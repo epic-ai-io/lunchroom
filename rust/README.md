@@ -24,11 +24,11 @@ Alpine 3.20. It does not build for other systems.
 Each release publishes `lunchroom-v<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl`, with `SHA256SUMS` signed by Sigstore. Check a download before you run
 it, with cosign 3 or newer: first that this repository's release workflow signed `SHA256SUMS` for the
-release's own tag (here `v1.0.0`; use the tag you downloaded), then the archive against it:
+release's own tag (here `v1.0.1`; use the tag you downloaded), then the archive against it:
 
 ```
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.0.0 \
+  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.0.1 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum -c SHA256SUMS --ignore-missing
 ```
@@ -98,7 +98,7 @@ writes Lunchroom's plugin (OpenClaw: `~/.lunchroom/plugins/openclaw/`; Hermes:
 Hermes, `hermes plugins enable lunchroom`. A broken guard never locks you out: what the guard cannot
 check goes to you, or, where nobody can be asked, that one call is DENIED.
 
-`lunchroom version` names the build, for example `lunchroom 1.0.0 (a1b2c3d)`: the version, then the commit it was built from, with
+`lunchroom version` names the build, for example `lunchroom 1.0.1 (a1b2c3d)`: the version, then the commit it was built from, with
 `, modified` when a tracked file of the source differs from that commit (untracked files do not
 count); a build from a source copy with no git history shows the version alone. The install reports the build it installed and the
 one it kept as a backup.
@@ -138,8 +138,10 @@ Then include each session that may receive messages. When a Claude Code or Codex
 Lunchroom asks: "include this session? Type join, or join <name>." Type `join` as the whole prompt
 and the session is in, named after its harness and folder (`claude-myproject`; a second one there
 is `claude-myproject-2`), or type `join Builder` to pick the name. Its agent is told its name and
-the commands it may run, and in Claude Code the name shows as the session's title. Type anything
-else and the session stays out: nothing can message it. Type `leave` to take it out again. In
+the commands it may run, and in Claude Code the name shows as the session's title. Lunchroom leaves
+a title you set, unless it equals a name the session is giving up or the title Lunchroom last gave
+it, and a title an earlier version set stays after `leave`. Type anything else and the session
+stays out: nothing can message it. Type `leave` to take it out again. In
 OpenClaw and Hermes, type `join` in the session the same way; their plugins show no line at the
 session's start.
 

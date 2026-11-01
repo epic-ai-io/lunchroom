@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1
+
+- Fix: Lunchroom no longer replaces titles you set on Claude Code sessions. A joined session that
+  started or resumed was renamed to its Lunchroom name each time, over any title you had set. Now
+  Lunchroom sets a title only on a session with no title of yours, and changes only a title it
+  gave or one equal to a name the session is giving up. A title already replaced stays as it is:
+  set it again with `/rename`.
+
 ## 1.0.0
 
 The first release, reissued after the repository moved to `epic-ai-io/lunchroom`.

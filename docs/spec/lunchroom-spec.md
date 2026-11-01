@@ -338,12 +338,17 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    name, the name cut shorter before the suffix where the suffix needs the room; joining under
    a new name gives up the session's earlier names. When the user joins a session, its agent is
    told its name and the two commands it may run (`lunchroom send` and `lunchroom status`), and in
-   Claude Code the name becomes the session's title. When a session of
-   a harness with a session-start hook (Claude Code, Codex) starts, the user is shown how to
-   include it, also when Lunchroom cannot use its store; a joined session that starts again keeps its name and its agent is told it. A
-   prompt that is not the user's own typing names nothing, and an agent cannot register itself or
-   another session from inside a guarded session; a name already taken is reported to the user,
-   never silently moved, and the earlier holder's QUEUED messages never pass to the new holder.
+   Claude Code the name becomes the session's title unless the session has a custom title, which
+   Lunchroom never replaces. The title Lunchroom last gave the session, until a hook shows
+   Lunchroom a custom title in its place, is not custom, and neither is a title equal to a name
+   the join gives up. When a session of a harness with a session-start hook (Claude Code, Codex)
+   starts, the user is shown how to include it, also when Lunchroom cannot use its store; a joined
+   session that starts again keeps its name and its agent is told it, and in Claude Code it takes
+   the name as its title only if it has no custom title and only on `startup`, `resume` or `fork`,
+   the starts on which Claude Code applies a title. A prompt that is not the user's own typing
+   names nothing, and an agent cannot register itself or another session from inside a guarded
+   session; a name already taken is reported to the user, never silently moved, and the earlier
+   holder's QUEUED messages never pass to the new holder.
    The user ends it by typing `leave` in the session, which takes away every name the session has,
    or with `lunchroom unregister <name>`, which takes away that name: a session that no other name
    labels receives nothing more, and its QUEUED messages stay QUEUED.

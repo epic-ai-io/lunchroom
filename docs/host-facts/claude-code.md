@@ -25,6 +25,18 @@ https://code.claude.com/docs/en/hooks.md (H) and https://code.claude.com/docs/en
   card 4 replay: a PostToolUse `additionalContext` reaches Claude's context (the transcript holds a
   `hook_additional_context` attachment) and is not drawn in the terminal; card 4's line is
   therefore returned as both `additionalContext` and `systemMessage`.
+- Session titles (H, read 2026-11-01): SessionStart `sessionTitle` "Sets the session title, with the
+  same effect as `/rename`. Applies when `source` is "startup", "resume", or "fork"". SessionStart
+  input `session_title` is "The session's custom title, present when one is set, for example with
+  `--name`, `/rename`, a hook's `sessionTitle` output, or the Agent SDK's `renameSession()`", and a
+  generated title "isn't a custom title and doesn't appear in `session_title`". "UserPromptSubmit
+  hooks also receive `session_title` when the session has a custom title", and their `sessionTitle`
+  output "Sets the session title". So a title Lunchroom set comes back to it as custom: Lunchroom
+  keeps its own record of the title it last gave. The hooks reference lists no event for `/rename`:
+  a title reaches a hook only as `session_title`, so a rename and a rename back with no hook between
+  them cannot be seen. Measured on 2.1.316 (2026-11-01): `/rename` then a full quit and resume keeps
+  the title; `/clear` starts a new session id, so the conversation after it is out of Lunchroom and
+  SessionStart asks to include it.
 
 ## 2. What a hook can see of the session that started it (measured)
 

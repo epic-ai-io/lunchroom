@@ -52,8 +52,8 @@ Download `lunchroom-v<version>-<target>.tar.gz` for your machine from
 your own terminal:
 
 ```
-tar xzf lunchroom-v1.0.0-x86_64-unknown-linux-musl.tar.gz
-cd lunchroom-v1.0.0-x86_64-unknown-linux-musl
+tar xzf lunchroom-v1.0.1-x86_64-unknown-linux-musl.tar.gz
+cd lunchroom-v1.0.1-x86_64-unknown-linux-musl
 ./lunchroom install
 ```
 

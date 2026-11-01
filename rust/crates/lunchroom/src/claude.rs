@@ -395,6 +395,11 @@ pub struct HookInput {
     pub harness_version: Option<String>,
     /// From Lunchroom's OpenClaw plugin: the script the gateway runs under its runtime (D1.1).
     pub harness_entry: Option<PathBuf>,
+    /// The session's custom title (Claude Code, present only when one is set): I1.5 never
+    /// replaces it.
+    pub session_title: Option<String>,
+    /// How a session started (`SessionStart`): `startup`, `resume`, `fork`, `clear` or `compact`.
+    pub source: Option<String>,
 }
 
 impl HookInput {
@@ -451,6 +456,8 @@ impl HookInput {
             harness_entry: s("harness_entry")
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute()),
+            session_title: s("session_title").filter(|t| !t.is_empty()),
+            source: s("source"),
         })
     }
 
@@ -812,6 +819,8 @@ pub fn prompt(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     let out = store
         .update(|m| {
             observe(m, &me, input, harness.as_deref(), &env.home);
+            // I1.5: a custom title seen on any prompt ends the record of Lunchroom's own.
+            custom_title(m, &me, input.session_title.as_deref(), &[]);
             // Once a turn, what can no longer matter is forgotten.
             m.prune(env.now, |k| {
                 k.split(':')
@@ -840,7 +849,10 @@ pub fn prompt(input: &HookInput, env: &Env) -> Result<HookOut, String> {
                 // I1.5: the user's own typing joins this session, or takes it out, where a person
                 // is at the prompt.
                 match typed_command(text).filter(|_| person_at_prompt) {
-                    Some(Typed::Join(wanted)) => return join(m, &me, wanted, &input.cwd),
+                    Some(Typed::Join(wanted)) => {
+                        let current = input.session_title.as_deref();
+                        return join(m, &me, wanted, &input.cwd, current);
+                    }
                     Some(Typed::Leave) => return leave(m, &me),
                     None => {}
                 }
@@ -947,10 +959,27 @@ fn member_context(name: &str) -> String {
     )
 }
 
+/// I1.5: whether the session's `current` title is custom: not the one Lunchroom last gave, and not
+/// a name it `gives_up` (1.0.0 kept no record of its titles). A custom title ends that record.
+fn custom_title(m: &mut Mail, me: &Identity, current: Option<&str>, gives_up: &[String]) -> bool {
+    let custom =
+        current.is_some_and(|t| m.title_given(me) != Some(t) && !gives_up.iter().any(|n| n == t));
+    if custom {
+        m.forget_title(me);
+    }
+    custom
+}
+
 /// I1.5: the user typed `join` or `join <name>` in this session, so it receives messages under
 /// that name (or the one it has, or [`session_name`]). A name another session has is refused and
-/// named, never moved; a session keeps one name.
-fn join(m: &mut Mail, me: &Identity, wanted: Option<&str>, cwd: &Path) -> HookOut {
+/// named, never moved; a session keeps one name. A session with a custom title keeps it.
+fn join(
+    m: &mut Mail,
+    me: &Identity,
+    wanted: Option<&str>,
+    cwd: &Path,
+    current: Option<&str>,
+) -> HookOut {
     let name = match wanted {
         Some(n) => n.to_owned(),
         None => m
@@ -977,8 +1006,13 @@ fn join(m: &mut Mail, me: &Identity, wanted: Option<&str>, cwd: &Path) -> HookOu
         .filter(|(n, h)| *h == me && *n != name)
         .map(|(n, _)| n.to_owned())
         .collect();
+    let custom = custom_title(m, me, current, &earlier);
     for n in &earlier {
         m.unregister(n);
+    }
+    let title = if custom { None } else { title_for(me, &name) };
+    if let Some(t) = &title {
+        m.record_title(me, t);
     }
     HookOut::Event {
         event: "UserPromptSubmit",
@@ -989,7 +1023,7 @@ fn join(m: &mut Mail, me: &Identity, wanted: Option<&str>, cwd: &Path) -> HookOu
             sentence(Word::TheUser.text()),
             Word::TheUser.text()
         )),
-        title: title_for(me, &name),
+        title,
     }
 }
 
@@ -1036,33 +1070,47 @@ fn sentence(text: &str) -> String {
 }
 
 /// `SessionStart` (I1.5): a session that is not in Lunchroom shows the user how to include it; a
-/// joined one, started again, keeps its name, and its agent is told it.
+/// joined one, started again, keeps its name, its agent is told it, and it takes the name as its
+/// title only if it has no custom title.
 ///
 /// A store it cannot use still shows the user how to include the session, with the reason.
 pub fn start(input: &HookInput, env: &Env) -> HookOut {
     let me = input.me();
     let harness = harness_process(env, input.harness);
-    let name = store(env).and_then(|store| {
+    let named = store(env).and_then(|store| {
         store
             .update(|m| {
                 observe(m, &me, input, harness.as_deref(), &env.home);
-                m.name_of(&me).map(str::to_owned)
+                let name = m.name_of(&me).map(str::to_owned);
+                let custom = custom_title(m, &me, input.session_title.as_deref(), &[]);
+                // Claude Code applies a title only on these starts, so none is sent or recorded
+                // on `clear` or `compact`.
+                let applies =
+                    matches!(input.source.as_deref(), Some("startup" | "resume" | "fork"));
+                let title = name
+                    .as_deref()
+                    .filter(|_| !custom && applies)
+                    .and_then(|n| title_for(&me, n));
+                if let Some(t) = &title {
+                    m.record_title(&me, t);
+                }
+                (name, title)
             })
             .map_err(crate::cli::unwritten)
     });
-    match name {
+    match named {
         Err(reason) => HookOut::Notice(format!(
             "{INCLUDE_LINE} Lunchroom could not check this: {reason}."
         )),
-        Ok(Some(name)) => HookOut::Event {
+        Ok((Some(name), title)) => HookOut::Event {
             event: "SessionStart",
             notice: Some(format!(
                 "Lunchroom: this session is in Lunchroom as {name}; type leave to take it out."
             )),
             context: Some(member_context(&name)),
-            title: title_for(&me, &name),
+            title,
         },
-        Ok(None) => HookOut::Event {
+        Ok((None, _)) => HookOut::Event {
             event: "SessionStart",
             notice: Some(INCLUDE_LINE.to_owned()),
             context: None,

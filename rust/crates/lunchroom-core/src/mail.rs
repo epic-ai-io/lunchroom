@@ -287,6 +287,10 @@ pub struct Mail {
     /// The hold mode the user chose; Balanced until they choose (P1.6).
     #[serde(default)]
     hold_mode: Option<crate::policy::HoldMode>,
+    /// The title Lunchroom last sent each session, by identity key: a session's title that equals
+    /// it is Lunchroom's own, not a custom title (I1.5). It outlives the session's names.
+    #[serde(default)]
+    titles: BTreeMap<String, String>,
 }
 
 /// How long the text of a DELIVERED or FAILED message that holds nobody is kept: a week.
@@ -563,8 +567,9 @@ impl Mail {
     }
 
     /// Takes `name` away, so its session receives no more messages unless another name still labels
-    /// it. Messages already QUEUED for it stay QUEUED. False when no session has that name. Only
-    /// the `lunchroom unregister` command calls this, after the user's confirmation (A1.3).
+    /// it. Messages already QUEUED for it stay QUEUED. False when no session has that name. Called
+    /// by the `lunchroom unregister` command after the user's confirmation (A1.3), and by `join`
+    /// and `leave`, which the user typed in the session (I1.5).
     pub fn unregister(&mut self, name: &str) -> bool {
         let Some(who) = self.names.remove(name) else {
             return false;
@@ -573,6 +578,22 @@ impl Mail {
             self.receivers.remove(&who.key());
         }
         true
+    }
+
+    /// Records the title Lunchroom gave `who` (I1.5).
+    pub fn record_title(&mut self, who: &Identity, title: &str) {
+        self.titles.insert(who.key(), title.to_owned());
+    }
+
+    /// The title Lunchroom last gave `who` (I1.5).
+    #[must_use]
+    pub fn title_given(&self, who: &Identity) -> Option<&str> {
+        self.titles.get(&who.key()).map(String::as_str)
+    }
+
+    /// Forgets the title Lunchroom gave `who`: a custom title has taken its place (I1.5).
+    pub fn forget_title(&mut self, who: &Identity) {
+        self.titles.remove(&who.key());
     }
 
     /// The identity a name labels now.

@@ -98,7 +98,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "lunchroom"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "lunchroom-core",
  "serde",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "lunchroom-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",

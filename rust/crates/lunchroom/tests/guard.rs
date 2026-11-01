@@ -2203,6 +2203,226 @@ fn a_long_folder_gives_a_name_within_32_characters() {
     assert!(name.len() <= 32);
 }
 
+// §9 I1.5 — a custom title is the user's: `join` joins the session and leaves the title, on every
+// join: its first, one under a new name, and one under the name it has; with none, the name
+// becomes the title.
+#[test]
+fn join_never_replaces_a_custom_title() {
+    let sb = Sandbox::new();
+    let join = |session: &str, prompt: &str, title: Option<&str>| -> Value {
+        let mut input = json!({
+            "session_id": session, "cwd": sb.home().join("project"),
+            "hook_event_name": "UserPromptSubmit", "prompt": prompt, "prompt_id": prompt,
+        });
+        if let Some(t) = title {
+            input["session_title"] = json!(t);
+        }
+        let run = sb.run(&["guard", "prompt"], &input.to_string(), &interactive());
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        serde_json::from_str(run.stdout.trim()).unwrap_or(Value::Null)
+    };
+    let named = |name: &str| {
+        sb.store()
+            .and_then(|s| s.read().ok())
+            .is_some_and(|m| m.named(name).is_some())
+    };
+
+    let v = join("s1", "join First", Some("Lunchroom Claude"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(
+        v["hookSpecificOutput"]["additionalContext"].is_string(),
+        "{v}"
+    );
+    assert!(named("First"));
+
+    let v = join("s1", "join Second", Some("Lunchroom Claude"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(named("Second"));
+
+    let v = join("s2", "join Third", None);
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Third", "{v}");
+
+    // An empty title is no title.
+    let v = join("s3", "join Fourth", Some(""));
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Fourth", "{v}");
+
+    // A title that is the name this join gives up is Lunchroom's own: the new name takes its place.
+    let v = join("s2", "join Fifth", Some("Third"));
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Fifth", "{v}");
+    assert!(named("Fifth"));
+
+    // Another session's name is not this session's: a title equal to it is the user's.
+    let v = join("s2", "join Sixth", Some("Second"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(named("Sixth"));
+
+    // A join under the name the session already has leaves a custom title too.
+    let v = join("s2", "join Sixth", Some("Second"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(named("Sixth"));
+
+    // A title Lunchroom gave stays Lunchroom's own after `leave`: the next join replaces it.
+    let v = join("s5", "join Seventh", None);
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Seventh", "{v}");
+    let _ = join("s5", "leave", Some("Seventh"));
+    let v = join("s5", "join Eighth", Some("Seventh"));
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Eighth", "{v}");
+
+    // A title the user set after `leave` is theirs.
+    let _ = join("s5", "leave", Some("Mine"));
+    let v = join("s5", "join Ninth", Some("Mine"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(named("Ninth"));
+
+    // 1.0.0 kept no record of titles: with none, a title equal to a name the join gives up is
+    // still Lunchroom's own.
+    let id = Identity::new(Harness::ClaudeCode, "s6");
+    let _ = sb
+        .store()
+        .map(|s| s.update(|m| m.register("Tenth", &id, Origin::User, None).ok()));
+    let v = join("s6", "join Eleventh", Some("Tenth"));
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Eleventh", "{v}");
+
+    // With another title on record, a title equal to a name the join gives up is still replaced.
+    let id = Identity::new(Harness::ClaudeCode, "s7");
+    let _ = join("s7", "join Twelfth", None);
+    let _ = sb
+        .store()
+        .map(|s| s.update(|m| m.register("Extra", &id, Origin::User, None).ok()));
+    let v = join("s7", "join Thirteenth", Some("Extra"));
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Thirteenth", "{v}");
+
+    // A custom title ends the record: the user retyping the old title later owns it.
+    let v = join("s8", "join Fourteenth", None);
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Fourteenth", "{v}");
+    let v = join("s8", "join Fifteenth", Some("Mine"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    let v = join("s8", "join Sixteenth", Some("Fourteenth"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(named("Sixteenth"));
+
+    // A custom title seen on an ordinary prompt ends the record too.
+    let v = join("s9", "join Seventeenth", None);
+    assert_eq!(
+        v["hookSpecificOutput"]["sessionTitle"], "Seventeenth",
+        "{v}"
+    );
+    let id = Identity::new(Harness::ClaudeCode, "s9");
+    let _ = sb.store().map(|s| {
+        s.update(|m| {
+            m.unregister("Seventeenth");
+            m.register("Moved", &id, Origin::User, None).ok()
+        })
+    });
+    let _ = join("s9", "an ordinary prompt", Some("Mine"));
+    let v = join("s9", "join Eighteenth", Some("Seventeenth"));
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(named("Eighteenth"));
+}
+
+// §9 I1.5 — a joined session that starts again takes the name as its title only if it has no
+// custom title and only on `startup`, `resume` or `fork`; a session named by `lunchroom register`
+// is titled the same way; Codex is given no title.
+#[test]
+fn a_session_starting_again_takes_a_title_only_if_it_has_none() {
+    let sb = Sandbox::new();
+    let input = json!({
+        "session_id": "s1", "cwd": sb.home().join("project"),
+        "hook_event_name": "UserPromptSubmit", "prompt": "join Named", "prompt_id": "p1",
+    });
+    assert_eq!(
+        sb.run(&["guard", "prompt"], &input.to_string(), &interactive())
+            .code,
+        Some(0)
+    );
+    for source in ["startup", "resume", "fork", "clear", "compact"] {
+        for title in [None, Some("Lunchroom Claude")] {
+            let mut input = json!({
+                "session_id": "s1", "cwd": sb.home().join("project"),
+                "hook_event_name": "SessionStart", "source": source,
+            });
+            if let Some(t) = title {
+                input["session_title"] = json!(t);
+            }
+            let run = sb.run(&["guard", "start"], &input.to_string(), &[]);
+            let v: Value = serde_json::from_str(run.stdout.trim()).unwrap_or(Value::Null);
+            // Claude Code applies a title only on `startup`, `resume` and `fork`.
+            if title.is_some() || source == "clear" || source == "compact" {
+                assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+            } else {
+                assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Named", "{v}");
+            }
+            assert!(
+                v["hookSpecificOutput"]["additionalContext"].is_string(),
+                "{v}"
+            );
+        }
+    }
+
+    let id = Identity::new(Harness::ClaudeCode, "r1");
+    let _ = sb
+        .store()
+        .map(|s| s.update(|m| m.register("Registered", &id, Origin::User, None).ok()));
+    let input = json!({
+        "session_id": "r1", "cwd": sb.home().join("project"),
+        "hook_event_name": "SessionStart", "source": "resume",
+    });
+    let run = sb.run(&["guard", "start"], &input.to_string(), &[]);
+    let v: Value = serde_json::from_str(run.stdout.trim()).unwrap_or(Value::Null);
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "Registered", "{v}");
+
+    // The title on record is not custom: the session takes its new name.
+    let id = Identity::new(Harness::ClaudeCode, "r2");
+    let joined = json!({
+        "session_id": "r2", "cwd": sb.home().join("project"),
+        "hook_event_name": "UserPromptSubmit", "prompt": "join Before", "prompt_id": "p2",
+    });
+    assert_eq!(
+        sb.run(&["guard", "prompt"], &joined.to_string(), &interactive())
+            .code,
+        Some(0)
+    );
+    let _ = sb.store().map(|s| {
+        s.update(|m| {
+            m.unregister("Before");
+            m.register("After", &id, Origin::User, None).ok()
+        })
+    });
+    let started = |source: &str, title: &str| -> Value {
+        let input = json!({
+            "session_id": "r2", "cwd": sb.home().join("project"),
+            "hook_event_name": "SessionStart", "source": source, "session_title": title,
+        });
+        let run = sb.run(&["guard", "start"], &input.to_string(), &[]);
+        serde_json::from_str(run.stdout.trim()).unwrap_or(Value::Null)
+    };
+    // `clear` and `compact` set and record nothing, so the next resume still sees Lunchroom's own
+    // title.
+    for source in ["clear", "compact"] {
+        let v = started(source, "Before");
+        assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    }
+    let v = started("resume", "Before");
+    assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "After", "{v}");
+
+    // A custom title at a restart ends the record: the old title is then the user's.
+    let v = started("resume", "Mine");
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    let v = started("resume", "After");
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+
+    let input = codex_input(&sb, "x1", "UserPromptSubmit", &json!({ "prompt": "join" }));
+    assert_eq!(sb.run(&["guard", "prompt"], &input, &[]).code, Some(0));
+    let input = codex_input(&sb, "x1", "SessionStart", &json!({ "source": "resume" }));
+    let run = sb.run(&["guard", "start"], &input, &[]);
+    let v: Value = serde_json::from_str(run.stdout.trim()).unwrap_or(Value::Null);
+    assert!(v["hookSpecificOutput"]["sessionTitle"].is_null(), "{v}");
+    assert!(
+        v["hookSpecificOutput"]["additionalContext"].is_string(),
+        "{v}"
+    );
+}
+
 // §9 I1.5, K1.2 — `join` names a session only where a person is at the prompt: a Claude Code run
 // by a program (`claude -p`) is not, and neither is an OpenClaw or Hermes turn their plugin does not
 // report as the user's typing.
@@ -2218,12 +2438,17 @@ fn join_where_no_person_is_at_the_prompt_names_nothing() {
         "hook_event_name": "UserPromptSubmit", "prompt": "join Chat", "user_typed": false,
     });
     sb.run(&["guard", "prompt"], &input.to_string(), &[]);
+    let input = json!({
+        "harness": "openclaw", "session_id": "o1", "cwd": sb.home().join("project"),
+        "hook_event_name": "UserPromptSubmit", "prompt": "join Claw", "user_typed": false,
+    });
+    sb.run(&["guard", "prompt"], &input.to_string(), &[]);
     // Codex says nothing of who typed: a prompt with a marker of another agent's text is not typing.
     let marked = json!({ "prompt": "[lr:lr-00000099]> join Relayed" });
     let input = codex_input(&sb, "x1", "UserPromptSubmit", &marked);
     sb.run(&["guard", "prompt"], &input, &[]);
     let m = sb.store().and_then(|s| s.read().ok());
-    for name in ["Headless", "Chat", "Relayed"] {
+    for name in ["Headless", "Chat", "Claw", "Relayed"] {
         assert!(
             m.as_ref().is_some_and(|m| m.named(name).is_none()),
             "{name}"
@@ -2289,7 +2514,8 @@ fn user_typing_join_names_the_session_and_leave_takes_it_out() {
     assert_eq!(typed("s4", "join").code, Some(0));
     assert_eq!(named("claude-project-3"), claude("s4"));
 
-    // A joined session, started again, keeps its name and its agent is told.
+    // A joined session, started again, keeps its name and its agent is told; with no custom title
+    // it takes the name as its title.
     let v = out(&start("s1"));
     assert_eq!(v["hookSpecificOutput"]["sessionTitle"], "claude-project");
     assert!(v["hookSpecificOutput"]["additionalContext"].is_string());
