@@ -10,7 +10,7 @@
 
 ## 1.0.0
 
-The first release, reissued after the repository moved to `epic-ai-io/lunchroom`.
+The first release.
 
 - Messages between Claude Code, Codex, OpenClaw and Hermes sessions, with the sender stamped by
   Lunchroom, delivery confirmed by each harness, and honest outcomes (QUEUED, DELIVERED, FAILED).
