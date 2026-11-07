@@ -1,0 +1,41 @@
+MEASURED free space on /: 8971 MB
+== building lunchroom-realworld-openclawlink from Containerfile
+MEASURED image lunchroom-realworld-openclawlink: 1956 MB
+
+== facts of this system
+openclaw: OpenClaw 2026.10.7 (157d8c2)
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install openclaw finished
+MEASURED tools.exec.applyPatch.workspaceOnly (left at its default, not set by this proof): Config path is valid but unset: tools.exec.applyPatch.workspaceOnly. The runtime default applies until you set an authored value with openclaw config set tools.exec.applyPatch.workspaceOnly <value>.
+PASS the Lunchroom plugin is enabled
+PASS the gateway listens (after 23 s)
+PASS alpha joined and is AVAILABLE
+MEASURED workspace: /home/dev/.openclaw/workspace (exists)
+    lrwxrwxrwx 1 dev dev   26 Nov  3 09:45 link-dir -> /home/dev/.lunchroom/store
+    lrwxrwxrwx 1 dev dev   37 Nov  3 09:45 link-file.json -> /home/dev/.lunchroom/store/state.json
+PASS the workspace holds link-file.json -> state.json and link-dir -> the store folder
+
+== 1. control: an ordinary file in the workspace
+MEASURED apply_patch of hello-p0.txt in the workspace: Success. Updated the following files: A hello-p0.txt
+PASS control: hello-p0.txt was created in the workspace (the tool path works with the default containment)
+
+== 2. apply_patch through a symlink to the store's state file
+MEASURED apply_patch 'Add File: link-file.json': the model was given back: { "status": "error", "tool": "apply_patch", "error": "Symlink escapes sandbox root (~/.openclaw/workspace): ~/.openclaw/workspace/link-file.json" }
+MEASURED state.json sha256 before: e11c106a3d48c4c60d5ae49e44e5a8915fab24ee14f5368b7e2d92a1f0c0af5f
+MEASURED state.json sha256 after:  574ecbbfa92dd10803ed64f4840f92476a64ebf809dae3421656e589439baf40
+MEASURED state.json now begins: {"schema":2,"next_message":0,"seen":["openclaw:agent:main:alpha"],"processes":{"
+MEASURED the refusal came from OpenClaw's own containment
+PASS the store file is still Lunchroom's JSON and does not hold the patch's line 'hello'
+
+== 3. apply_patch to a new file under a symlinked folder
+MEASURED apply_patch 'Add File: link-dir/planted-l2.txt': the model was given back: { "status": "error", "tool": "apply_patch", "error": "Symlink escapes sandbox root (~/.openclaw/workspace): ~/.openclaw/workspace/link-dir" }
+MEASURED the refusal came from OpenClaw's own containment
+PASS no file was created inside Lunchroom's store folder
+MEASURED status afterwards still lists alpha: AVAILABLE
+
+== result
+RESULT: 8 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-openclawlink removed
+
+RESULT: 8 PASS, 0 FAIL

@@ -4,9 +4,10 @@
 // Each test file uses only part of this module.
 #![allow(dead_code)]
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lunchroom_core::mail::Mail;
@@ -21,7 +22,13 @@ const SYSTEM_PATH: &str = "/usr/bin:/bin";
 pub struct Run {
     pub stdout: String,
     pub stderr: String,
+    /// The exit code, with Claude Code's block form read as the block it is: V1.4 (2026-11-03)
+    /// gives a DENIED tool call to Claude Code as a `permissionDecision` of `deny` (exit 0), whose
+    /// reason the agent reads, and as a `systemMessage`, which the user reads; such a run counts as
+    /// exit 2 with that reason on standard error, so a test of a decision reads one form. The
+    /// process's own exit code is `raw_code`, and the tests of the form itself read it.
     pub code: Option<i32>,
+    pub raw_code: Option<i32>,
 }
 
 impl Run {
@@ -31,16 +38,31 @@ impl Run {
             stdout: String::new(),
             stderr: why.to_owned(),
             code: None,
+            raw_code: None,
         }
     }
 }
 
 impl From<Output> for Run {
     fn from(out: Output) -> Self {
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let raw_code = out.status.code();
+        let mut code = raw_code;
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
+        let specific = &v["hookSpecificOutput"];
+        if raw_code == Some(0) && specific["permissionDecision"] == "deny" {
+            code = Some(2);
+            let reason = specific["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default();
+            stderr = format!("{reason}{stderr}");
+        }
         Self {
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            code: out.status.code(),
+            stdout,
+            stderr,
+            code,
+            raw_code,
         }
     }
 }
@@ -64,6 +86,100 @@ pub fn finish_bytes(mut cmd: Command, stdin: &[u8]) -> Run {
     child
         .wait_with_output()
         .map_or_else(|_| Run::failed("wait failed"), Run::from)
+}
+
+/// A child shell started in a process group of its own, which is killed with all that the shell
+/// started (a `sleep`, a `flock`'s command, a Lunchroom process) when the guard is dropped, however
+/// the test ends: a failed assertion unwinds through the drop. The workspace forbids `unsafe`, so
+/// the group is killed by the system's `kill -KILL -- -<pgid>` (the group's id is the child's).
+/// A child already waited for is killed again harmlessly: the signal finds no such group.
+pub struct GroupChild {
+    child: Child,
+}
+
+impl GroupChild {
+    /// Starts `cmd` as the leader of a new process group.
+    pub fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        cmd.process_group(0);
+        cmd.spawn().map(|child| Self { child })
+    }
+
+    /// Closes the child's input, reads its output to the end and waits for it, as
+    /// [`Child::wait_with_output`] does; the group is killed afterwards, by the drop.
+    pub fn into_output(mut self) -> std::io::Result<Output> {
+        drop(self.child.stdin.take());
+        let err = self.child.stderr.take();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut err) = err {
+                let _ = err.read_to_end(&mut bytes);
+            }
+            bytes
+        });
+        let mut stdout = Vec::new();
+        if let Some(mut out) = self.child.stdout.take() {
+            out.read_to_end(&mut stdout)?;
+        }
+        let status = self.child.wait()?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr: reader.join().unwrap_or_default(),
+        })
+    }
+}
+
+impl std::ops::Deref for GroupChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for GroupChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--"])
+            .arg(format!("-{}", self.child.id()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+/// The processes whose command line holds `root` followed by a slash: what a test left running in
+/// its sandbox (the id and the command line of each).
+pub fn processes_holding(root: &Path) -> Vec<(u32, String)> {
+    // The sandbox's path as the test spells it (it has `..` in it) and as a shell reports its
+    // working directory.
+    let mut needles = vec![format!("{}/", root.display())];
+    if let Ok(real) = root.canonicalize() {
+        needles.push(format!("{}/", real.display()));
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let line = std::fs::read(entry.path().join("cmdline")).ok()?;
+            let line = String::from_utf8_lossy(&line).replace('\0', " ");
+            needles
+                .iter()
+                .any(|needle| line.contains(needle))
+                .then_some((pid, line))
+        })
+        .collect()
 }
 
 /// The full path of `program` as the test process's own `PATH` finds it: tests name a system

@@ -65,7 +65,9 @@ pub struct Request {
 
 impl Mail {
     /// Keeps a call waiting for the user's approval; the same call again replaces the older entry.
+    /// A call that has waited [`APPROVAL_SECS`] or more by the time of this one is dropped.
     pub fn request(&mut self, request: Request) {
+        self.expire_requests(request.at);
         let hash = input_hash(&request.input);
         self.requests.retain(|r| {
             !(r.session == request.session
@@ -76,6 +78,14 @@ impl Mail {
         self.requests.push(request);
         let excess = self.requests.len().saturating_sub(REQUESTS_KEPT);
         self.requests.drain(..excess);
+    }
+
+    /// Drops the calls that have waited [`APPROVAL_SECS`] or more at `now`: the user's yes lasts as
+    /// long as that after it is given, so a request older than that is no longer one anybody is
+    /// asked about. A request stamped ahead of `now` (the clock stepped back) is kept.
+    pub fn expire_requests(&mut self, now: u64) {
+        self.requests
+            .retain(|r| now < r.at.saturating_add(APPROVAL_SECS));
     }
 
     /// The calls waiting for the user's approval, oldest first.
@@ -122,6 +132,9 @@ impl Mail {
         now: u64,
     ) -> Result<String, Changed> {
         let r = self.requests.get(index).ok_or(Changed)?;
+        if now >= r.at.saturating_add(APPROVAL_SECS) {
+            return Err(Changed);
+        }
         let now_shown = self.approval_prompt(&r.session, &r.agent, &r.tool, &r.input, &r.cwd);
         if r != expected || now_shown != shown {
             return Err(Changed);

@@ -1,0 +1,110 @@
+MEASURED free space on /: 6752 MB
+== building lunchroom-realworld-codexstopped from Containerfile
+MEASURED image lunchroom-realworld-codexstopped: 1735 MB
+
+== facts of this system
+codex: codex-cli 0.166.0
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install codex finished
+PASS Codex is up at its prompt
+---- t=0 s (the session has just been listed) (04:01:12)
+  lunchroom status:
+    1 agent: 1 AVAILABLE
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    cx	codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06	AVAILABLE	QUEUED 0
+  processes of user dev (pid, ppid, comm, start ticks, exe, cmdline):
+    88 ppid=82 comm=python3 start=116670325 exe=/usr/bin/python3.11
+      cmdline=python3 /opt/proof/sessionpty.py --log /run/sess/cx.log --keys /run/sess/cx.keys --ready /run/sess/cx.ready --timeout 900 -- codex 
+    90 ppid=88 comm=codex start=116670328 exe=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex
+      cmdline=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex 
+    146 ppid=90 comm=codex start=116670582 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// --analytics-default-enabled --manag
+    195 ppid=90 comm=codex start=116670602 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server daemon pid-update-loop 
+  the store's record of the session (sessions / processes):
+    session codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06 {"process": "146:116670582", "cwd": "/home/dev", "entry": null}
+    process 146:116670582 -> {"harness": "codex", "session": "01a1a4b7-9e85-7591-9791-5c3b0d13ea06"}
+  codex is alive per /proc: 90 146 195 
+---- t=5 s (04:01:17)
+  lunchroom status:
+    1 agent: 1 AVAILABLE
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    cx	codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06	AVAILABLE	QUEUED 0
+  processes of user dev (pid, ppid, comm, start ticks, exe, cmdline):
+    88 ppid=82 comm=python3 start=116670325 exe=/usr/bin/python3.11
+      cmdline=python3 /opt/proof/sessionpty.py --log /run/sess/cx.log --keys /run/sess/cx.keys --ready /run/sess/cx.ready --timeout 900 -- codex 
+    90 ppid=88 comm=codex start=116670328 exe=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex
+      cmdline=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex 
+    146 ppid=90 comm=codex start=116670582 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// --analytics-default-enabled --manag
+    195 ppid=90 comm=codex start=116670602 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server daemon pid-update-loop 
+  the store's record of the session (sessions / processes):
+    session codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06 {"process": "146:116670582", "cwd": "/home/dev", "entry": null}
+    process 146:116670582 -> {"harness": "codex", "session": "01a1a4b7-9e85-7591-9791-5c3b0d13ea06"}
+  codex is alive per /proc: 90 146 195 
+---- t=30 s (04:01:42)
+  lunchroom status:
+    1 agent: 1 AVAILABLE
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    cx	codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06	AVAILABLE	QUEUED 0
+  processes of user dev (pid, ppid, comm, start ticks, exe, cmdline):
+    88 ppid=82 comm=python3 start=116670325 exe=/usr/bin/python3.11
+      cmdline=python3 /opt/proof/sessionpty.py --log /run/sess/cx.log --keys /run/sess/cx.keys --ready /run/sess/cx.ready --timeout 900 -- codex 
+    90 ppid=88 comm=codex start=116670328 exe=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex
+      cmdline=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex 
+    146 ppid=90 comm=codex start=116670582 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// --analytics-default-enabled --manag
+    195 ppid=90 comm=codex start=116670602 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server daemon pid-update-loop 
+  the store's record of the session (sessions / processes):
+    session codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06 {"process": "146:116670582", "cwd": "/home/dev", "entry": null}
+    process 146:116670582 -> {"harness": "codex", "session": "01a1a4b7-9e85-7591-9791-5c3b0d13ea06"}
+  codex is alive per /proc: 90 146 195 
+MEASURED state at 0 s: AVAILABLE; at 5 s: AVAILABLE; at 30 s: AVAILABLE
+---- lunchroom doctor (the agent's line)
+    PASS Codex: Lunchroom is installed and its configuration runs the whole guard
+    PASS Codex: release 0.166.0, read from /usr/local/lib/node_modules/@openai/codex/bin/codex.js. This is the release Lunchroom was tested with, or a later one.
+    PASS agent cx (Codex) is AVAILABLE: its guard is running and no other agent's text is in its session
+
+== 2. the same join, with each Lunchroom hook run through a wrapper shell (what codexodd1 did)
+---- wrapped hooks, t=0 s (04:02:09)
+  lunchroom status:
+    2 agents: 1 UNGUARDED, 1 STOPPED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    cx2	codex:01a1a4b8-7f73-7283-88a2-ba91bbe681ed	UNGUARDED	QUEUED 0
+      why: Codex's hooks file /home/dev/.codex/hooks.json does not hold Lunchroom's whole guard (PreToolUse, PostToolUse, UserPromptSubmit and SessionStart, each on every tool, its program there to run): run lunchroom install codex in a terminal of your own, then trust Lunchroom's hooks in Codex's /hooks.
+    cx	codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06	STOPPED	QUEUED 0
+  processes of user dev (pid, ppid, comm, start ticks, exe, cmdline):
+    647 ppid=641 comm=python3 start=116676695 exe=/usr/bin/python3.11
+      cmdline=python3 /opt/proof/sessionpty.py --log /run/sess/cx.log --keys /run/sess/cx.keys --ready /run/sess/cx.ready --timeout 400 -- codex 
+    649 ppid=647 comm=codex start=116676698 exe=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex
+      cmdline=/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex 
+    680 ppid=649 comm=codex start=116676760 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// --analytics-default-enabled --manag
+    729 ppid=649 comm=codex start=116676770 exe=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex
+      cmdline=/home/dev/.codex/packages/app-server-daemon/releases/0.166.0-x86_64-unknown-linux-musl/bin/codex app-server daemon pid-update-loop 
+  the store's record of the session (sessions / processes):
+    session codex:01a1a4b7-9e85-7591-9791-5c3b0d13ea06 {"process": "146:116670582", "cwd": "/home/dev", "entry": null}
+    session codex:01a1a4b8-7f73-7283-88a2-ba91bbe681ed {"process": "680:116676760", "cwd": "/home/dev", "entry": null}
+    process 680:116676760 -> {"harness": "codex", "session": "01a1a4b8-7f73-7283-88a2-ba91bbe681ed"}
+  codex is alive per /proc: 649 680 729 
+MEASURED with the wrapper: state at 0 s: UNGUARDED; at 30 s: UNGUARDED
+  hook processes seen by the wrapper (parent chain is the point): the wrapped hook's parent is sh, run by codex
+PASS the Codex process is running (pid 649 680 729 )
+PASS at 0 s status says AVAILABLE for the running Codex session
+PASS at 5 s status says AVAILABLE for the running Codex session
+PASS at 30 s status says AVAILABLE for the running Codex session
+PASS with each hook run through a wrapper shell, status says UNGUARDED at 0 s, with a reason naming hooks.json
+PASS with each hook run through a wrapper shell, status says UNGUARDED at 30 s, with a reason naming hooks.json
+
+== result
+RESULT: 8 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-codexstopped removed
+
+RESULT: 8 PASS, 0 FAIL

@@ -1,0 +1,65 @@
+# Run by the user in a terminal of their own on 2026-11-04 (the guard in the agents' sessions,
+# Lunchroom 1.0.1, DENIED this script), with the 1.0.2 build (d6fa799, modified); output as printed.
+PASS gh release download: lunchroom-v1.0.1-x86_64-unknown-linux-musl.tar.gz and SHA256SUMS of epic-ai-io/lunchroom v1.0.1
+PASS sha256sum -c SHA256SUMS: lunchroom-v1.0.1-x86_64-unknown-linux-musl.tar.gz: OK (1de432d632ec5d46afb4856ff7163705a386c03e010632972759ee818f3dcd24)
+MEASURED free space on /: 4860 MB
+== building lunchroom-realworld-mixed from Containerfile
+MEASURED image lunchroom-realworld-mixed: 124 MB
+
+== facts of this system
+os: Ubuntu 24.04.5 LTS
+MEASURED 1.0.1: lunchroom 1.0.1 (aaa504c)  sha256 bd109b46e20a5be44fc0c7b4ed997eb5807302200493e81f6e78350b3e5cc3e9
+MEASURED 1.0.2: lunchroom 1.0.2 (d6fa799, modified)  sha256 3eb23e73e62f275b6a0d02652fb13cdad3cf5476777ef75d95f38e125ae4d0a9
+MEASURED dev's password: dev P; hash scheme $y$
+
+== 1. which fields only 1.0.2 writes
+PASS 1.0.1 wrote a store of its own at /home/dev/h101/.lunchroom/store/state.json
+PASS 1.0.2 wrote the store /home/dev/.lunchroom/store/state.json
+MEASURED fields only 1.0.2 writes: latest_guard_fingerprint schema seen_at user_notices
+MEASURED fields only 1.0.1 writes: none
+PASS 1.0.2 writes fields 1.0.1 does not: latest_guard_fingerprint schema seen_at user_notices
+MEASURED 1.0.2's store: latest_guard_fingerprint = {"openclaw": "/home/dev/proof-plugin/index.mjs\n2026.10.7\n1793769267"}
+MEASURED 1.0.2's store: schema = 2
+MEASURED 1.0.2's store: seen_at = 1793769267
+MEASURED 1.0.2's store: user_notices = []
+PASS the 1.0.2 store carries the layout number: schema = 2
+PASS latest_guard_fingerprint holds data in the 1.0.2 store: {"openclaw": "/home/dev/proof-plugin/index.mjs\n2026.10.7\n1793769267"}
+
+== 2. doctor, while 1.0.2 wrote the store last
+PASS doctor ran (it printed 4 lines)
+PASS doctor does not say the store was last written by an older program (control)
+
+== 3. a 1.0.1 write into the 1.0.2 store
+PASS 1.0.1 wrote into the store: it records the session S2
+MEASURED latest_guard_fingerprint: after the 1.0.2 write = {"openclaw": "/home/dev/proof-plugin/index.mjs\n2026.10.7\n1793769267"}; after the 1.0.1 write = ABSENT
+MEASURED schema: after the 1.0.2 write = 2; after the 1.0.1 write = ABSENT
+MEASURED seen_at: after the 1.0.2 write = 1793769267; after the 1.0.1 write = ABSENT
+MEASURED user_notices: after the 1.0.2 write = []; after the 1.0.1 write = ABSENT
+PASS a 1.0.1 write drops the 1.0.2-only fields that held data (spec section 15 limit 26): latest_guard_fingerprint schema seen_at
+PASS the 1.0.1 write left no schema stamp (1.0.1 knows none): the stamp reads as 0, 'written by an older program'
+
+== 4. doctor, after the 1.0.1 write
+    FAIL Lunchroom's program is not installed at /home/dev/.lunchroom/bin/lunchroom: in a terminal of your own, run `lunchroom install` with the lunchroom program you have, which puts it there
+    FAIL no program named lunchroom is on your PATH: put /home/dev/.local/bin on your PATH and run lunchroom install again in a terminal of your own, which links /home/dev/.lunchroom/bin/lunchroom there
+    FAIL the passphrase check: no passphrase is set; run `lunchroom passphrase` in a terminal of your own to set one
+    PASS the guard decided every call in the last 24 hours
+    FAIL Lunchroom's store was last written by an older Lunchroom program. A session that was started before the upgrade is still running its old program, which drops what this version keeps. Start those sessions anew.
+PASS doctor says: Lunchroom's store was last written by an older Lunchroom program.
+PASS the line tells the user to start those sessions anew
+PASS the line is a FAIL line
+
+== 5. the next 1.0.2 write restores the stamp, not the lost data
+PASS after a 1.0.2 write the stamp is schema = 2 again
+PASS doctor no longer says an older program wrote last
+MEASURED latest_guard_fingerprint after the next 1.0.2 write: {"openclaw": "/home/dev/proof-plugin/index.mjs\n2026.10.7\n1793769268"}
+
+== 6. a field neither program knows (what a later program wrote)
+PASS the unknown field is in the store
+PASS a 1.0.2 write carries the unknown field through
+MEASURED after a 1.0.1 write the unknown field is: ABSENT
+
+== result
+RESULT: 17 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-mixed removed
+
+RESULT: 19 PASS, 0 FAIL

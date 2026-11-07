@@ -1,0 +1,102 @@
+MEASURED free space on /: 8975 MB
+== building lunchroom-realworld-hookfields from Containerfile
+MEASURED image lunchroom-realworld-hookfields: 417 MB
+
+== facts of this system
+claude: 2.1.311 (Claude Code)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code finished
+PASS the session joined as s1
+PASS control, variant hook off: the Bash call ran (output: variant-ran)
+---- form a: what the model was given back: PreToolUse:Bash hook error: [/usr/local/bin/variant-hook.sh]: A-LINE1 first line, on stderr A-LINE2 second line A-LINE3 third line
+MEASURED form a, marker A-LINE1: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+MEASURED form a, marker A-LINE2: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+MEASURED form a, marker A-LINE3: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+---- default screen after form a (non-blank lines, last 14):
+    | ✻ Churned for 0s · done 9:38 AM
+    | ❯ VARTEST ctl
+    |   Ran 1 shell command
+    | ● done
+    | ✻ Sautéed for 0s · done 9:38 AM
+    | ❯ VARTEST a1
+    |   Ran 1 shell command
+    | ● done
+    | ✻ Worked for 0s · done 9:38 AM
+    |                                                            ◐ medium · /effort · Update available! Run: your package manager update command
+    | ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── s1 ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ manual mode on · ? for shortcuts
+---- form b: what the model was given back: PreToolUse:Bash hook error: B-LINE1 first line, in the reason B-LINE2 second line B-LINE3 third line
+MEASURED form b, marker B-LINE1: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+MEASURED form b, marker B-LINE2: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+MEASURED form b, marker B-LINE3: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+---- default screen after form b (non-blank lines, last 14):
+    | ✻ Sautéed for 0s · done 9:38 AM
+    | ❯ VARTEST a1
+    |   Ran 1 shell command
+    | ● done
+    | ✻ Worked for 0s · done 9:38 AM
+    | ❯ VARTEST b1
+    |   Ran 1 shell command
+    | ● done
+    | ✻ Sautéed for 0s · done 9:38 AM
+    |                                                            ◐ medium · /effort · Update available! Run: your package manager update command
+    | ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── s1 ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ manual mode on · ? for shortcuts
+---- form c: what the model was given back: PreToolUse:Bash hook error: C-REASON1 first line, in the reason C-REASON2 second line C-REASON3 third line
+MEASURED form c, marker C-REASON1: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+MEASURED form c, marker C-SYS1: on the default screen: yes; after ctrl+o: yes; in the result the model got: no
+MEASURED form c, marker C-REASON2: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+MEASURED form c, marker C-SYS2: on the default screen: yes; after ctrl+o: yes; in the result the model got: no
+MEASURED form c, marker C-REASON3: on the default screen: no; after ctrl+o: yes; in the result the model got: yes
+MEASURED form c, marker C-SYS3: on the default screen: yes; after ctrl+o: yes; in the result the model got: no
+---- default screen after form c (non-blank lines, last 14):
+    | ● done
+    | ✻ Sautéed for 0s · done 9:38 AM
+    | ❯ VARTEST c1
+    |   Ran 1 shell command
+    |   ⎿  PreToolUse:Bash says: C-SYS1 first line, in systemMessage
+    |      C-SYS2 second line
+    |      C-SYS3 third line
+    | ● done
+    | ✻ Crunched for 0s · done 9:38 AM
+    |                                                            ◐ medium · /effort · Update available! Run: your package manager update command
+    | ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── s1 ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ manual mode on · ? for shortcuts
+---- form d: what the model was given back: variant-ran
+MEASURED form d, marker D-SYS1: on the default screen: yes; after ctrl+o: yes; in the result the model got: no
+MEASURED form d, marker D-SYS2: on the default screen: yes; after ctrl+o: yes; in the result the model got: no
+MEASURED form d, marker D-SYS3: on the default screen: yes; after ctrl+o: yes; in the result the model got: no
+---- default screen after form d (non-blank lines, last 14):
+    | ● done
+    | ✻ Crunched for 0s · done 9:38 AM
+    | ❯ VARTEST d1
+    |   Ran 1 shell command
+    |   ⎿  PreToolUse:Bash says: D-SYS1 first line, in systemMessage alone
+    |      D-SYS2 second line
+    |      D-SYS3 third line
+    | ● done
+    | ✻ Brewed for 0s · done 9:38 AM
+    |                                                            ◐ medium · /effort · Update available! Run: your package manager update command
+    | ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── s1 ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ manual mode on · ? for shortcuts
+
+== summary: which field the default screen showed
+form a, LINE1 first line: default screen = no, after ctrl+o = yes
+form b, LINE1 first line: default screen = no, after ctrl+o = yes
+form c, SYS1 first line: default screen = yes, after ctrl+o = yes
+form c, REASON1 first line: default screen = no, after ctrl+o = yes
+form d, SYS1 first line: default screen = yes, after ctrl+o = yes
+
+== result
+RESULT: 3 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-hookfields removed
+
+RESULT: 3 PASS, 0 FAIL

@@ -1,12 +1,13 @@
 //! Tests for the classifier, on a throwaway home folder under the build's `target` folder.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{Guard, candidates, fence_args, starts_session};
+use super::{Guard, MAX_PATCH_PATHS, candidates, fence_args, patch_paths, starts_session};
 use crate::fs::{BUDGET, OsFs};
 use crate::paths::Layout;
 use crate::policy::{
@@ -549,6 +550,47 @@ fn slip_never_holds_writes_commands_or_protected_calls() {
     }
 }
 
+// §6 P1.4 (2026-11-03) — a call to a file-write tool whose input holds no path or patch the guard
+// can read is DENIED in every session, since it may write Lunchroom's stores; one with a path is
+// judged by that path. Before, such a call was PROTECTED only while HELD, so a session that was not
+// HELD wrote unjudged (found with OpenClaw's `apply_patch`, whose patch is its `input` field).
+#[test]
+fn a_file_write_call_with_nothing_to_judge_is_denied_in_every_session() {
+    let h = Fixture::new();
+    let unreadable = [
+        ("Write", json!({ "content": "x" })),
+        ("Write", json!({ "file_path": 7, "content": "x" })),
+        ("Write", json!({ "file_path": "", "content": "x" })),
+        ("Edit", json!({ "old_string": "a", "new_string": "b" })),
+        ("MultiEdit", json!({ "edits": [] })),
+        ("NotebookEdit", json!({ "new_source": "x" })),
+        ("apply_patch", json!({})),
+        ("apply_patch", json!({ "command": 7 })),
+        ("apply_patch", json!({ "command": "" })),
+    ];
+    for held in [false, true] {
+        for (tool, input) in &unreadable {
+            assert!(
+                matches!(h.class(held, tool, input), CallClass::Denied(_)),
+                "{tool} {input} held={held}"
+            );
+        }
+    }
+    let readable = [
+        (
+            "Write",
+            json!({ "file_path": h.path("project/new.rs"), "content": "x" }),
+        ),
+        (
+            "apply_patch",
+            json!({ "command": format!("*** Begin Patch\n*** Add File: {}\n+x\n*** End Patch\n", h.path("project/n.rs")) }),
+        ),
+    ];
+    for (tool, input) in &readable {
+        assert_eq!(h.class(false, tool, input), CallClass::Ordinary, "{tool}");
+    }
+}
+
 // §6 P1.4 — an agent's write to Lunchroom's stores is DENIED in every session, written directly
 // or through a link; writing Lunchroom's program or the guard's configuration is PROTECTED.
 #[test]
@@ -700,9 +742,20 @@ fn f1_scripts_and_code_are_searched_for_channels() {
         ),
         CONFIG
     );
+    // A word after Lunchroom's name that is an option and not a user-only command runs nothing:
+    // every Lunchroom program, 1.0.1 included, takes its command from its first argument and
+    // prints its usage for anything else (main.rs), so these are not Lunchroom commands (A1.3).
     for code in [
         "import subprocess; subprocess.run(['lunchroom', '--rate', '5'])",
         "import subprocess; subprocess.run(['lunchroom', '--json', 'approve', '3'])",
+    ] {
+        assert_eq!(
+            h.bash(false, &format!("python3 -c \"{code}\"")),
+            CallClass::Ordinary,
+            "{code}"
+        );
+    }
+    for code in [
         "import subprocess; subprocess.run(['lunchroom', '--help', 'approve', '3'])",
         "import subprocess; subprocess.run(['lunchroom', 'listen', '--once'])",
     ] {
@@ -972,6 +1025,11 @@ fn a1_agent_lunchroom_configuration_commands_denied() {
         "lunchroom help yolo all till 14:00".to_owned(),
         "lunchroom --version register x".to_owned(),
         "bash approve.sh".to_owned(),
+        // §14::8: `lunchroom doctor` is the user's command.
+        "lunchroom doctor".to_owned(),
+        format!("{program} doctor"),
+        "lunchroom --help doctor".to_owned(),
+        "sh -c 'lunchroom doctor'".to_owned(),
     ];
     for cmd in &denied {
         assert_eq!(h.bash(false, cmd), CONFIG, "{cmd}");
@@ -2922,5 +2980,622 @@ fn naming_a_harness_program_is_guard_configuration_while_held() {
             call.kinds.contains(ProtectedKind::GuardConfig),
             "{cmd}: {call:?}"
         );
+    }
+}
+
+impl Fixture {
+    /// The class of a call and the part at fault the guard found for it (V1.4).
+    fn explained(&self, held: bool, tool: &str, input: &Value) -> (CallClass, Option<String>) {
+        let fs = OsFs::with_path(BUDGET, Some(self.home.join("bin").into_os_string()));
+        let g = Guard {
+            layout: &self.layout,
+            fs: &fs,
+            held,
+        };
+        let (call, fault) = g.classify_explained(tool, input, &self.home.join("project"));
+        (call.folded(), fault)
+    }
+}
+
+/// A Codex `apply_patch` input: the hook's `tool_input` holds the whole patch under `command`
+/// (docs/host-facts/codex-apply-patch.md).
+fn patch_input(patch: &str) -> Value {
+    json!({ "command": patch })
+}
+
+// G1-1 (Codex 10 s timeouts): `apply_patch` is a file-edit tool, and only the paths on its header
+// lines are judged. A 5,000-line patch whose text is full of wildcards, `~` paths, braces and
+// substitutions is decided at once, with the real file system, and its text is not read as paths.
+#[test]
+fn apply_patch_is_decided_quickly_and_only_its_header_paths_are_judged() {
+    let h = Fixture::new();
+    let mut patch = String::from("*** Begin Patch\n*** Update File: src/main.rs\n@@ fn main() {\n");
+    for i in 0..5_000 {
+        let _ = writeln!(
+            patch,
+            "+// {i} match **/*.rs and ~/.lunchroom/inbox/m{i} and {{a,b}} $(x) [a-z]*?"
+        );
+    }
+    patch.push_str("*** End Patch\n");
+    let input = patch_input(&patch);
+    for held in [true, false] {
+        let started = std::time::Instant::now();
+        let (class, fault) = h.explained(held, "apply_patch", &input);
+        assert!(
+            started.elapsed() < decide_limit(),
+            "held={held}: {:?}",
+            started.elapsed()
+        );
+        // Decided: an ordinary call, not undecided, not DENIED for text in the patch's lines.
+        assert_eq!(class, CallClass::Ordinary, "held={held}");
+        assert_eq!(fault, None, "held={held}");
+    }
+}
+
+// G1-1: each header line's path is judged as a write, in every session for Lunchroom's stores and
+// while HELD for transcripts; a line of file contents that looks like a header is not.
+#[test]
+fn apply_patch_judges_each_kind_of_header_line() {
+    let h = Fixture::new();
+    let store = h.path(".lunchroom/registry.json");
+    let transcript = h.path(".claude/projects/p/t.jsonl");
+    let wrap = |body: &str| format!("*** Begin Patch\n{body}*** End Patch\n");
+    let cases = [
+        (
+            wrap(&format!("*** Add File: {store}\n+x\n")),
+            CONFIG,
+            &store,
+        ),
+        (wrap(&format!("*** Delete File: {store}\n")), CONFIG, &store),
+        (
+            wrap(&format!("*** Update File: {store}\n@@\n-a\n+b\n")),
+            CONFIG,
+            &store,
+        ),
+        (
+            wrap(&format!(
+                "*** Update File: src/main.rs\n*** Move to: {store}\n@@\n-a\n+b\n"
+            )),
+            CONFIG,
+            &store,
+        ),
+        (
+            wrap(&format!(
+                "*** Add File: src/ok.rs\n+fine\n  *** Delete File: {store}\n"
+            )),
+            CONFIG,
+            &store,
+        ),
+    ];
+    for (patch, expected, path) in &cases {
+        for held in [true, false] {
+            let (class, fault) = h.explained(held, "apply_patch", &patch_input(patch));
+            assert_eq!(class, *expected, "held={held}: {patch}");
+            assert_eq!(
+                fault.as_deref(),
+                Some(path.as_str()),
+                "held={held}: {patch}"
+            );
+        }
+    }
+    // A transcript is DENIED while HELD, and an ordinary write when the agent is not HELD.
+    let patch = wrap(&format!("*** Update File: {transcript}\n@@\n-a\n+b\n"));
+    let (class, fault) = h.explained(true, "apply_patch", &patch_input(&patch));
+    assert_eq!(class, DENIED_PATH);
+    assert_eq!(fault.as_deref(), Some(transcript.as_str()));
+    assert_eq!(
+        h.explained(false, "apply_patch", &patch_input(&patch)).0,
+        CallClass::Ordinary
+    );
+    // File contents are not paths: a content line that holds a header, a context line's path and
+    // the words of a hunk's heading name nothing.
+    let contents = wrap(&format!(
+        "*** Update File: src/main.rs\n@@ {store}\n+*** Add File: {store}\n+*** Delete File: {transcript}\n -{store}\n"
+    ));
+    for held in [true, false] {
+        let (class, fault) = h.explained(held, "apply_patch", &patch_input(&contents));
+        assert_eq!(class, CallClass::Ordinary, "held={held}");
+        assert_eq!(fault, None, "held={held}");
+    }
+    // An input with no patch in it cannot be read: DENIED in every session (P1.4, 2026-11-03).
+    for held in [true, false] {
+        assert!(
+            matches!(
+                h.explained(held, "apply_patch", &json!({})).0,
+                CallClass::Denied(_)
+            ),
+            "held={held}"
+        );
+    }
+}
+
+// G1-1: the paths of a patch are exactly its header paths, once each, in order; Codex reads a
+// header from the trimmed line (`streaming_parser.rs`), so an indented header counts; a patch
+// naming more than the limit is cut and says so.
+#[test]
+fn apply_patch_paths_are_exactly_the_header_paths() {
+    let patch = "*** Begin Patch\n\
+                 *** Add File: src/a.rs\n\
+                 +*** Add File: src/not-a-path.rs\n\
+                 *** Update File: src/b.rs\n\
+                 *** Move to: src/c.rs\n\
+                 @@ *** Delete File: src/not-either.rs\n\
+                 -old\n\
+                 +new\n\
+                 \x20 *** Delete File: src/d.rs  \n\
+                 *** Update File: src/a.rs\n\
+                 *** Add File: \n\
+                 *** End Patch\n";
+    assert_eq!(
+        patch_paths(patch),
+        (vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], false)
+    );
+    assert_eq!(
+        super::patch_files(patch),
+        vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]
+    );
+    assert_eq!(patch_paths(""), (Vec::new(), false));
+    assert_eq!(patch_paths("not a patch\nat all"), (Vec::new(), false));
+    let add_files = |count: usize| -> String {
+        let mut out = String::new();
+        for i in 0..count {
+            let _ = writeln!(out, "*** Add File: f{i}");
+        }
+        out
+    };
+    let many = add_files(MAX_PATCH_PATHS + 1);
+    let (paths, cut) = patch_paths(&many);
+    assert!(cut);
+    assert_eq!(paths.len(), MAX_PATCH_PATHS);
+    assert_eq!(paths.last(), Some(&"f199"));
+    let exact = add_files(MAX_PATCH_PATHS);
+    assert!(!patch_paths(&exact).1);
+    // A patch of more files than the limit is PROTECTED while HELD, an ordinary write otherwise.
+    let h = Fixture::new();
+    assert_eq!(
+        h.explained(true, "apply_patch", &patch_input(&many)).0,
+        UNPARSED
+    );
+    assert_eq!(
+        h.explained(false, "apply_patch", &patch_input(&many)).0,
+        CallClass::Ordinary
+    );
+}
+
+// G1-1: an unknown tool given a long text full of wildcards and paths is decided at once too:
+// candidates are counted once each and cut at a limit, and what is cut makes a HELD call PROTECTED
+// as unparsed.
+#[test]
+fn an_unknown_tool_with_a_long_text_is_decided_at_once() {
+    let h = Fixture::new();
+    let mut text = String::new();
+    for i in 0..5_000 {
+        let _ = writeln!(
+            text,
+            "line {i} matches **/*.rs and a/b/c{i} and [a-z]*?x{i}"
+        );
+    }
+    let input = json!({ "patch": text });
+    let started = std::time::Instant::now();
+    let class = h.class(true, "mystery_tool", &input);
+    assert!(
+        started.elapsed() < decide_limit(),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(class, UNPARSED);
+    let started = std::time::Instant::now();
+    assert_eq!(h.class(false, "mystery_tool", &input), CallClass::Ordinary);
+    assert!(started.elapsed() < decide_limit());
+    // The store path comes after thousands of words, past the limit of strings looked up in the
+    // file system: it is still found, in every session.
+    let hidden = json!({ "patch": format!("{text} ~/.lunchroom/inbox/m1") });
+    assert_eq!(h.class(false, "mystery_tool", &hidden), CONFIG);
+    assert_eq!(h.class(true, "mystery_tool", &hidden), CONFIG);
+    // Each candidate is once (the word, then each part and each part from its first `/`), however
+    // many there are, and a string past the limit is still judged by its text: a store path written
+    // out in full among thousands of words is found.
+    let word = (0..1_000)
+        .map(|i| format!("a/{i}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let found = candidates(&word);
+    assert_eq!(found.len(), 2_001);
+    let mut sorted = found.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), found.len());
+    assert_eq!(candidates("a/b a/b"), vec!["a/b a/b", "a/b", "/b"]);
+}
+
+/// How long a decision on a very large call may take in these tests: 1 s in the release build that
+/// ships (measured 2026-11-02: the 5,000-line case passes), 3 s in an unoptimized test build, whose
+/// code runs several times slower (the same case measured 1.39 s there, alone).
+fn decide_limit() -> Duration {
+    if cfg!(debug_assertions) {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(1)
+    }
+}
+
+// G1-1: a path the file system cannot be asked about because the budget has run out is incomplete,
+// not missing. As a search cut short (L1.1), a HELD read of it is one Lunchroom could not check,
+// which goes to the user (H1.5); it is not DENIED as a path that cannot be followed.
+#[test]
+fn a_call_out_of_time_is_judged_as_possibly_anywhere() {
+    let h = Fixture::new();
+    let fs = OsFs::with_path(Duration::ZERO, Some(h.home.join("bin").into_os_string()));
+    let g = Guard {
+        layout: &h.layout,
+        fs: &fs,
+        held: true,
+    };
+    let input = json!({ "file_path": h.path("project/src/main.rs") });
+    assert_eq!(
+        g.classify("Read", &input, &h.home.join("project")),
+        CREDENTIAL
+    );
+}
+
+// G1-2: a DENIED search names the folder the call searched and nothing found below it. A file
+// found in the walk, a link's target and an expansion of a wildcard are other sessions' files, and
+// are never in the part at fault.
+#[test]
+fn a_denied_search_names_only_the_folder_searched() {
+    let h = Fixture::new();
+    let claude = h.path(".claude");
+    let searches = [
+        (
+            "Grep",
+            json!({ "pattern": "x", "path": claude }),
+            claude.clone(),
+        ),
+        (
+            "Bash",
+            json!({ "command": format!("grep -r token {claude}") }),
+            claude.clone(),
+        ),
+        (
+            "Bash",
+            json!({ "command": format!("rg token {claude}") }),
+            claude.clone(),
+        ),
+        ("Bash", json!({ "command": "grep -r x" }), h.path("project")),
+    ];
+    for (tool, input, folder) in &searches {
+        let (class, fault) = h.explained(true, tool, input);
+        assert_eq!(class, DENIED_PATH, "{tool} {input}");
+        assert_eq!(
+            fault.as_deref(),
+            Some(format!("a search of {folder}").as_str()),
+            "{tool} {input}"
+        );
+        let fault = fault.unwrap_or_default();
+        for below in [
+            "projects",
+            "t.jsonl",
+            "settings.json",
+            ".lunchroom",
+            "inbox",
+        ] {
+            assert!(!fault.contains(below), "{tool} {input}: {fault}");
+        }
+    }
+    // A glob names the pattern with the folder the call gave it.
+    let (class, fault) = h.explained(
+        true,
+        "Glob",
+        &json!({ "pattern": "**/*.jsonl", "path": h.home.to_string_lossy() }),
+    );
+    assert_eq!(class, DENIED_PATH);
+    assert_eq!(
+        fault,
+        Some(format!(
+            "a search of {}",
+            h.home.join("**/*.jsonl").display()
+        ))
+    );
+    // A link into the stores is named as the call wrote it, not by its target.
+    let link = h.path("project/inbox-link");
+    let (class, fault) = h.explained(true, "Read", &json!({ "file_path": link }));
+    assert_eq!(class, DENIED_PATH);
+    assert_eq!(fault, Some(link));
+    // So is a wildcard, not the file it matched.
+    let wild = h.path(".lunch*/inbox/m?");
+    let (class, fault) = h.explained(true, "Read", &json!({ "file_path": wild }));
+    assert_eq!(class, DENIED_PATH);
+    assert_eq!(fault, Some(wild));
+}
+
+// G1-3: `lunchroom check` is the user's: in the shell, in a script a shell runs, and in code a
+// program is handed, it is DENIED in every session; `send`, `status` and `codex-threads` are not.
+#[test]
+fn lunchroom_check_is_the_users_command() {
+    let h = Fixture::new();
+    write(&h.home.join("project/check.sh"), "lunchroom check alice\n");
+    let program = h.path(".lunchroom/bin/lunchroom");
+    let denied = [
+        "lunchroom check".to_owned(),
+        "lunchroom check alice".to_owned(),
+        format!("{program} check alice"),
+        "lunchroom --help check".to_owned(),
+        "mywrap lunchroom check alice".to_owned(),
+        "sh -c 'lunchroom check alice'".to_owned(),
+        "bash check.sh".to_owned(),
+        "python3 -c \"import subprocess; subprocess.run(['lunchroom', 'check', 'alice'])\""
+            .to_owned(),
+    ];
+    for cmd in &denied {
+        assert_eq!(h.bash(false, cmd), CONFIG, "{cmd}");
+        assert_eq!(h.bash(true, cmd), CONFIG, "{cmd}");
+    }
+    for cmd in [
+        "lunchroom send alice hi",
+        "lunchroom status",
+        "lunchroom codex-threads",
+        "lunchroom send alice please check the build",
+    ] {
+        assert!(!matches!(h.bash(false, cmd), CallClass::Denied(_)), "{cmd}");
+    }
+}
+
+// G1-9: the part at fault for every shape of DENIED path in the corpus, exactly as the call wrote
+// it, and always there: a cat, the Read tool, a redirection, a nested shell, a heredoc handed to a
+// shell, a recursive grep, the Grep and Glob tools. The rule that denies first names the fault.
+#[test]
+fn every_denied_path_names_its_fault() {
+    let h = Fixture::new();
+    let transcript = h.path(".claude/projects/p/t.jsonl");
+    let codex = h.path(".codex/sessions/s.jsonl");
+    let claude = h.path(".claude");
+    let bash = |command: String| ("Bash", json!({ "command": command }));
+    let cases: Vec<(&str, Value, String)> = vec![
+        {
+            let (t, i) = bash(format!("cat {transcript}"));
+            (t, i, transcript.clone())
+        },
+        {
+            let (t, i) = bash(format!("cat {transcript} {codex}"));
+            (t, i, transcript.clone())
+        },
+        {
+            let (t, i) = bash(format!("cat < {transcript}"));
+            (t, i, transcript.clone())
+        },
+        {
+            let (t, i) = bash(format!("sh -c 'cat {codex}'"));
+            (t, i, codex.clone())
+        },
+        {
+            let (t, i) = bash(format!("sh -c \"sh -c 'cat {transcript}'\""));
+            (t, i, transcript.clone())
+        },
+        {
+            let (t, i) = bash(format!("bash <<EOF\ncat {transcript}\nEOF\n"));
+            (t, i, transcript.clone())
+        },
+        {
+            let (t, i) = bash(format!("grep -r token {claude}"));
+            (t, i, format!("a search of {claude}"))
+        },
+        {
+            let (t, i) = bash(format!("ls -R {claude}"));
+            (t, i, format!("a search of {claude}"))
+        },
+        (
+            "Read",
+            json!({ "file_path": transcript }),
+            transcript.clone(),
+        ),
+        ("Read", json!({ "file_path": codex }), codex.clone()),
+        (
+            "Grep",
+            json!({ "pattern": "x", "path": claude }),
+            format!("a search of {claude}"),
+        ),
+        (
+            "LS",
+            json!({ "path": h.path(".claude/projects") }),
+            h.path(".claude/projects"),
+        ),
+        (
+            "Read",
+            json!({ "file_path": "/proc/self/environ" }),
+            "/proc/self/environ".to_owned(),
+        ),
+    ];
+    for (tool, input, fault) in &cases {
+        let (class, found) = h.explained(true, tool, input);
+        assert_eq!(class, DENIED_PATH, "{tool} {input}");
+        assert!(
+            found.is_some(),
+            "{tool} {input}: a DENIED path names its fault"
+        );
+        assert_eq!(found.as_deref(), Some(fault.as_str()), "{tool} {input}");
+        // Not HELD: none of these is DENIED, so there is no part at fault.
+        let (class, found) = h.explained(false, tool, input);
+        assert!(!matches!(class, CallClass::Denied(_)), "{tool} {input}");
+        assert_eq!(found, None, "{tool} {input}");
+    }
+}
+
+// G1-9: a fault belongs to the rule that made the class shown. A later rule of the same class
+// does not replace it, and a rule of a lower class does not set one.
+#[test]
+fn the_fault_belongs_to_the_first_rule_of_the_class_shown() {
+    let h = Fixture::new();
+    let store = h.path(".lunchroom/registry.json");
+    let other = h.path(".lunchroom/inbox/m1");
+    let (class, fault) = h.explained(
+        false,
+        "Bash",
+        &json!({ "command": format!("cat {store} {other}") }),
+    );
+    assert_eq!(class, CONFIG);
+    assert_eq!(fault, Some(store.clone()));
+    // A transcript read after a store write: the store's class is Configuration, DENIED path is
+    // another DENIED class; the first to be raised to the shown rank keeps the fault.
+    let transcript = h.path(".claude/projects/p/t.jsonl");
+    let (class, fault) = h.explained(
+        true,
+        "Bash",
+        &json!({ "command": format!("cat {transcript}; cat {store}") }),
+    );
+    assert!(matches!(class, CallClass::Denied(_)));
+    assert!(fault.is_some_and(|f| f == transcript || f == store));
+    // An ordinary call has no fault.
+    assert_eq!(
+        h.explained(true, "Bash", &json!({ "command": "ls src" })).1,
+        None
+    );
+}
+
+// Field report, 2026-11-02 (1.0.1 guard on a live machine): ordinary commands in a session that is
+// not HELD were DENIED as "unparsed". In a session that is not HELD each of them is an ordinary
+// call, which runs.
+#[test]
+fn ordinary_commands_reported_unparsed_in_the_field_are_ordinary() {
+    let h = Fixture::new();
+    for cmd in [
+        "install -m 644 /tmp/a/graph_run.sh /tmp/b/graph_run.sh",
+        "python3 -I /tmp/x/script.py",
+        "S=/tmp/s; B=/tmp/b; mkdir -p $B; cd $S; python3 make.py",
+        "cd /tmp; sed -n 1,5p a.txt; f=$(find . -name '*.dxf'); echo $f",
+    ] {
+        assert_eq!(h.bash(false, cmd), CallClass::Ordinary, "{cmd}");
+    }
+}
+
+// F1.2 (docs/spec/lunchroom-spec.md, §12 item 2): "A command that runs a shell script the guard
+// cannot find or read … is DENIED in every session." It holds for a script another user owns
+// (the field case on 2026-11-02: `sudo -n -u svc bash -c '… source /opt/secrets/.env …'`): an
+// account with password-free sudo, as the account that ran this field case has, can write as that
+// user, so ownership proves nothing about who wrote it. `/etc/sudoers` (root's, mode 0440) is such a
+// file where the tests do not run as root.
+#[test]
+fn a_script_the_guard_cannot_read_is_denied_in_every_session() {
+    let h = Fixture::new();
+    let sudoers = std::path::Path::new("/etc/sudoers");
+    if std::fs::read(sudoers).is_err() && sudoers.is_file() {
+        for cmd in [
+            "sudo -n -u someone bash /etc/sudoers",
+            "bash /etc/sudoers",
+            "sudo -n -u someone bash -c 'set -a && source /etc/sudoers && set +a; echo done'",
+            ". /etc/sudoers",
+        ] {
+            assert_eq!(
+                h.bash(false, cmd),
+                CallClass::Denied(DenyReason::Unparsed),
+                "{cmd}"
+            );
+            assert_eq!(
+                h.bash(true, cmd),
+                CallClass::Denied(DenyReason::Unparsed),
+                "{cmd}"
+            );
+        }
+    }
+    // A script that does not exist, and one this account owns but cannot read.
+    let missing = h.path("nowhere/run.sh");
+    assert_eq!(
+        h.bash(false, &format!("bash {missing}")),
+        CallClass::Denied(DenyReason::Unparsed)
+    );
+    let own = h.home.join("mine.sh");
+    write(&own, "echo hi");
+    let _ = std::fs::set_permissions(&own, std::os::unix::fs::PermissionsExt::from_mode(0o000));
+    if std::fs::read(&own).is_err() {
+        assert_eq!(
+            h.bash(false, &format!("bash {}", own.display())),
+            CallClass::Denied(DenyReason::Unparsed)
+        );
+    }
+}
+
+// 1.0.2, option A (decided 2026-11-03): the console ships switched off, and so do its guard rules.
+// An agent that is not HELD is not blocked from terminals, debuggers, signals, tmux or `ptrace`;
+// another process's folder in /proc (its memory, environment, descriptors) is, as in 1.0.1, a read
+// L1.1 DENIES while HELD (the lesson of the 2026 Hugging Face incident, already in place), and adds
+// nothing otherwise.
+#[cfg(not(feature = "console"))]
+#[test]
+fn without_the_console_its_rules_block_nothing() {
+    let h = Fixture::new();
+    for cmd in [
+        "echo hi > /dev/pts/7",
+        "cat /dev/tty3",
+        "kill -0 4242",
+        "pkill lunchroom",
+        "strace -p 4242",
+        "gdb -p 4242",
+        "tmux send-keys -t other ls Enter",
+        "tmux capture-pane -p -t other",
+        "python3 -c 'import ctypes; ctypes.CDLL(None).ptrace(16, 4242, 0, 0)'",
+        "cat /proc/4242/environ",
+    ] {
+        assert_eq!(h.bash(false, cmd), CallClass::Ordinary, "{cmd}");
+    }
+    assert_eq!(h.bash(true, "cat /proc/4242/environ"), DENIED_PATH);
+    assert_eq!(h.bash(true, "head -c 64 /proc/4242/mem"), DENIED_PATH);
+}
+
+// #42 item 3 (the lesson of the 2026 Hugging Face incident: every shared file is a channel between
+// agents): each file Lunchroom keeps in its folder, the store and every file 1.0.2 added beside it,
+// is a store path. P1.4 (docs/spec/lunchroom-spec.md §6 item 4): "A command that names a path in
+// Lunchroom's stores, a reply included, … counts as writing them", and a write of the stores is
+// DENIED, never asked: no agent, HELD or not, can read, write, move or remove any of them, by a
+// command or by a file tool.
+#[test]
+fn every_shared_lunchroom_file_is_out_of_an_agents_reach() {
+    let h = Fixture::new();
+    for name in [
+        "store/state.json",
+        "store/state.json.prev",
+        "store/state.flock",
+        "guard-records.jsonl",
+        "guard-records.jsonl.tmp",
+        "guard-records.flock",
+        "guard-records.d/1793600000-42.json",
+        "checks/1793600000-42.waiting",
+        "checks/1793600000-42.running",
+        "check.flock",
+        "rpm-owner.cache",
+    ] {
+        let p = h.home.join(".lunchroom").join(name);
+        write(&p, "x");
+        let shown = p.display().to_string();
+        // L1.1 for the file tools: a HELD agent's read is DENIED; an agent that is not HELD reads
+        // as any read (L1.1 holds only while HELD; P1.4's rule is for commands).
+        assert_eq!(
+            h.class(true, "Read", &json!({ "file_path": shown })),
+            DENIED_PATH,
+            "{name}"
+        );
+        assert_eq!(
+            h.class(false, "Read", &json!({ "file_path": shown })),
+            CallClass::Ordinary,
+            "{name}"
+        );
+        for held in [false, true] {
+            for cmd in [
+                format!("cat {shown}"),
+                format!("echo x > {shown}"),
+                format!("rm {shown}"),
+                format!("mv {shown} /tmp/away"),
+                format!("cp /tmp/forged {shown}"),
+            ] {
+                assert_eq!(h.bash(held, &cmd), CONFIG, "{name}: {cmd}");
+            }
+            assert_eq!(
+                h.class(
+                    held,
+                    "Write",
+                    &json!({ "file_path": shown, "content": "x" })
+                ),
+                CONFIG,
+                "{name}"
+            );
+        }
     }
 }

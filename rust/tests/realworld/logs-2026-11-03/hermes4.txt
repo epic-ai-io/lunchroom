@@ -1,0 +1,80 @@
+MEASURED free space on /: 8675 MB
+== building lunchroom-realworld-hermes from Containerfile
+MEASURED image lunchroom-realworld-hermes: 2947 MB
+
+== facts of this system
+os: Debian GNU/Linux 13 (trixie)
+python: Python 3.14.10
+hermes: Hermes Agent v0.22.5+1722.g9976f48 (2026.9.24) · stable · local 9976f4857b72
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install hermes finished
+    install: installed /home/dev/.lunchroom/bin/lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+    install: wrote /home/dev/.hermes/plugins/lunchroom/plugin.yaml
+    install: wrote /home/dev/.hermes/plugins/lunchroom/__init__.py
+    install: Steps only you can do (Lunchroom writes no trust record):
+    install: 1. hermes plugins enable lunchroom
+    install: 2. Start each Hermes session that Lunchroom should guard anew: Hermes loads a plugin when a session starts.
+    install: 3. In each session that should receive messages, type join (or join <name>); type leave to take it out.
+    install: hold mode: Balanced (change it with: lunchroom mode relaxed|balanced|strict)
+    install: 
+    install: Setting your passphrase:
+    install: made the passphrase check (600000 rounds of PBKDF2)
+    install: put it at /etc/lunchroom/1000.verifier, owned by root
+    install: read it back: it is owned by root and holds the passphrase just typed
+    install: the passphrase is set; `sudo rm /etc/lunchroom/1000.verifier` removes the check
+    enable: Preparing the isolated Hermes runtime…
+    enable:   → Installing Python dependencies…
+    enable:   ✓ Installing Python dependencies
+    enable:   → Installing Python dependencies…
+    enable:   ✓ Installing Python dependencies
+MEASURED plugins list: │ lunchroom           │ enabled     │ 1.0.2   │ Lunchroom's guard:   │ user    │
+PASS Hermes lists the Lunchroom plugin as enabled
+    config: ✓ Set model.provider = custom in /home/dev/.hermes/config.yaml
+    config: ✓ Set model.base_url = http://127.0.0.1:8099/v1 in /home/dev/.hermes/config.yaml
+    config: ✓ Set model.default = mock-1 in /home/dev/.hermes/config.yaml
+
+== 1. a session joins
+    turn:   hermes -c "ok"
+    turn: 
+    turn: Session:        local-b88d3ce94f44505c4511726ff19e258958dd6357a4f82e9d0462c00e2d635ce4
+    turn: Title:          ok
+    turn: Duration:       16s
+    turn: Messages:       2 (1 user, 0 tool calls)
+    1 agent: 1 UNGUARDED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    hm	hermes:local-b88d3ce94f44505c4511726ff19e258958dd6357a4f82e9d0462c00e2d635ce4	UNGUARDED	QUEUED 0
+      why: Hermes's release cannot be read from the install of its program (/usr/local/bin/python3.14): Lunchroom reads it from the release Lunchroom's plugin reports with each guard hook it runs. To fix it, run lunchroom install hermes in a terminal of your own, so the plugin reports it, then start the session anew.
+FAIL the Hermes session is not AVAILABLE
+    PASS Hermes: Lunchroom is installed and its configuration runs the whole guard
+    FAIL Hermes: the release Lunchroom's plugin reported in Hermes's latest session, on 2026-11-03 at 09:34 UTC, 3 s ago, cannot be read (unknown): run lunchroom install hermes in a terminal of your own, so the plugin reports it, then start a Hermes session and run lunchroom doctor again.
+    FAIL agent hm (Hermes) is UNGUARDED (running, but its guard is not, so nothing it does is checked): Hermes's release cannot be read from the install of its program (/usr/local/bin/python3.14): Lunchroom reads it from the release Lunchroom's plugin reports with each guard hook it runs. To fix it, run lunchroom install hermes in a terminal of your own, so the plugin reports it, then start the session anew.
+FAIL doctor has a FAIL line for Hermes
+
+== 1b. what Hermes's version information gives the plugin
+MEASURED as dev, root-owned install: {'commit': None, 'commit_date': None, 'base_version': 'unknown'}
+MEASURED as root:                    {'commit': '9976f4857b72439d79016354d7b6e1a3ee952e2f', 'commit_date': 1793038003, 'base_version': '0.22.5'}
+MEASURED git as dev: fatal: detected dubious ownership in repository at '/opt/hermes-agent'
+MEASURED as dev, install owned by dev: {'commit': '9976f4857b72439d79016354d7b6e1a3ee952e2f', 'commit_date': 1793038003, 'base_version': '0.22.5'}
+MEASURED hermes processes before: 370 
+MEASURED hermes processes after SIGTERM: 
+    2 agents: 1 AVAILABLE, 1 STOPPED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    hm2	hermes:local-c1fc2450878462e60788debad252df4b0e68187da7d09f9e8967abc702efd4cb	AVAILABLE	QUEUED 0
+    hm	hermes:local-b88d3ce94f44505c4511726ff19e258958dd6357a4f82e9d0462c00e2d635ce4	STOPPED	QUEUED 0
+PASS with the install owned by the user, the Hermes session hm2 is AVAILABLE (the release is read)
+
+== 2. tool calls through the plugin
+MEASURED the terminal tool, 'codex queue other hi': the model was given back: {"error": "Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`.\nWhat was DENIED: the terminal command `codex queue other hi` (the part at fault: codex queue other hi).\nWhy: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session.\nWays forward:\n- The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's identity from as they are.\n- The user: run it in a terminal of their own, outside every agent session."}
+PASS a raw 'codex queue' is blocked in the Hermes session (DENIED text reached the model)
+MEASURED the terminal tool, 'ls /opt/proof': the model was given back: {"output": "chatmock.py\ninner.sh\nlib.sh\nlunchroom\nplaintext.py\nptyrun.py", "exit_code": 0, "error": null}
+PASS the control call ran (its output lists /opt/proof)
+MEASURED the tools Hermes offered: {"path": "/v1/chat/completions", "tools": ["patch", "read_file", "search_files", "terminal", "write_file", "tool_search", "tool_describe", "tool_call"], "roles": ["system", "user"]}
+
+== result
+RESULT: 5 PASS, 2 FAIL
+MEASURED image lunchroom-realworld-hermes removed
+
+RESULT: 5 PASS, 2 FAIL

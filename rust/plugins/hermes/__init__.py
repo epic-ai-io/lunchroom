@@ -19,8 +19,10 @@ it where nobody can answer, until the guard has judged a turn the user typed (T1
 import importlib
 import json
 import os
+import stat
 import re
 import subprocess
+import time
 import uuid
 
 PROGRAM = "__LUNCHROOM_PROGRAM__"
@@ -28,6 +30,18 @@ PROGRAM = "__LUNCHROOM_PROGRAM__"
 # system stops the guard before it answers.
 DEADLINE_SECONDS = 12
 PLUGIN_FILE = os.path.abspath(__file__)
+
+# How long Hermes lets a ``pre_llm_call`` callback run: ``plugins.hook_callback_timeout``, 30 seconds
+# unless the user set another (NousResearch/hermes-agent at 9976f4857b72, ``hermes_cli/plugins_dispatch.py:183``
+# ``_HOOK_CALLBACK_TIMEOUT_SECS = 30.0``; ``pre_llm_call`` is in the bounded set, line 44; the setting is
+# read by ``hermes_cli/plugins.py:1049-1071`` ``_resolve_hook_callback_timeout``). Past it Hermes
+# abandons the callback and the turn goes on with nothing from it (fail open), so the guard's
+# answer and the next message together must fit under it, with a margin.
+HOOK_LIMIT_SECONDS = 30.0
+HOOK_MARGIN_SECONDS = 5.0
+# The listener is not started with less than this left of the budget; the next message then waits
+# for the next turn.
+MIN_LISTEN_SECONDS = 2.0
 
 # Hermes surfaces where the turn's text is typed by the person at this computer.
 TYPED_PLATFORMS = frozenset({"cli", "tui", "desktop"})
@@ -80,28 +94,126 @@ def harness_version():
         info = get_version_info()
         if info.commit and info.commit_date:
             return f"{info.commit}@{info.commit_date}"
+        if not info.commit:
+            # Read once per process, as Hermes reads its own version once: the walk of the
+            # checkout and the two git runs stay out of every later call's time.
+            if "release" not in CHECKOUT_READ:
+                CHECKOUT_READ["release"] = root_checkout_release()
+            if CHECKOUT_READ["release"]:
+                return CHECKOUT_READ["release"]
         return str(info.commit or info.base_version or "")
     except Exception:
         return ""
 
 
-def run_guard(args, payload, program=None):
-    """One guard run: its exit code and output, ``missing`` or ``failed``."""
+# The owner a checkout must have to be trusted (H1.2); a test stands in its own uid.
+ROOT_UID = 0
+
+# What `root_checkout_release` found, once per process (key "release").
+CHECKOUT_READ = {}
+
+# The most entries a checkout may hold for the plugin to check it; a larger one is not trusted.
+CHECKOUT_LIMIT = 200000
+
+
+def checkout_is_roots(repo):
+    """H1.2: what the two git commands the plugin runs (`rev-parse HEAD`, `log -1`) read is the
+    checkout's `.git`, so that is what must be root's: the checkout folder itself (whoever can
+    write it can replace `.git`) and every entry in `.git`, owned by root, writable by no group or
+    other user, with no symbolic link in `.git` (a link could lead git to a file someone else
+    writes). The working tree is read by neither command, so a file there that others can write,
+    such as the `.venv/.lock` that `uv` leaves writable by all, does not matter. A `.git` with more
+    than ``CHECKOUT_LIMIT`` entries, or one that cannot be read, is not trusted."""
+    git_dir = os.path.join(repo, ".git")
+    try:
+        top = os.lstat(repo)
+    except OSError:
+        return False
+    if top.st_uid != ROOT_UID or top.st_mode & 0o022 or stat.S_ISLNK(top.st_mode):
+        return False
+    seen = 0
+    # A folder in `.git` that cannot be listed is one whose entries are not examined: the walk
+    # fails, and the checkout is not trusted (os.walk skips such a folder unless told otherwise).
+    unread = []
+    for root, dirs, files in os.walk(git_dir, onerror=unread.append):
+        for name in [None, *dirs, *files]:
+            path = root if name is None else os.path.join(root, name)
+            seen += 1
+            if seen > CHECKOUT_LIMIT:
+                return False
+            try:
+                st = os.lstat(path)
+            except OSError:
+                return False
+            if stat.S_ISLNK(st.st_mode) or st.st_uid != ROOT_UID or st.st_mode & 0o022:
+                return False
+    return seen > 0 and not unread
+
+
+def root_checkout_release():
+    """H1.2: where Hermes runs from a git checkout another user owns, git refuses to read it
+    ("dubious ownership") and Hermes's version information has no commit. The commit and its date
+    are then read with git told to trust that one checkout, only when root owns the checkout and
+    its ``.git`` and no group or other user can write to either; otherwise nothing is read."""
+    try:
+        import hermes_cli
+
+        repo = os.path.dirname(os.path.dirname(os.path.realpath(hermes_cli.__file__)))
+        if not os.path.isdir(os.path.join(repo, ".git")) or not checkout_is_roots(repo):
+            return ""
+
+        def git(*args):
+            run = subprocess.run(["git", "-c", f"safe.directory={repo}", *args], cwd=repo,
+                                 capture_output=True, text=True, timeout=3)
+            return run.stdout.strip() if run.returncode == 0 else ""
+
+        commit = git("rev-parse", "HEAD")
+        date = git("log", "-1", "--format=%ct", "HEAD")
+        if commit and date.isdigit():
+            return f"{commit}@{date}"
+        return commit
+    except Exception:
+        return ""
+
+
+def hook_budget():
+    """The seconds a ``pre_llm_call`` callback may use in all: Hermes's own limit for it, less a
+    margin. Hermes's limit is the user's ``plugins.hook_callback_timeout`` when it is a positive
+    number, else 30 seconds (``_resolve_hook_callback_timeout``; a value of 0 or less turns the
+    bound off, and the plugin then keeps to the default)."""
+    limit = HOOK_LIMIT_SECONDS
+    try:
+        from hermes_cli.plugins import _resolve_hook_callback_timeout
+
+        value = float(_resolve_hook_callback_timeout())
+        if value > 0:
+            limit = value
+    except Exception:  # noqa: BLE001 -- another Hermes: the default limit
+        pass
+    return max(limit - HOOK_MARGIN_SECONDS, MIN_LISTEN_SECONDS)
+
+
+def run_guard(args, payload, program=None, timeout=None):
+    """One guard run: its exit code and output, ``missing`` or ``failed``. ``timeout`` is the most
+    seconds it may take (never more than ``DEADLINE_SECONDS``). Its output is read as UTF-8, with a
+    replacement for any byte that is not, so output that is not text never raises."""
     data = dict(payload, harness="hermes", plugin_file=PLUGIN_FILE, harness_version=harness_version())
+    limit = DEADLINE_SECONDS if timeout is None else max(0.1, min(DEADLINE_SECONDS, timeout))
     try:
         run = subprocess.run(
             [program or PROGRAM, *args],
             input=json.dumps(data, default=str),
             capture_output=True,
-            text=True,
-            timeout=DEADLINE_SECONDS,
+            encoding="utf-8",
+            errors="replace",
+            timeout=limit,
             check=False,
         )
     except FileNotFoundError:
         return {"missing": True}
     except subprocess.TimeoutExpired:
         return {"failed": "no answer in time"}
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return {"failed": str(exc)}
     if run.returncode < 0:
         return {"failed": f"stopped by signal {-run.returncode}"}
@@ -156,7 +268,15 @@ def _decision(stdout):
 
 
 def _context(stdout):
-    """What the guard's prompt hook adds to the turn (I1.5: the session's name after ``join``)."""
+    """What the guard's prompt hook adds to the turn: its ``additionalContext`` (the session's name
+    after ``join``, a sender's notices). The guard's ``systemMessage`` is text for the user and is
+    never added: Hermes shows the user nothing from ``pre_llm_call`` (it reads only ``context`` from
+    a callback's result, ``agent/turn_context.py:838-841`` at 9976f4857b72, and adds it to the turn's
+    user message, ``:806-808``), so the plugin tells the guard it cannot show the user text
+    (``can_show_user: false``) and the guard leaves the user's notices where ``lunchroom status``
+    shows them. ``PluginContext.post_message`` (``hermes_cli/plugins.py:607``) posts text to the
+    user only through a live gateway (``hermes_cli/plugin_messages.py:5``, ``:99-111``), which the
+    terminal surfaces this plugin serves do not have."""
     try:
         hook = json.loads(stdout.strip() or "{}").get("hookSpecificOutput") or {}
         return hook.get("additionalContext") or ""
@@ -239,12 +359,17 @@ def on_pre_tool_call(tool_name="", args=None, session_id="", tool_call_id="", ta
     def not_judged(why):
         # A call the guard cannot judge goes to the user where a person can answer, else it is
         # DENIED; one the rules needing no record DENY is DENIED, in every uncertain state (H1.5).
-        # The request shows the call in full (A1.4).
+        # The request shows the call in full (A1.4). Each message says what happened, why and
+        # what happens next in its first line.
         if names_no_record_rule(tool_input):
-            return {"action": "block", "message": f"Lunchroom: DENIED. {why}"}
+            return {"action": "block", "message": (
+                f"Lunchroom {why} This call is DENIED, because it names Lunchroom or another "
+                "agent's session, which Lunchroom never lets through unchecked.")}
         if not channel:
-            return {"action": "block", "message": f"Lunchroom: {why}"}
-        request = f"Lunchroom: {why} Any script this call runs was not read."
+            return {"action": "block", "message": (
+                f"Lunchroom {why} Nobody can be asked in this session, so this call is DENIED.")}
+        request = (f"Lunchroom {why} It needs your yes: answer this prompt (yes runs the call once, "
+                   "no stops it). Lunchroom did not read any script this call runs.")
         return _approve(f"{request}{shown(tool_name, tool_input)}", tool_call_id)
 
     # What the plugin knows that the guard's record may not: no session, or another agent's text
@@ -281,8 +406,8 @@ def on_pre_tool_call(tool_name="", args=None, session_id="", tool_call_id="", ta
         if not channel:
             return {"action": "block", "message": reason or "Lunchroom: DENIED"}
         # A1.4: the guard's request shows the call; one with no text of its own is given it here.
-        request = reason or f"Lunchroom: this call needs you.{shown(tool_name, tool_input)}"
-        return _approve(f"{request}\n(Lunchroom {held})" if held else request, tool_call_id)
+        request = reason or f"Lunchroom: this call needs your yes.{shown(tool_name, tool_input)}"
+        return _approve(f"{request}\nLunchroom {held}" if held else request, tool_call_id)
     # The guard lets it run, but the plugin knows what the guard's record may not: the user decides.
     return not_judged(held) if held else None
 
@@ -321,13 +446,19 @@ def on_pre_llm_call(session_id="", user_message=None, platform="", turn_id="", p
     if not typed:
         UNJUDGED.add(session_id)
     text = user_message if isinstance(user_message, str) else json.dumps(user_message, default=str)
+    # One budget for the whole callback, under Hermes's limit for it (hook_budget): the guard's
+    # answer first, the next message with what is left.
+    started = time.monotonic()
+    budget = hook_budget()
     try:
         judged = run_guard(["guard", "prompt"], dict(
             _base(session_id, "UserPromptSubmit"),
             prompt=text or "",
             prompt_id=turn_id,
             user_typed=typed,
-        ), program)
+            # Hermes shows the user nothing from this hook (see ``_context``).
+            can_show_user=False,
+        ), program, timeout=budget)
     except Exception:  # noqa: BLE001 -- any failure is a guard that could not judge (H1.5)
         # Not judged: the turn's text stays unjudged, so every later call of this session goes
         # to the user, or is DENIED where nobody can answer; nothing is handed to this turn.
@@ -337,7 +468,12 @@ def on_pre_llm_call(session_id="", user_message=None, platform="", turn_id="", p
     elif typed and judged.get("status") == 0:
         UNJUDGED.discard(session_id)
     told = _context(judged.get("stdout", "")) if typed and judged.get("status") == 0 else ""
-    got = run_guard(["listen", "--once"], _base(session_id, "Stop"), program)
+    left = budget - (time.monotonic() - started)
+    if left < MIN_LISTEN_SECONDS:
+        # No time left to hand the turn a message: it waits for the next turn.
+        return {"context": told} if told else None
+    got = run_guard(["listen", "--once"], dict(_base(session_id, "Stop"), can_show_user=False), program,
+                    timeout=left)
     if got.get("status") == 2 and got["stderr"].strip():
         context = got["stderr"].strip()
         ids = _envelope_ids(context)

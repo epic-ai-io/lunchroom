@@ -1,0 +1,89 @@
+MEASURED free space on /: 7515 MB
+== building lunchroom-realworld-clocklock from Containerfile
+MEASURED image lunchroom-realworld-clocklock: 123 MB
+
+== facts of this system
+os: Ubuntu 24.04.5 LTS
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED this container's effective capabilities: 0x00000000800405fb; CAP_SYS_TIME (bit 25) is absent; the proof does not set the clock either way
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code finished
+
+== 1. a message that waits, to plant stamps in
+    QUEUED lr-00000001
+    alpha is STOPPED.
+PASS a message exists in the store: lr-00000001
+    {"failed_attempts": 0, "handed_over": false, "presented_at": null, "status": "Queued"}
+
+== 2. stamps from a clock that stepped back (D1.4 item 4)
+MEASURED planted presented_at=now(-30 s) handed_over=0 -> after one check: failed_attempts=0 ({"failed_attempts": 0, "handed_over": false, "presented_at": 1793763771, "status": "Queued"})
+PASS an offer 30 s old is within its 60 s (control): failed_attempts = 0
+MEASURED planted presented_at=now(-61 s) handed_over=0 -> after one check: failed_attempts=1 ({"failed_attempts": 1, "handed_over": false, "presented_at": null, "status": "Queued"})
+PASS an offer 61 s old has run out (control): failed_attempts = 1
+MEASURED planted presented_at=now(-580 s) handed_over=1 -> after one check: failed_attempts=0 ({"failed_attempts": 0, "handed_over": true, "presented_at": 1793763221, "status": "Queued"})
+PASS a hand-over 580 s old is within its 600 s (control): failed_attempts = 0
+MEASURED planted presented_at=now(-620 s) handed_over=1 -> after one check: failed_attempts=1 ({"failed_attempts": 1, "handed_over": false, "presented_at": null, "status": "Queued"})
+PASS a hand-over 620 s old has run out (control): failed_attempts = 1
+MEASURED planted presented_at=now(+4 s) handed_over=0 -> after one check: failed_attempts=0 ({"failed_attempts": 0, "handed_over": false, "presented_at": 1793763805, "status": "Queued"})
+PASS an offer stamped 4 s ahead of the clock is not a stepped-back stamp (slack 5 s): failed_attempts = 0
+MEASURED planted presented_at=now(+10 s) handed_over=0 -> after one check: failed_attempts=1 ({"failed_attempts": 1, "handed_over": false, "presented_at": null, "status": "Queued"})
+PASS an offer stamped 10 s ahead is a stamp from a clock that stepped back: it has run out: failed_attempts = 1
+MEASURED planted presented_at=now(+3600 s) handed_over=0 -> after one check: failed_attempts=1 ({"failed_attempts": 1, "handed_over": false, "presented_at": null, "status": "Queued"})
+PASS an offer stamped 1 hour ahead (the clock stepped back an hour): it has run out: failed_attempts = 1
+MEASURED planted presented_at=now(+3600 s) handed_over=1 -> after one check: failed_attempts=1 ({"failed_attempts": 1, "handed_over": false, "presented_at": null, "status": "Queued"})
+PASS a hand-over stamped 1 hour ahead: it has run out: failed_attempts = 1
+
+== 3. the store lock held by another process (LOCK_WAIT 10 s)
+PASS a process of dev holds /home/dev/.lunchroom/store/state.flock (exclusive flock) for 75 s
+MEASURED lunchroom status with the store held: exit 1 after 10025 ms: DENIED · Lunchroom's store cannot be read What was DENIED: lunchroom status. Why: Lunchroom keeps its messages and state in a store, and it cannot be read: another Lunchroom process held the store for as long as this program waits for it. Ways forward: - The agent: wait a moment and try once more; 
+PASS status with the store held exits non-zero (1), not success
+PASS status with the store held finished in 10025 ms (under 15 s)
+PASS status says the store is held (another Lunchroom process has held the store)
+
+== 4. the guard, with the store held: it never locks the user out (section 13 item 5)
+MEASURED ordinary read 'ls /home/dev': exit 0 after 10038 ms: {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Lunchroom could not check the exec command `ls /home/dev`: Lunchroom did not finish within 10 seconds. It needs your yes: answer this permissio
+PASS a guard past its time sends even a read to the user (permissionDecision ask, exit 0)
+PASS ...and the guard answered within its 10 s (10038 ms)
+MEASURED 'codex queue other hi': exit 0 after 10034 ms: {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Lunchroom could not check the exec command `codex queue other hi`: Lunchroom did not finish within 10 seconds. It needs your yes: answer this p
+PASS a fence is sent to the user, not run, when the guard is past its time (item 6: the second judging is not made past the time)
+MEASURED 'git push origin main' with no approval channel: exit 2 after 10019 ms: Lunchroom could not check the exec command `git push origin main`: Lunchroom did not finish within 10 seconds, and nobody can be asked in this session, so this one call is DENIED. The agent can try it once more; the user can run it in a terminal of t
+PASS a call the guard cannot decide is DENIED where there is no approval channel (A1.2)
+MEASURED the user's typed prompt: exit 0 after 10038 ms
+PASS the user's prompt reaches the agent with the store held (exit 0)
+
+== 5. after the lock is let go
+PASS the lock holder has ended
+PASS status works again at once (exit 0, 13 ms)
+PASS the next guard call decides normally
+    FAIL Lunchroom could not decide on the exec command `ls /home/dev` at 03:43 UTC in a session with no agent name: Lunchroom did not finish within 10 seconds; it was still waiting for another Lunchroom process to release Lunchroom's store. Its slowest step was waiting for another Lunchroom process to release Lunchroom's store (10018 ms). This line clears at 03:43 UTC on 2026-11-05, 24 hours after the call. If the call is still needed, run it yourself in a terminal of your own. If the cause is Lunchroom's store, `lunchroom status` shows whether it can be read, and `lunchroom repair` puts back the last good copy.
+    FAIL Lunchroom could not decide on the exec command `codex queue other hi` at 03:43 UTC in a session with no agent name: Lunchroom did not finish within 10 seconds; it was still waiting for another Lunchroom process to release Lunchroom's store. Its slowest step was waiting for another Lunchroom process to release Lunchroom's store (10016 ms). This line clears at 03:43 UTC on 2026-11-05, 24 hours after the call. If the call is still needed, run it yourself in a terminal of your own. If the cause is Lunchroom's store, `lunchroom status` shows whether it can be read, and `lunchroom repair` puts back the last good copy.
+    FAIL Lunchroom could not decide on the exec command `git push origin main` at 03:43 UTC in a session with no agent name: Lunchroom did not finish within 10 seconds; it was still waiting for another Lunchroom process to release Lunchroom's store. Its slowest step was waiting for another Lunchroom process to release Lunchroom's store (10000 ms). This line clears at 03:43 UTC on 2026-11-05, 24 hours after the call. If the call is still needed, run it yourself in a terminal of your own. If the cause is Lunchroom's store, `lunchroom status` shows whether it can be read, and `lunchroom repair` puts back the last good copy.
+    FAIL Lunchroom could not decide on the prompt sent to this session at 03:44 UTC in a session with no agent name: Lunchroom did not finish within 10 seconds; it was still waiting for another Lunchroom process to release Lunchroom's store. Its slowest step was waiting for another Lunchroom process to release Lunchroom's store (10019 ms). This line clears at 03:44 UTC on 2026-11-05, 24 hours after the call. If the call is still needed, run it yourself in a terminal of your own. If the cause is Lunchroom's store, `lunchroom status` shows whether it can be read, and `lunchroom repair` puts back the last good copy.
+PASS doctor shows the calls the guard could not decide while the store was held (no record dropped)
+
+== 6. 20 writers at once (no lost update)
+PASS all 20 concurrent guard calls exited 0
+PASS the store records all 20 sessions (no update lost)
+PASS state.json is valid JSON after the contention
+
+== 7. a store the guard cannot use (not a lock: unreadable state), section 13 items 5 and 6
+MEASURED control, good store, HELD session, read tool on /etc/hostname: exit 0:  
+PASS control: with a good store a HELD session's read-tool call on /etc/hostname runs (inside the slip)
+MEASURED control, good store, HELD session, exec 'cat /etc/hostname': exit 0:  
+MEASURED hold mode in effect: Balanced
+PASS P1.6 Balanced (the hold mode in effect): a HELD agent's exec 'cat /etc/hostname' is not PROTECTED, so it runs
+MEASURED unusable store, 'ls /home/dev' (a folder that holds Lunchroom's own): exit 0 after 18 ms: {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Lunchroom could not check the exec command `ls /home/dev`: Lunchroom's store could not be used. It needs your yes: answer this permission promp
+MEASURED unusable store, read tool on /etc/hostname: exit 0 after 18 ms:  
+PASS a read-tool call inside the slip runs with a store the guard cannot use
+MEASURED unusable store, exec 'cat /etc/hostname': exit 0 after 31 ms: {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Lunchroom could not check the exec command `cat /etc/hostname`: Lunchroom's store could not be used. It needs your yes: answer this permission 
+PASS H1.5 item 5 (section 13): judged by the rules that need no record, 'a call inside the slip as shipped runs'; an exec command is outside the slip (P1.1), so it goes to the user, unlike the good-store case under P1.6 Balanced
+MEASURED unusable store, 'codex queue other hi': exit 2 after 24 ms: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the exec command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call tha
+PASS a fence is DENIED with a store the guard cannot use
+PASS the user's prompt reaches the agent with an unusable store
+PASS with the state file put back, status works again
+
+== result
+RESULT: 33 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-clocklock removed
+
+RESULT: 33 PASS, 0 FAIL

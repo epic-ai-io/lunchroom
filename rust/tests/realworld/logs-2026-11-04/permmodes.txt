@@ -1,0 +1,150 @@
+MEASURED free space on /: 8895 MB
+== building lunchroom-realworld-permmodes from Containerfile
+MEASURED image lunchroom-realworld-permmodes: 417 MB
+
+== facts of this system
+claude: 2.1.311 (Claude Code)
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code finished
+
+== permission mode: default
+MEASURED default: the SessionStart text is on the screen
+---- default: what the model was given back: PreToolUse:Bash hook error: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroo
+---- default: default screen (non-blank lines, last 16):
+    |   ⎿  PreToolUse:Bash says: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom
+    |      send <name> <text>`.
+    |      What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi).
+    |      Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the
+    |      variables Lunchroom reads an agent's identity from is DENIED in every session.
+    |      Ways forward:
+    |      - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's
+    |      identity from as they are.
+    |      - The user: run it in a terminal of their own, outside every agent session.
+    | ● done
+    | ✻ Baked for 0s · done 3:35 AM
+    |                                                                                                                         ◐ medium · /effort
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── m_default ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ manual mode on · ? for shortcuts · ← for agents
+PASS default: the call did not run (the model's result is Lunchroom's refusal, no shell output)
+PASS default: the default screen shows 'Lunchroom: DENIED'
+PASS default: the default screen shows 'Ways forward'
+PASS default: the model's result has 'What was DENIED'
+PASS default: the model's result has 'Why:'
+PASS default: the model's result has 'Ways forward'
+
+== permission mode: acceptEdits
+MEASURED acceptEdits: the SessionStart text is on the screen
+---- acceptEdits: what the model was given back: PreToolUse:Bash hook error: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroo
+---- acceptEdits: default screen (non-blank lines, last 16):
+    |   ⎿  PreToolUse:Bash says: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom
+    |      send <name> <text>`.
+    |      What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi).
+    |      Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the
+    |      variables Lunchroom reads an agent's identity from is DENIED in every session.
+    |      Ways forward:
+    |      - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's
+    |      identity from as they are.
+    |      - The user: run it in a terminal of their own, outside every agent session.
+    | ● done
+    | ✻ Churned for 0s · done 3:36 AM
+    |                                                                                                                         ◐ medium · /effort
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── m_acceptEdits ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents
+PASS acceptEdits: the call did not run (the model's result is Lunchroom's refusal, no shell output)
+PASS acceptEdits: the default screen shows 'Lunchroom: DENIED'
+PASS acceptEdits: the default screen shows 'Ways forward'
+PASS acceptEdits: the model's result has 'What was DENIED'
+PASS acceptEdits: the model's result has 'Why:'
+PASS acceptEdits: the model's result has 'Ways forward'
+
+== permission mode: bypassPermissions
+MEASURED bypassPermissions: the SessionStart text is on the screen
+---- bypassPermissions: what the model was given back: PreToolUse:Bash hook error: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroo
+---- bypassPermissions: default screen (non-blank lines, last 16):
+    |   ⎿  PreToolUse:Bash says: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom
+    |      send <name> <text>`.
+    |      What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi).
+    |      Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the
+    |      variables Lunchroom reads an agent's identity from is DENIED in every session.
+    |      Ways forward:
+    |      - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's
+    |      identity from as they are.
+    |      - The user: run it in a terminal of their own, outside every agent session.
+    | ● done
+    | ✻ Worked for 0s · done 3:36 AM
+    |                                                                                                                         ◐ medium · /effort
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── m_bypassPermissions ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+PASS bypassPermissions: the call did not run (the model's result is Lunchroom's refusal, no shell output)
+PASS bypassPermissions: the default screen shows 'Lunchroom: DENIED'
+PASS bypassPermissions: the default screen shows 'Ways forward'
+PASS bypassPermissions: the model's result has 'What was DENIED'
+PASS bypassPermissions: the model's result has 'Why:'
+PASS bypassPermissions: the model's result has 'Ways forward'
+
+== permission mode: dontAsk
+MEASURED dontAsk: the SessionStart text is on the screen
+---- dontAsk: what the model was given back: PreToolUse:Bash hook error: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroo
+---- dontAsk: default screen (non-blank lines, last 16):
+    |   ⎿  PreToolUse:Bash says: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom
+    |      send <name> <text>`.
+    |      What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi).
+    |      Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the
+    |      variables Lunchroom reads an agent's identity from is DENIED in every session.
+    |      Ways forward:
+    |      - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's
+    |      identity from as they are.
+    |      - The user: run it in a terminal of their own, outside every agent session.
+    | ● done
+    | ✻ Baked for 0s · done 3:36 AM
+    |                                                                                                                         ◐ medium · /effort
+    | ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── m_dontAsk ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+PASS dontAsk: the call did not run (the model's result is Lunchroom's refusal, no shell output)
+PASS dontAsk: the default screen shows 'Lunchroom: DENIED'
+PASS dontAsk: the default screen shows 'Ways forward'
+PASS dontAsk: the model's result has 'What was DENIED'
+PASS dontAsk: the model's result has 'Why:'
+PASS dontAsk: the model's result has 'Ways forward'
+
+== permission mode: plan
+MEASURED plan: the SessionStart text is on the screen
+---- plan: what the model was given back: PreToolUse:Bash hook error: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroo
+---- plan: default screen (non-blank lines, last 16):
+    |   ⎿  PreToolUse:Bash says: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom
+    |      send <name> <text>`.
+    |      What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi).
+    |      Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the
+    |      variables Lunchroom reads an agent's identity from is DENIED in every session.
+    |      Ways forward:
+    |      - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's
+    |      identity from as they are.
+    |      - The user: run it in a terminal of their own, outside every agent session.
+    | ● done
+    | ✻ Churned for 0s · done 3:36 AM
+    |                                                                                                                         ◐ medium · /effort
+    | ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── m_plan ─
+    | ❯
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ plan mode on (shift+tab to cycle) · ← for agents
+PASS plan: the call did not run (the model's result is Lunchroom's refusal, no shell output)
+PASS plan: the default screen shows 'Lunchroom: DENIED'
+PASS plan: the default screen shows 'Ways forward'
+PASS plan: the model's result has 'What was DENIED'
+PASS plan: the model's result has 'Why:'
+PASS plan: the model's result has 'Ways forward'
+
+== result
+RESULT: 31 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-permmodes removed
+
+RESULT: 31 PASS, 0 FAIL

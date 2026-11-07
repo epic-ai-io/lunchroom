@@ -290,6 +290,76 @@ fn plugin_calls_are_judged_as_the_calls_they_are() {
     assert_eq!(sb.run(&["guard", "pretool"], &input, &[]).code, Some(2));
 }
 
+// §6 P1.4 and P1.5 (2026-11-03): OpenClaw's `apply_patch` is a file-write tool whose
+// patch is its `input` field (OpenClaw 2026.10.7's own schema: {"required":["input"]}, measured in
+// the real-world proof `openclaw2.txt`, where a patch into Lunchroom's folder ran and created the
+// file). Each header line is judged as a write of its path; a file-write call whose input holds no
+// path or patch the guard can read is DENIED in every session, since it may write the stores.
+#[test]
+fn file_write_calls_are_judged_by_the_path_or_patch_they_carry() {
+    let sb = Sandbox::new();
+    let store = sb.lunchroom().join("store/planted.txt");
+    let store = store.display();
+    let ordinary = sb.home().join("project/hello.txt");
+    let ordinary = ordinary.display();
+    let patch = |header: &str| format!("*** Begin Patch\n{header}\n+hello\n*** End Patch\n");
+    // Into Lunchroom's store: DENIED in a session that is not HELD, by every header kind.
+    for header in [
+        format!("*** Add File: {store}"),
+        format!("*** Update File: {store}"),
+        format!("*** Delete File: {store}"),
+        format!("*** Update File: {ordinary}\n*** Move to: {store}"),
+    ] {
+        let run = sb.pretool(
+            "openclaw",
+            "s1",
+            "apply_patch",
+            &json!({"input": patch(&header)}),
+            true,
+        );
+        assert_eq!(run.code, Some(2), "{header}: {}", run.stdout);
+        assert!(run.stderr.contains("Lunchroom: DENIED"), "{}", run.stderr);
+    }
+    // An ordinary file: runs.
+    let run = sb.pretool(
+        "openclaw",
+        "s1",
+        "apply_patch",
+        &json!({"input": patch(&format!("*** Add File: {ordinary}"))}),
+        true,
+    );
+    assert_eq!(
+        (run.code, decision(&run)),
+        (Some(0), String::new()),
+        "{}",
+        run.stderr
+    );
+    // No path or patch the guard can read: DENIED in every session (not HELD here).
+    for (harness, tool, input) in [
+        ("openclaw", "apply_patch", json!({})),
+        ("openclaw", "apply_patch", json!({"input": 7})),
+        ("openclaw", "apply_patch", json!({"input": ""})),
+        ("openclaw", "write", json!({"content": "y"})),
+        ("openclaw", "edit", json!({"oldText": "a", "newText": "b"})),
+        ("hermes", "write_file", json!({"content": "y"})),
+        (
+            "hermes",
+            "patch",
+            json!({"old_string": "a", "new_string": "b"}),
+        ),
+        ("hermes", "write_file", json!({"path": "", "content": "y"})),
+    ] {
+        let run = sb.pretool(harness, "s1", tool, &input, true);
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{harness} {tool} {input}: {}",
+            run.stdout
+        );
+        assert!(run.stderr.contains("Lunchroom: DENIED"), "{}", run.stderr);
+    }
+}
+
 // §5::5 (OpenClaw, Hermes) and §7::9, §7::18 (the guard's side): a prompt the plugin
 // reports as not the user's typing holds the session; there a call outside the slip goes to the
 // user where the plugin reports a person would be asked, and is DENIED where it reports none; a
@@ -498,14 +568,8 @@ fn stand_in_openclaw(sb: &Sandbox) {
 }
 
 /// A stand-in OpenClaw gateway that has run one guard hook, alive until dropped.
-struct Gateway(std::process::Child);
-
-impl Drop for Gateway {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+/// Its guard kills the gateway's whole process group (the `sleep` it started too) when dropped.
+struct Gateway(#[allow(dead_code)] common::GroupChild);
 
 /// A copy of `bash` named `openclaw`, so the hook it starts is recorded under a process running a
 /// program of that name, as under a gateway. It runs the guard on `input`, then stays alive.
@@ -529,20 +593,21 @@ fn gateway_with(sb: &Sandbox, input: &str, n: u32, env: &[(&str, &str)]) -> Opti
     // A binary just copied can fail to start with "Text file busy" (see `codex_session`).
     let mut child = None;
     for _ in 0..50 {
-        let started = Command::new(&fake)
-            .args(["-c", script])
-            .env_clear()
-            .env("HOME", sb.home())
-            .env("LUNCHROOM_HOME", sb.lunchroom())
-            .env("PATH", &sb.path)
-            .env("LR", PROGRAM)
-            .env("IN", &input_file)
-            .env("DONE", &done)
-            .envs(env.iter().copied())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let started = common::GroupChild::spawn(
+            Command::new(&fake)
+                .args(["-c", script])
+                .env_clear()
+                .env("HOME", sb.home())
+                .env("LUNCHROOM_HOME", sb.lunchroom())
+                .env("PATH", &sb.path)
+                .env("LR", PROGRAM)
+                .env("IN", &input_file)
+                .env("DONE", &done)
+                .envs(env.iter().copied())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        );
         match started {
             Ok(c) => {
                 child = Some(c);
@@ -964,7 +1029,7 @@ fn plugin_guard_past_its_time_answers_before_the_plugins_limit() {
     );
     let lock = sb.root.join("lunchroom/store/state.flock");
     let mut flock = common::require("flock");
-    let holder = flock.arg(&lock).args(["sleep", "14"]).spawn();
+    let holder = common::GroupChild::spawn(flock.arg(&lock).args(["sleep", "14"]));
     assert!(holder.is_ok());
     let Ok(mut holder) = holder else { return };
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -991,7 +1056,7 @@ fn plugin_guard_past_its_time_answers_before_the_plugins_limit() {
     );
     // The guard's deadline and the store's lock wait are both 10 seconds: either gives up first.
     assert!(
-        asked.stdout.contains("no answer within 10 seconds")
+        asked.stdout.contains("did not finish within 10 seconds")
             || asked.stdout.contains("held the store for 10 seconds"),
         "{}",
         asked.stdout

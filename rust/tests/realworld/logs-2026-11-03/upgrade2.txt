@@ -1,0 +1,92 @@
+MEASURED free space on /: 11773 MB
+== building lunchroom-realworld-upgrade from Containerfile
+MEASURED image lunchroom-realworld-upgrade: 468 MB
+
+== facts of this system
+os: Ubuntu 24.04.5 LTS
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+
+== 1. before the upgrade: claude-code 2.1.309-1 installed, a real session running
+PASS dpkg: claude-code is at 2.1.309-1
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code finished
+PASS session 'before' (pid 75) runs /usr/bin/claude; its exe is '/usr/bin/claude'
+    1 agent: 1 AVAILABLE
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    before	claude-code:ef4b1976-7666-4288-ac24-5cbe0700fa91	AVAILABLE	QUEUED 0
+PASS before the upgrade the session is AVAILABLE (guarded)
+
+== 1b. before the upgrade: the session's hooks judge a real tool call
+MEASURED pre: DENY call (codex queue other hi) -> Claude Code got: PreToolUse:Bash hook error: [/home/dev/.lunchroom/bin/lunchroom guard pretool]: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's identity from as they are. - The user: run it in a terminal of their own, outside every agent session.
+MEASURED pre: control call (ls /opt/proof) -> Claude Code got: hang.py inner.sh lib.sh lunchroom mockapi.py plaintext.py ptyrun.py sessionpty.py
+PASS pre: the control call ran (its output lists /opt/proof): the hook path works
+PASS pre: the call that must be DENIED was DENIED by the session's hook
+
+== 2. the upgrade, with Anthropic's own command, while the session runs
+COMMAND apt-get update && apt-get upgrade -y claude-code   (the page: 'sudo apt update && sudo apt upgrade claude-code')
+    Preparing to unpack .../claude-code_2.1.317-1_amd64.deb ...
+    Unpacking claude-code (2.1.317-1) over (2.1.309-1) ...
+    Setting up claude-code (2.1.317-1) ...
+PASS apt-get upgrade claude-code exited 0
+MEASURED dpkg: claude-code 2.1.309-1 -> 2.1.317-1
+PASS the package is now 2.1.317-1, not 2.1.309-1 (the upgrade installed a different release)
+PASS the session (pid 75) is still running
+MEASURED /proc/75/exe -> /usr/bin/claude (deleted)
+PASS /proc/75/exe ends in ' (deleted)': the running program was replaced
+MEASURED the program now on disk says: 2.1.317 (Claude Code)
+
+== 3. what Lunchroom 1.0.2 says now
+    1 agent: 1 UNGUARDED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    before	claude-code:ef4b1976-7666-4288-ac24-5cbe0700fa91	UNGUARDED	QUEUED 0
+      why: Claude Code's program (/usr/bin/claude) was replaced while this session was running, most likely by an upgrade, so Lunchroom cannot tell which release the session still runs: start the Claude Code session anew, so it runs the program now installed.
+PASS the session is UNGUARDED after the program was replaced
+PASS status: the reason is 'program replaced while running' ("was replaced while this session was running")
+PASS status does not say 'release cannot be read'
+PASS status tells the user what to do: start the Claude Code session anew
+    PASS Lunchroom's program is installed at /home/dev/.lunchroom/bin/lunchroom
+    FAIL no program named lunchroom is on your PATH: put /home/dev/.local/bin on your PATH and run lunchroom install again in a terminal of your own, which links /home/dev/.lunchroom/bin/lunchroom there
+    PASS the passphrase check is in place (/etc/lunchroom/1001.verifier)
+    PASS Claude Code: Lunchroom is installed and its configuration runs the whole guard
+    PASS Claude Code: release 2.1.317-1, read from /usr/bin/claude. This is the release Lunchroom was tested with, or a later one.
+    PASS the guard decided every call in the last 24 hours
+    FAIL agent before (Claude Code) is UNGUARDED (running, but its guard is not, so nothing it does is checked): Claude Code's program (/usr/bin/claude) was replaced while this session was running, most likely by an upgrade, so Lunchroom cannot tell which release the session still runs: start the Claude Code session anew, so it runs the program now installed.
+PASS doctor: the same reason
+PASS doctor does not say 'release cannot be read'
+
+== 3b. the UNGUARDED session's own hooks, still running, judge a real tool call
+MEASURED post: DENY call (codex queue other hi) -> Claude Code got: PreToolUse:Bash hook error: [/home/dev/.lunchroom/bin/lunchroom guard pretool]: Lunchroom: DENIED · fence: this would start work in another agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's identity from as they are. - The user: run it in a terminal of their own, outside every agent session.
+MEASURED post: control call (ls /opt/proof) -> Claude Code got: hang.py inner.sh lib.sh lunchroom mockapi.py plaintext.py ptyrun.py sessionpty.py
+PASS post: the control call ran (its output lists /opt/proof): the hook path works
+PASS post: the call that must be DENIED was DENIED by the session's hook
+PASS session 'after' (pid 498) runs /usr/bin/claude (not deleted)
+    2 agents: 1 AVAILABLE, 1 STOPPED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    after	claude-code:e5786be1-9cbf-4e54-8079-fed888caf934	AVAILABLE	QUEUED 0
+    before	claude-code:ef4b1976-7666-4288-ac24-5cbe0700fa91	STOPPED	QUEUED 0
+PASS the new session is AVAILABLE (guarded)
+PASS doctor: release 2.1.317-1, read from /usr/bin/claude
+
+== 5. a reinstall of the same release under a running session
+COMMAND apt-get install --reinstall -y claude-code
+PASS apt-get install --reinstall claude-code exited 0
+PASS the release is the same, 2.1.317-1
+MEASURED /proc/498/exe -> /usr/bin/claude (deleted)
+PASS /proc/498/exe ends in ' (deleted)' after the reinstall
+    2 agents: 1 UNGUARDED, 1 STOPPED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    after	claude-code:e5786be1-9cbf-4e54-8079-fed888caf934	UNGUARDED	QUEUED 0
+      why: Claude Code's program (/usr/bin/claude) was replaced while this session was running, most likely by an upgrade, so Lunchroom cannot tell which release the session still runs: start the Claude Code session anew, so it runs the program now installed.
+    before	claude-code:ef4b1976-7666-4288-ac24-5cbe0700fa91	STOPPED	QUEUED 0
+PASS after the reinstall: the reason is 'program replaced while running'
+PASS after the reinstall: status does not say 'release cannot be read'
+
+== result
+RESULT: 26 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-upgrade removed
+
+RESULT: 26 PASS, 0 FAIL

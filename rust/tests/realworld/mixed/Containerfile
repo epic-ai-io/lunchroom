@@ -1,0 +1,27 @@
+# Proof 3 (mixed): the public Lunchroom 1.0.1 release program and the 1.0.2 program on one store.
+#
+# The 1.0.1 program is the GitHub release epic-ai-io/lunchroom v1.0.1, downloaded by ../prove.sh
+# with `gh release download` and checked against the release's SHA256SUMS; the build checks the
+# checksum again, so an altered file stops the build.
+#
+# Build context: made by ../prove.sh.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 procps util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY SHA256SUMS lunchroom-v1.0.1-x86_64-unknown-linux-musl.tar.gz /tmp/rel/
+RUN cd /tmp/rel \
+ && sha256sum -c --ignore-missing SHA256SUMS \
+ && tar -xzf lunchroom-v1.0.1-x86_64-unknown-linux-musl.tar.gz \
+ && install -m 0755 lunchroom-v1.0.1-x86_64-unknown-linux-musl/lunchroom /usr/local/bin/lunchroom-1.0.1 \
+ && rm -rf /tmp/rel
+
+COPY lunchroom /usr/local/bin/lunchroom-1.0.2
+COPY lib.sh ptyrun.py plaintext.py hook.py inner.sh /opt/proof/
+RUN chmod 0755 /usr/local/bin/lunchroom-1.0.2 /opt/proof/inner.sh /opt/proof/ptyrun.py \
+      /opt/proof/plaintext.py /opt/proof/hook.py
+
+CMD ["/opt/proof/inner.sh"]

@@ -72,13 +72,13 @@ service that folder is the service's, not a project's, so project settings are r
 
 | Harness | Where the release is read | Measured | Passed with |
 |---|---|---|---|
-| Claude Code | the process binary's path, `~/.local/share/claude/versions/<release>`; an npm install, the `package.json` above the script it runs | `readlink /proc/$CLAUDE_PID/exe`: `~/.local/share/claude/versions/2.1.310` | 2.1.310 |
+| Claude Code | the process binary's path, `…/claude/versions/<release>`; an npm install, the `package.json` above the script it runs; a system package, the package manager's records (`docs/host-facts/claude-code.md` section 4) | `…/claude/versions/2.1.309`, run from Anthropic's `claude-code_2.1.309-1_amd64.deb` (`claude --version`: `2.1.309 (Claude Code)`; `docs/host-facts/claude-code.md` section 5) | 2.1.309 |
 | Codex | `…/releases/<release>-<target>/bin/codex` (the app-server daemon), or the `package.json` above the binary (`@openai/codex-linux-x64`: `"version": "0.163.0-linux-x64"`) | daemon `~/.codex/packages/app-server-daemon/releases/0.164.0-x86_64-unknown-linux-musl/bin/codex`; CLI package `@openai/codex` `"version": "0.163.0"` | 0.163.0 |
 | OpenClaw | its package's `package.json` above the gateway's entry script (the plugin reads it) | `openclaw --version`: `OpenClaw 2026.10.7 (157d8c2)` | 2026.10.7 |
 | Hermes | `hermes_cli.version_info.get_version_info()`: a source install gives `commit` and `commit_date`, `base_version` "unknown" (the plugin reports `<commit>@<commit date>`) | `9976f4857b72439d79016354d7b6e1a3ee952e2f`, commit date `1793038003`, source `git` | commit 9976f48 (later commit dates pass) |
 
 A release is read from the harness's own install alone: Claude Code, a `claude/versions/<release>`
-path or the `@anthropic-ai/claude-code` package; Codex, a `releases/<release>-<target>` folder under
+path, the `@anthropic-ai/claude-code` package or the system package named `claude-code`; Codex, a `releases/<release>-<target>` folder under
 `.codex` or an `@openai/codex` package. A release Lunchroom cannot read leaves the session UNGUARDED.
 
 ## Live runs (2026-10-26)

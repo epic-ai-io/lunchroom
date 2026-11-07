@@ -1,0 +1,48 @@
+# Proof 1 (packages), dnf: Claude Code from Anthropic's own dnf repository on Fedora.
+#
+# The repository setup is Anthropic's, copied from "Install with Linux package managers" (dnf tab)
+# at https://code.claude.com/docs/en/setup.md (read 2026-11-03): a /etc/yum.repos.d/claude-code.repo
+# with baseurl=https://downloads.claude.ai/claude-code/rpm/stable, gpgcheck=1 and
+# gpgkey=https://downloads.claude.ai/keys/claude-code.asc, whose fingerprint must be
+# 31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE. `dnf install -y` accepts the key without
+# the prompt; the build then checks that the key rpm imported is that fingerprint.
+#
+# Build context: made by ../prove.sh.
+FROM fedora:latest
+
+ENV DISTRO=dnf
+# Measured (podman run, rootless, Fedora 44): sudo refuses dev's correct password ("Sorry, try
+# again", with a yescrypt and with a SHA-512 hash), and with NOPASSWD it stops at "PAM account
+# management error: Authentication service cannot retrieve authentication info" (pam_unix cannot
+# read /etc/shadow, which is mode 000 on Fedora, through its setuid helper in this container). The
+# proof is about the package database, not about sudo's authentication, so /etc/pam.d/sudo below
+# permits dev's sudo (the sudoers rule still limits it to dev) and the rule is NOPASSWD.
+ENV SUDO_NOPASSWD=1
+RUN dnf install -y sudo python3 procps-ng util-linux shadow-utils findutils diffutils \
+ && dnf clean all
+
+RUN printf '%s\n' \
+      '#%PAM-1.0' \
+      'auth       sufficient   pam_permit.so' \
+      'account    sufficient   pam_permit.so' \
+      'session    optional     pam_permit.so' \
+      > /etc/pam.d/sudo
+
+RUN printf '%s\n' \
+      '[claude-code]' \
+      'name=Claude Code' \
+      'baseurl=https://downloads.claude.ai/claude-code/rpm/stable' \
+      'enabled=1' \
+      'gpgcheck=1' \
+      'gpgkey=https://downloads.claude.ai/keys/claude-code.asc' \
+      > /etc/yum.repos.d/claude-code.repo \
+ && { dnf install -y claude-code >/tmp/dnf.out 2>&1 || { cat /tmp/dnf.out; exit 1; }; } \
+ && grep -E 'Importing OpenPGP key|Fingerprint' /tmp/dnf.out \
+ && grep -q 'Fingerprint: 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE' /tmp/dnf.out \
+ && dnf clean all
+
+COPY lunchroom lib.sh ptyrun.py sessionpty.py plaintext.py hang.py inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/sessionpty.py \
+      /opt/proof/plaintext.py /opt/proof/hang.py
+
+CMD ["/opt/proof/inner.sh"]

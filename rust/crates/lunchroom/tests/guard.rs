@@ -48,6 +48,33 @@ impl Sandbox {
             .map_or_else(|_| Run::failed("spawn failed"), Run::from)
     }
 
+    /// `lunchroom status` as the user runs it in a terminal of their own: a process with no
+    /// recorded harness above it (G1-11). The shell exits at once, so the status process is
+    /// reparented away from this test process, which the hooks record as the harness.
+    fn user_status(&self) -> String {
+        let out = self.home().join("user-status.txt");
+        let _ = std::fs::remove_file(&out);
+        let started = self
+            .command("/bin/sh")
+            .args([
+                "-c",
+                "( \"$0\" status > \"$1.tmp\" 2>&1 < /dev/null; mv \"$1.tmp\" \"$1\" ) &",
+                env!("CARGO_BIN_EXE_lunchroom"),
+            ])
+            .arg(&out)
+            .current_dir(self.home().join("project"))
+            .stdin(Stdio::null())
+            .status();
+        assert!(started.is_ok_and(|s| s.success()));
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&out) {
+                return text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        String::new()
+    }
+
     fn pretool(&self, session: &str, command: &str, env: &[(&str, String)]) -> Run {
         self.pretool_in_mode(session, command, "default", env)
     }
@@ -169,7 +196,7 @@ fn a_held_agents_reply_may_quote_a_refusal() {
     let program = env!("CARGO_BIN_EXE_lunchroom");
     let denial = "Lunchroom: DENIED - no approval channel: this session has no permission prompt; \
                   the user can approve this exact call with lunchroom approve, and then it can \
-                  run. test-codex is HELD. This call is outside the permission slip of a HELD \
+                  run. bob is HELD. This call is outside the permission slip of a HELD \
                   session.";
     for text in [
         format!("Result: {denial}"),
@@ -625,10 +652,9 @@ fn approved_call_runs_once() {
             .update(|m| m.approve(&me, "Bash", &approved, &dir, now))
             .is_ok()
     );
-    assert_eq!(
-        decision(&sb.pretool("s1", "touch made.txt.", &headless())),
-        ""
-    );
+    // Another call is not approved: it is DENIED (V1.4: Claude Code's form is a `deny`).
+    let other = sb.pretool("s1", "touch made.txt.", &headless());
+    assert_eq!((other.code, decision(&other).as_str()), (Some(2), "deny"));
     // A2.1: the same call in another folder is not covered.
     let elsewhere = json!({
         "session_id": "s1", "cwd": sb.home(), "hook_event_name": "PreToolUse",
@@ -663,7 +689,7 @@ fn system_message(run: &Run) -> String {
 #[test]
 fn guard_failure_never_locks_the_user_out() {
     let sb = Sandbox::new();
-    let failed = "could not check this: ";
+    let failed = "Lunchroom could not check ";
     // The guard's own error: input it cannot read, or an unknown mode.
     for stdin in [
         "not json",
@@ -677,8 +703,12 @@ fn guard_failure_never_locks_the_user_out() {
         );
         assert!(reason(&run).contains(failed), "{}", reason(&run));
         // A1.4: the request starts with Lunchroom's name and says no script was read.
-        assert!(reason(&run).starts_with("Lunchroom: "), "{}", reason(&run));
-        assert!(reason(&run).contains("Any script this call runs was not read."));
+        assert!(
+            reason(&run).starts_with("Lunchroom could not check "),
+            "{}",
+            reason(&run)
+        );
+        assert!(reason(&run).contains("Lunchroom did not read any script the call runs."));
         let run = sb.run(&["guard", "pretool"], stdin, &headless());
         assert_eq!(run.code, Some(2), "{stdin}");
         assert!(run.stderr.contains(failed), "{}", run.stderr);
@@ -738,7 +768,7 @@ fn guard_failure_never_locks_the_user_out() {
 #[test]
 fn guard_with_an_unusable_store_settles_what_it_can() {
     let sb = Sandbox::new();
-    let failed = "could not check this: ";
+    let failed = "Lunchroom could not check ";
     // Lunchroom's folder is a file.
     let broken = sb.root.join("not-a-folder");
     let _ = std::fs::write(&broken, "x");
@@ -826,6 +856,39 @@ fn guard_with_an_unusable_store_settles_what_it_can() {
 // itself held ("held the store for 10 seconds", and the rules that need no record settle a read).
 // Either way a call goes to the user or is DENIED where nobody can answer; the deadline itself is
 // tested without the lock in `guard_past_its_deadline_answers_as_one_that_could_not_decide`.
+// §14 C1.1 (2026-11-03, clocklock7.txt: 30,065 ms, three waits of 10 s in a row): while
+// another Lunchroom process holds the store, `lunchroom status` waits for it 10 seconds in all, not
+// 10 seconds for each read, and then says the store is busy and stops.
+#[test]
+fn status_waits_ten_seconds_in_all_for_a_held_store() {
+    let sb = Sandbox::new();
+    assert_eq!(sb.prompt_in("s1", "Start.", &interactive()).code, Some(0));
+    let lock = sb.lunchroom().join("store/state.flock");
+    let mut flock = common::require("flock");
+    let holder = common::GroupChild::spawn(flock.arg(&lock).args(["sleep", "40"]));
+    assert!(holder.is_ok(), "flock did not start");
+    let Ok(mut holder) = holder else { return };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let run = sb.run(&["status"], "", &[]);
+    let took = started.elapsed();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(
+        took < std::time::Duration::from_secs(15),
+        "status took {took:?}: {} {}",
+        run.stdout,
+        run.stderr
+    );
+    // It says the store is busy: another Lunchroom process holds it.
+    assert!(
+        format!("{}{}", run.stdout, run.stderr).contains("another Lunchroom process held"),
+        "{} {}",
+        run.stdout,
+        run.stderr
+    );
+}
+
 #[test]
 fn guard_past_its_time_sends_the_call_to_the_user() {
     let sb = Sandbox::new();
@@ -833,7 +896,7 @@ fn guard_past_its_time_sends_the_call_to_the_user() {
     assert_eq!(sb.prompt_in("s1", "Start.", &interactive()).code, Some(0));
     let lock = sb.lunchroom().join("store/state.flock");
     let mut flock = common::require("flock");
-    let holder = flock.arg(&lock).args(["sleep", "14"]).spawn();
+    let holder = common::GroupChild::spawn(flock.arg(&lock).args(["sleep", "14"]));
     assert!(holder.is_ok());
     let Ok(mut holder) = holder else { return };
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -893,7 +956,7 @@ fn guard_past_its_time_sends_the_call_to_the_user() {
         run.stderr
     );
     let gave_up = |text: &str| {
-        text.contains("no answer within 10 seconds")
+        text.contains("did not finish within 10 seconds")
             || text.contains("held the store for 10 seconds")
     };
     assert!(gave_up(&reason(&run)), "{}", reason(&run));
@@ -931,6 +994,7 @@ fn with_transcript(sb: &Sandbox, event: &str, extra: &Value, transcript: &Path) 
 // to the user, a call is DENIED where nobody can answer, the user's typed prompt goes on, and a
 // prompt carrying another agent's text is blocked. Each call has a store of its own.
 #[test]
+#[allow(clippy::too_many_lines)] // one setup, each kind of call past its deadline checked on it
 fn guard_past_its_deadline_answers_as_one_that_could_not_decide() {
     let sbs: Vec<Sandbox> = (0..5).map(|_| Sandbox::new()).collect();
     let fifos: Vec<_> = sbs.iter().map(stalled_transcript).collect();
@@ -985,7 +1049,9 @@ fn guard_past_its_deadline_answers_as_one_that_could_not_decide() {
     else {
         return;
     };
-    let ten = "no answer within 10 seconds";
+    // What the user and the agent read, and what the guard's record keeps (the reason as given).
+    let ten = "did not finish within 10 seconds";
+    let recorded = "no answer within 10 seconds";
     for (name, run) in [("call", &asked), ("read", &read_run)] {
         assert_eq!(
             (run.code, decision(run)),
@@ -1002,6 +1068,69 @@ fn guard_past_its_deadline_answers_as_one_that_could_not_decide() {
     // The guard answered at its deadline (10 s), under the hook's own limit (15 s).
     assert!(took >= std::time::Duration::from_secs(10), "{took:?}");
     assert!(took < std::time::Duration::from_secs(14), "{took:?}");
+    // §13 H1.7, H1.9: the call, the cause naming the step still running when the time
+    // ran out, and the ways forward; with nobody to ask, the agent may make it again and the user
+    // may run it in a terminal of their own, and `lunchroom doctor` is named.
+    let step = format!(
+        "it was still reading the session's transcript {}",
+        fifos[1].display()
+    );
+    for part in [
+        "Lunchroom could not check the command `touch a`: Lunchroom did not finish within 10 \
+         seconds, and nobody can be asked in this session, so this one call is DENIED."
+            .to_owned(),
+        "What could not be checked: the command `touch a`.".to_owned(),
+        format!(
+            "Why: Lunchroom did not finish within 10 seconds; {step}; a call Lunchroom cannot \
+             check goes to the user, and this session has no permission prompt to ask in, so \
+             that one call is DENIED."
+        ),
+        "Ways forward:".to_owned(),
+        "- The agent: try the call once more. If Lunchroom still cannot check it, stop and tell \
+         the user what the call was for."
+            .to_owned(),
+        "- The user: run it in a terminal of their own, outside every agent session.".to_owned(),
+        "`lunchroom doctor`".to_owned(),
+    ] {
+        assert!(denied.stderr.contains(&part), "{part}\n{}", denied.stderr);
+    }
+    assert!(
+        reason(&asked).contains("answer this permission prompt"),
+        "{}",
+        reason(&asked)
+    );
+    // H1.8: each undecided call is recorded with its session, call, slowest step and its time.
+    for (sb, call) in [
+        (&sbs[1], "the command `touch a`"),
+        (&sbs[3], "the prompt sent to this session"),
+    ] {
+        let text =
+            std::fs::read_to_string(sb.lunchroom().join("guard-records.jsonl")).unwrap_or_default();
+        let records: Vec<Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(records.len(), 1, "{text}");
+        let r = &records[0];
+        assert_eq!(r["session"], "s9", "{text}");
+        assert_eq!(r["call"], call, "{text}");
+        assert!(
+            r["undecided"]
+                .as_str()
+                .is_some_and(|u| u.contains(recorded)),
+            "{text}"
+        );
+        assert!(
+            r["step"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("reading the session's transcript")),
+            "{text}"
+        );
+        assert!(
+            r["step_ms"].as_u64().is_some_and(|ms| ms >= 9_000),
+            "{text}"
+        );
+    }
 }
 
 /// A guard for a call by a new session `s9` whose transcript is `fifo`, with an open for writing
@@ -1028,7 +1157,7 @@ fn guard_unstalled_after(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let started = std::time::Instant::now();
-    let mut child = cmd.spawn().ok()?;
+    let mut child = common::GroupChild::spawn(&mut cmd).ok()?;
     child.stdin.take()?.write_all(input.as_bytes()).ok()?;
     std::thread::sleep(after);
     // O_NONBLOCK: the open fails, rather than waits, when no guard is reading the pipe.
@@ -1037,7 +1166,7 @@ fn guard_unstalled_after(
         .custom_flags(0o4000)
         .open(fifo);
     drop(writer);
-    let out = child.wait_with_output().ok()?;
+    let out = child.into_output().ok()?;
     Some((Run::from(out), started.elapsed()))
 }
 
@@ -1093,41 +1222,49 @@ fn guard_answer_settled_just_after_the_deadline_is_given() {
         past.stderr
     );
     assert!(
-        reason(&past).contains("no answer within 10 seconds"),
+        reason(&past).contains("did not finish within 10 seconds"),
         "{}",
         reason(&past)
     );
+    // The transcript is read outside the lock (T1.7), after the update that records the session
+    // and marks its transcript searched; so the session was recorded before the deadline in both
+    // runs. What the guard that gave up no longer does is write after the deadline: the stalled
+    // search ended when the pipe opened at 12 seconds, after the guard had gone, and the record
+    // holds nothing from it (no hold, no second search mark).
     let seen = late.store().and_then(|s| s.read().ok()).map(|m| {
         m.session(&Identity::new(Harness::ClaudeCode, "s9"))
             .is_some()
     });
-    assert_eq!(seen, Some(false));
+    assert_eq!(seen, Some(true));
 }
 
 /// A stand-in Claude Code: a copy of `bash` at `path` (Claude Code's own install keeps each release
 /// at `versions/<release>`), running `script` with `$LR` (Lunchroom's program) and `CLAUDE_PID` set
-/// to itself, so a hook it starts runs under it.
-fn claude_stand_in(sb: &Sandbox, path: &Path, script: &str) -> Option<std::process::Child> {
+/// to itself, so a hook it starts runs under it. The shell leads a process group of its own, which
+/// the returned guard kills, shell and everything it started, when the guard is dropped: however
+/// the test ends, a failed assertion included, nothing it started is left running.
+fn claude_stand_in(sb: &Sandbox, path: &Path, script: &str) -> Option<common::GroupChild> {
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(&sb.root));
     let _ = std::fs::copy(common::which("bash")?, path);
     for _ in 0..50 {
-        let started = Command::new(path)
-            .args([
-                "-c",
-                &format!(
-                    "export CLAUDE_PID=$$ CLAUDE_CODE_SESSION_ATTENDED=1 CLAUDE_CODE_ENTRYPOINT=cli; {script}; true"
-                ),
-            ])
-            .env_clear()
-            .env("HOME", sb.home())
-            .env("LUNCHROOM_HOME", sb.lunchroom())
-            .env("PATH", "/usr/bin:/bin")
-            .env("LR", env!("CARGO_BIN_EXE_lunchroom"))
-            .current_dir(&sb.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let started = common::GroupChild::spawn(
+            Command::new(path)
+                .args([
+                    "-c",
+                    &format!(
+                        "export CLAUDE_PID=$$ CLAUDE_CODE_SESSION_ATTENDED=1 CLAUDE_CODE_ENTRYPOINT=cli; {script}; true"
+                    ),
+                ])
+                .env_clear()
+                .env("HOME", sb.home())
+                .env("LUNCHROOM_HOME", sb.lunchroom())
+                .env("PATH", "/usr/bin:/bin")
+                .env("LR", env!("CARGO_BIN_EXE_lunchroom"))
+                .current_dir(&sb.root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        );
         match started {
             Ok(child) => return Some(child),
             Err(e) if e.raw_os_error() == Some(26) => {
@@ -1139,20 +1276,84 @@ fn claude_stand_in(sb: &Sandbox, path: &Path, script: &str) -> Option<std::proce
     None
 }
 
+// Plan item 8 (U12): a test child shell is stopped however the test ends. A stand-in Claude Code
+// starts two `sleep` processes (whose command lines hold the sandbox path), then the test fails by
+// unwinding; once the guard is dropped, no process whose command line holds the sandbox path is
+// left. The unwind is forced with `resume_unwind`, a panic that does not call the panic hook.
+#[test]
+fn a_stand_in_shell_and_what_it_started_do_not_outlive_a_test_that_fails() {
+    let sb = Sandbox::new();
+    let mut running = 0;
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let script =
+            "(exec -a \"$PWD/orphan-a\" sleep 300) & (exec -a \"$PWD/orphan-b\" sleep 300) & wait";
+        let shell = claude_stand_in(&sb, &sb.root.join("claude/versions/2.1.400"), script);
+        assert!(shell.is_some(), "the stand-in did not start");
+        // The shell and its two `sleep` processes are running before the test fails.
+        for _ in 0..100 {
+            running = common::processes_holding(&sb.root).len();
+            if running >= 3 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::panic::resume_unwind(Box::new("forced failure after the stand-in started"));
+    }));
+    assert!(caught.is_err(), "the forced failure did not unwind");
+    assert!(
+        running >= 3,
+        "the stand-in's processes were not seen running: {running}"
+    );
+    let mut left = common::processes_holding(&sb.root);
+    for _ in 0..100 {
+        if left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        left = common::processes_holding(&sb.root);
+    }
+    assert!(left.is_empty(), "processes left running: {left:?}");
+}
+
 // §13::2, §13::14 (Claude Code): a session whose Claude Code runs a release older than
-// the one the adapter states (2.1.310), or whose release cannot be read, is UNGUARDED: the sender
+// the one the adapter states (2.1.309), or whose release cannot be read, is UNGUARDED: the sender
 // is told, its listener offers nothing, the message stays QUEUED. At the stated release or a later
 // one it is guarded: the listener offers the message and the delivery prompt makes it DELIVERED;
 // unless R3 says otherwise (the guard's hook not configured: UNGUARDED). Each stand-in Claude Code
 // is a copy of `bash` installed where its release can be read (`versions/<release>`), or not.
+// §4::9 (R3.4, Claude Code): `lunchroom status` gives each UNGUARDED case its own
+// reason: the configuration (item 1), a release that cannot be read naming the program's path
+// (item 3), an older release naming both (item 4).
 #[test]
 fn older_harness_version_is_unguarded_and_a_later_one_is_guarded() {
-    for (install, configured, guarded) in [
-        ("claude/versions/2.1.0", true, false),
-        ("claude/bin/claude", true, false),
-        ("claude/versions/2.1.310", true, true),
-        ("claude/versions/2.2.0", true, true),
-        ("claude/versions/2.2.0", false, false),
+    for (install, configured, guarded, reason) in [
+        (
+            "claude/versions/2.1.0",
+            true,
+            false,
+            "Claude Code 2.1.0 is older than 2.1.309",
+        ),
+        (
+            "claude/versions/2.1.308",
+            true,
+            false,
+            "Claude Code 2.1.308 is older than 2.1.309",
+        ),
+        (
+            "claude/bin/claude",
+            true,
+            false,
+            "Claude Code's release cannot be read from the install of its program (",
+        ),
+        ("claude/versions/2.1.309", true, true, ""),
+        ("claude/versions/2.1.310", true, true, ""),
+        ("claude/versions/2.2.0", true, true, ""),
+        (
+            "claude/versions/2.2.0",
+            false,
+            false,
+            "Claude Code's settings for this session do not run Lunchroom's whole guard",
+        ),
     ] {
         let sb = Sandbox::new();
         if configured {
@@ -1167,8 +1368,12 @@ fn older_harness_version_is_unguarded_and_a_later_one_is_guarded() {
         let stop = json!({"session_id": "o1", "cwd": cwd, "hook_event_name": "Stop"});
         let _ = std::fs::write(sb.root.join("pre.json"), pre.to_string());
         let _ = std::fs::write(sb.root.join("stop.json"), stop.to_string());
+        // The wait is bounded (60 s), and `claude_stand_in` returns a guard that kills the shell's
+        // whole process group when it is dropped. A failed assertion below, which never writes
+        // `go`, unwinds through that drop, so no shell or `sleep` outlives the test (three such
+        // orphans ran on 2026-11-05); the bound only ends the loop on a run that never writes `go`.
         let script = "\"$LR\" guard pretool < pre.json; \
-                      while [ ! -f go ]; do sleep 0.1; done; \
+                      i=0; while [ ! -f go ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; \
                       \"$LR\" listen --once < stop.json 2> offered.txt";
         let shell = claude_stand_in(&sb, &sb.root.join(install), script);
         assert!(shell.is_some(), "{install}");
@@ -1181,6 +1386,23 @@ fn older_harness_version_is_unguarded_and_a_later_one_is_guarded() {
             "{install}: {}",
             run.stdout
         );
+        // Old's own lines in `lunchroom status`: its line, then the indented lines under it.
+        let status = sb.user_status();
+        let why = status
+            .lines()
+            .skip_while(|l| !l.starts_with("Old\t"))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .find(|l| l.starts_with("  why: "));
+        if guarded {
+            assert_eq!(why, None, "{install}: {status}");
+        } else {
+            let why = why.unwrap_or_default();
+            assert!(why.contains(reason), "{install}: {status}");
+            if install == "claude/bin/claude" {
+                assert!(why.contains(install), "{install}: {status}");
+            }
+        }
         let id = run
             .stdout
             .split_whitespace()
@@ -1271,7 +1493,7 @@ fn send_from_observed_session_only() {
         let run = sb.run(&empty, "", &as_session("s1"));
         assert_eq!(run.code, Some(2), "{empty:?}");
         assert!(
-            run.stderr.contains("the message is empty"),
+            run.stderr.contains("the message has no text"),
             "{}",
             run.stderr
         );
@@ -1308,6 +1530,162 @@ fn rewake_prompt(stderr: &str) -> String {
         "<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n\
          <system-reminder>\nStop hook blocking error from command \"Stop\": {stderr}\n</system-reminder>"
     )
+}
+
+// §1 V1.4 (2026-11-03, hookfields1.txt): Claude Code folds a hook's block reason and its
+// error text behind "Ran 1 shell command", and shows a `systemMessage` in full. So a DENIED tool
+// call reaches Claude Code as a `deny` whose reason the agent reads and a `systemMessage` with the
+// same text for the user (exit 0). Codex blocks an exit 2 only with a reason on standard error, and
+// Lunchroom's plugins read exit 2, so theirs stays exit 2 with the reason on standard error.
+#[test]
+fn a_denied_call_reaches_the_agent_and_the_user_in_each_harness_form() {
+    let sb = Sandbox::new();
+    let call = |extra: Value| {
+        let mut v = json!({"session_id": "f1", "cwd": sb.home().join("project"),
+                           "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                           "tool_input": {"command": "codex queue other hi"}, "tool_use_id": "t1"});
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in e {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+        sb.run(&["guard", "pretool"], &v.to_string(), &interactive())
+    };
+    // Claude Code: exit 0, `deny`, the reason, and the same text as the `systemMessage`.
+    let run = call(json!({}));
+    assert_eq!(run.raw_code, Some(0), "{}", run.stderr);
+    let v: Value = serde_json::from_str(run.stdout.trim()).unwrap_or_default();
+    let reason = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(
+        v["hookSpecificOutput"]["permissionDecision"], "deny",
+        "{}",
+        run.stdout
+    );
+    assert!(reason.starts_with("Lunchroom: DENIED"), "{reason}");
+    assert!(reason.contains("Ways forward"), "{reason}");
+    assert_eq!(v["systemMessage"].as_str(), Some(reason), "{}", run.stdout);
+    // Codex: exit 2, the reason on standard error.
+    let run = call(json!({"turn_id": "turn-1"}));
+    assert_eq!(run.raw_code, Some(2), "{}", run.stdout);
+    assert!(
+        run.stderr.starts_with("Lunchroom: DENIED"),
+        "{}",
+        run.stderr
+    );
+}
+
+// §9 I1.5 (2026-11-03): a Claude Code session with no person at it is asked nothing at
+// its start, and its listener returns at once, since Claude Code runs a `-p` prompt only after its
+// start hooks finish (headless1.txt, headless2.txt: every `claude -p` with Lunchroom's hooks was
+// killed at 120 s; a scheduled scan on this server never ran its prompt from 2026-10-28). An
+// interactive session still gets the question, and its listener still waits.
+#[test]
+fn a_claude_code_session_with_no_person_is_asked_nothing_and_its_listener_returns() {
+    let sb = Sandbox::new();
+    // A stand-in `claude -p` process: its command line carries `-p`, as a one-prompt run's does.
+    let argv = ["-c", "sleep 60; true", "claude", "-p"];
+    let stand_in = common::GroupChild::spawn(Command::new("bash").args(argv));
+    assert!(stand_in.is_ok(), "the stand-in did not start");
+    let Ok(mut print_run) = stand_in else { return };
+    let headless = || {
+        vec![
+            ("CLAUDE_PID", print_run.id().to_string()),
+            ("CLAUDE_CODE_SESSION_ATTENDED", "0".to_owned()),
+            ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli".to_owned()),
+        ]
+    };
+    let start = |session: &str| {
+        json!({"session_id": session, "cwd": sb.home().join("project"),
+               "hook_event_name": "SessionStart", "source": "startup"})
+        .to_string()
+    };
+    // The start hook: the question goes to an interactive session only.
+    let run = sb.run(&["guard", "start"], &start("hl-1"), &headless());
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        !run.stdout.contains("include this session"),
+        "{}",
+        run.stdout
+    );
+    let run = sb.run(&["guard", "start"], &start("in-1"), &interactive());
+    assert!(
+        run.stdout.contains("include this session"),
+        "{}",
+        run.stdout
+    );
+    // The listener, as installed (`lunchroom listen`, no `--once`), at a session's start and at a
+    // turn's end: it returns within seconds where nobody is at the session.
+    for event in ["SessionStart", "Stop"] {
+        let input = json!({"session_id": "hl-1", "cwd": sb.home().join("project"),
+                           "hook_event_name": event})
+        .to_string();
+        let mut cmd = sb.command(env!("CARGO_BIN_EXE_lunchroom"));
+        cmd.arg("listen")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (k, v) in headless() {
+            cmd.env(k, v);
+        }
+        let started = cmd.spawn();
+        assert!(started.is_ok(), "{event}: lunchroom listen did not start");
+        let Ok(mut child) = started else { return };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if started.elapsed() < std::time::Duration::from_secs(10) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "{event}: the listener did not return within 10 s: {status:?}"
+        );
+    }
+    // An IDE or desktop session (not `cli`, not attended, no `-p`) keeps its listener: it waits.
+    let ide = [
+        ("CLAUDE_PID", std::process::id().to_string()),
+        ("CLAUDE_CODE_SESSION_ATTENDED", "0".to_owned()),
+        ("CLAUDE_CODE_ENTRYPOINT", "claude-vscode".to_owned()),
+    ];
+    let input = json!({"session_id": "ide-1", "cwd": sb.home().join("project"),
+                       "hook_event_name": "Stop"})
+    .to_string();
+    let mut cmd = sb.command(env!("CARGO_BIN_EXE_lunchroom"));
+    cmd.arg("listen")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for (k, v) in ide {
+        cmd.env(k, v);
+    }
+    let started = cmd.spawn();
+    assert!(started.is_ok(), "lunchroom listen did not start");
+    let Ok(mut child) = started else { return };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let waiting = matches!(child.try_wait(), Ok(None));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = print_run.kill();
+    let _ = print_run.wait();
+    assert!(waiting, "an IDE session's listener returned at once");
 }
 
 fn listen_once(sb: &Sandbox, session: &str) -> Run {
@@ -1521,7 +1899,7 @@ fn held_reply_runs_and_reply_to_non_holder_is_denied() {
 }
 
 // §7::11 (Claude Code): an agent's command that runs `lunchroom approve`, `register` or
-// `rate` is DENIED by the guard, HELD or not.
+// `rate` is DENIED by the guard, HELD or not. §14::8: so is `lunchroom doctor`.
 #[test]
 fn guard_denies_commands_running_approve_yolo_or_config_changes() {
     let sb = Sandbox::new();
@@ -1536,6 +1914,7 @@ fn guard_denies_commands_running_approve_yolo_or_config_changes() {
             "lunchroom rate 1000 1".to_owned(),
             "lunchroom yolo all till 14:00".to_owned(),
             "lunchroom install claude-code".to_owned(),
+            "lunchroom doctor".to_owned(),
             "sh -c 'lunchroom approve 1'".to_owned(),
             format!("echo '{{}}' > {}", state.display()),
             format!("cp /tmp/x {}", state.display()),
@@ -1607,10 +1986,14 @@ fn denied_call_runs_on_retry_after_exact_call_approved_via_cli() {
     );
     let listed = sb.run(&["approve"], "", &[]);
     assert_eq!(listed.code, Some(0), "{}", listed.stderr);
-    assert_eq!(
-        listed.stdout,
-        "1. s1 (claude-code:s1) Bash {\"command\":\"touch made.txt\"}\n"
+    // G2-11: each line ends with how long the call has waited.
+    let line = "1. s1 (claude-code:s1) Bash {\"command\":\"touch made.txt\"} (asked ";
+    assert!(
+        listed.stdout.starts_with(line) && listed.stdout.ends_with(" ago)\n"),
+        "{}",
+        listed.stdout
     );
+    assert_eq!(listed.stdout.lines().count(), 1, "{}", listed.stdout);
     // The user's confirmed `lunchroom approve 1` (its terminal check is unit-tested in
     // terminal.rs; this environment has no terminal of the user's to type into).
     let now = SystemTime::now()
@@ -1674,7 +2057,8 @@ fn yolo_turns_harness_yolo_on_until_its_end() {
     assert!(run.stderr.contains("DENIED · fence"), "{}", run.stderr);
     let status = sb.run(&["status"], "", &[]).stdout;
     assert_eq!(
-        status, "0 agents\nhold mode: Strict\n",
+        status,
+        "0 agents\nhold mode: Strict\ncalls waiting for the user: 1 (`lunchroom approve` lists them)\n",
         "s1 has no name, so status lists no agent: {status}"
     );
     // At the end time the YOLO is off: the HELD agent is asked again.
@@ -2169,16 +2553,16 @@ fn session_start_shows_how_to_join_when_the_store_cannot_be_used() {
         "session_id": "s9", "cwd": sb.home().join("project"),
         "hook_event_name": "SessionStart", "source": "startup",
     });
-    let run = sb.run(
-        &["guard", "start"],
-        &input.to_string(),
-        &[("LUNCHROOM_HOME", broken.display().to_string())],
-    );
+    // An interactive session (I1.5: a session with no person at it is asked nothing).
+    let mut env = interactive();
+    env.push(("LUNCHROOM_HOME", broken.display().to_string()));
+    let run = sb.run(&["guard", "start"], &input.to_string(), &env);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let v: Value = serde_json::from_str(run.stdout.trim()).unwrap_or(Value::Null);
     let shown = v["systemMessage"].as_str().unwrap_or_default();
     assert!(
-        shown.contains("Type join") && shown.contains("could not check this"),
+        shown.contains("Type join")
+            && shown.contains("Lunchroom could not check this session's start"),
         "{shown}"
     );
 }
@@ -2478,7 +2862,8 @@ fn user_typing_join_names_the_session_and_leave_takes_it_out() {
             "session_id": session, "cwd": sb.home().join("project"),
             "hook_event_name": "SessionStart", "source": "startup",
         });
-        sb.run(&["guard", "start"], &input.to_string(), &[])
+        // An interactive session (I1.5: a session with no person at it is asked nothing).
+        sb.run(&["guard", "start"], &input.to_string(), &interactive())
     };
 
     let run = start("s1");
@@ -2721,6 +3106,63 @@ fn held_reads_of_each_denied_path_four_ways_through_the_hook() {
             assert_eq!(run.code, Some(2), "{what} {input}");
             assert!(run.stderr.contains("DENIED"), "{}", run.stderr);
         }
+    }
+}
+
+// §1 V1.4, V1.5 (denied path, through the hook): a session HELD by another agent's
+// message reads a transcript, then searches a folder above transcripts. Each DENIED message names
+// what was DENIED (the command, and the transcript or the folder searched), the rule, the agent
+// and message id that hold the session, and each way forward: leave the path out, the user reads
+// it in a terminal of their own, the user types in the session to clear the hold.
+#[test]
+fn a_denied_path_names_the_path_the_holder_and_each_way_forward() {
+    let sb = Sandbox::new();
+    configure_guard(&sb);
+    name_agents(&sb, &[("alice", "c1"), ("Codex", "x1")]);
+    let id = held_by(&sb, "c1", "x1", "Codex");
+    let transcript = sb.home().join(".claude/projects/p/t.jsonl");
+    write_file(&transcript);
+    let read = format!("cat {}", transcript.display());
+    let folder = sb.home().join(".claude");
+    let search = format!("grep -r token {}", folder.display());
+    // The first line names the part at fault; a search names the folder the call searched and
+    // nothing found below it (G1-2, G1-8).
+    let searched = format!("a search of {}", folder.display());
+    for (command, at_fault, first) in [
+        (
+            read.as_str(),
+            "projects/p/t.jsonl",
+            transcript.display().to_string(),
+        ),
+        (
+            search.as_str(),
+            "(the part at fault: a search of ",
+            searched.clone(),
+        ),
+    ] {
+        let run = sb.pretool("x1", command, &interactive());
+        assert_eq!(run.code, Some(2), "{command}: {}", run.stderr);
+        let text = &run.stderr;
+        if command == search {
+            assert!(!text.contains("t.jsonl"), "{text}");
+        }
+        let parts = [
+            format!("Lunchroom: DENIED · {first}: this path is, or leads to, "),
+            format!("What was DENIED: the command `{command}`"),
+            at_fault.to_owned(),
+            "Why: a HELD session may not read Lunchroom's records or another session's transcript"
+                .to_owned(),
+            "This session is HELD by ".to_owned(),
+            format!("alice ({id})"),
+            "Ways forward:".to_owned(),
+            "- The agent: leave ".to_owned(),
+            "- The user: read it in a terminal of their own.".to_owned(),
+            "- The user: type a message in this session. That ends HELD".to_owned(),
+        ];
+        for part in &parts {
+            assert!(text.contains(part.as_str()), "{command}: {part}\n{text}");
+        }
+        assert!(!text.contains("lunchroom approve"), "{text}");
     }
 }
 
@@ -3088,7 +3530,14 @@ fn status_matches_the_records() {
         Some(0)
     );
     let out = status();
-    assert!(out.contains("  calls waiting for the user: 1"), "{out}");
+    assert!(
+        out.contains("calls waiting for the user: 1 (`lunchroom approve` lists them)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("  calls waiting for the user from this agent: 1"),
+        "{out}"
+    );
     assert!(
         out.contains("Codex\tclaude-code:x1\tHELD\tQUEUED 1\tYOLO until 23:30 UTC"),
         "{out}"
@@ -3156,7 +3605,12 @@ fn the_slip_takes_no_edit_command_or_protected_call() {
             "tool_use_id": "t1",
         });
         let run = sb.run(&["guard", "pretool"], &edit.to_string(), &interactive());
-        assert_eq!((run.code, run.stdout.as_str()), (Some(2), ""), "{held}");
+        // DENIED, never asked (V1.4: Claude Code's form is a `deny`, not an `ask`).
+        assert_eq!(
+            (run.code, decision(&run).as_str()),
+            (Some(2), "deny"),
+            "{held}"
+        );
         assert!(run.stderr.contains("DENIED"), "{}", run.stderr);
     }
 }
@@ -3206,9 +3660,19 @@ fn project_guard(dir: &Path, on: bool) {
     }
 }
 
+/// The notice of Mistral becoming UNGUARDED for its Claude Code configuration (R3.4): the card's
+/// line, then the reason (item 1, naming the harness) and what the user does.
+fn told_why(notice: &str) -> bool {
+    notice.starts_with(
+        "Lunchroom: Mistral is UNGUARDED. Claude Code's settings for this session do not run \
+         Lunchroom's whole guard",
+    ) && notice.ends_with("run lunchroom install claude-code in a terminal of your own, and start the session without --bare.")
+}
+
 // §4::8 (Claude Code): when a named agent becomes UNGUARDED, the user, typing in a
-// guarded session, is told "<agent> is UNGUARDED." once; when it is guarded again and then
-// UNGUARDED again, the user is told again.
+// guarded session, is told "<agent> is UNGUARDED." once, and why (R3.4: its configuration, named
+// with what the user does); when it is guarded again and then UNGUARDED again, the user is told
+// again.
 #[test]
 fn user_is_told_when_an_agent_becomes_unguarded() {
     let sb = Sandbox::new();
@@ -3226,7 +3690,7 @@ fn user_is_told_when_an_agent_becomes_unguarded() {
     project_guard(&mistral_dir, false);
     let run = sb.prompt_in("c1", "Next step.", &interactive());
     assert_eq!(run.code, Some(0));
-    assert_eq!(system_message(&run), "Lunchroom: Mistral is UNGUARDED.");
+    assert!(told_why(&system_message(&run)), "{}", system_message(&run));
     let run = sb.prompt_in("c1", "And again.", &interactive());
     assert_eq!(system_message(&run), "");
     // Guarded again, then UNGUARDED again: told again.
@@ -3237,7 +3701,7 @@ fn user_is_told_when_an_agent_becomes_unguarded() {
     );
     project_guard(&mistral_dir, false);
     let run = sb.prompt_in("c1", "Check.", &interactive());
-    assert_eq!(system_message(&run), "Lunchroom: Mistral is UNGUARDED.");
+    assert!(told_why(&system_message(&run)), "{}", system_message(&run));
     // Guarded again; then the guard's program goes missing while its settings stay: a guard that
     // runs nothing guards nothing, so Mistral is UNGUARDED and the user is told.
     project_guard(&mistral_dir, true);
@@ -3251,7 +3715,7 @@ fn user_is_told_when_an_agent_becomes_unguarded() {
         missing.to_string(),
     );
     let run = sb.prompt_in("c1", "And now?", &interactive());
-    assert_eq!(system_message(&run), "Lunchroom: Mistral is UNGUARDED.");
+    assert!(told_why(&system_message(&run)), "{}", system_message(&run));
     let status = sb.run(&["status"], "", &[]).stdout;
     assert!(
         status.contains("Mistral\tclaude-code:m1\tUNGUARDED"),
@@ -3414,7 +3878,7 @@ fn codex_input(sb: &Sandbox, thread: &str, event: &str, extra: &Value) -> String
 /// A stand-in Codex session: a copy of `bash` named `codex`, so a hook it starts sees a parent
 /// process named `codex`, as under Codex. `script` runs with `$LR` (Lunchroom's program) and
 /// `$IN` (a file of hook input); the process stays alive while `script` runs.
-fn codex_session(sb: &Sandbox, input: &str, script: &str) -> Option<std::process::Child> {
+fn codex_session(sb: &Sandbox, input: &str, script: &str) -> Option<common::GroupChild> {
     codex_session_with(sb, input, script, &[])
 }
 
@@ -3424,7 +3888,7 @@ fn codex_session_with(
     input: &str,
     script: &str,
     env: &[(&str, &str)],
-) -> Option<std::process::Child> {
+) -> Option<common::GroupChild> {
     // Where Codex's own install keeps a release (H1.2 reads it from the path).
     let harness = sb
         .root
@@ -3439,24 +3903,25 @@ fn codex_session_with(
     // A binary just copied can fail to start with "Text file busy" while another test thread
     // forks with the copy's file still open; such a start is tried again.
     for _ in 0..50 {
-        let started = Command::new(&fake)
-            .args(["-c", &format!("{script}; true")])
-            .env_clear()
-            .env("HOME", sb.home())
-            .env("LUNCHROOM_HOME", sb.lunchroom())
-            .env("CODEX_HOME", sb.home().join(".codex"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", sb.root.join("queue-bin").display()),
-            )
-            .env("LR", env!("CARGO_BIN_EXE_lunchroom"))
-            .env("IN", &input_file)
-            .envs(env.iter().copied())
-            .current_dir(sb.home().join("project"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        let started = common::GroupChild::spawn(
+            Command::new(&fake)
+                .args(["-c", &format!("{script}; true")])
+                .env_clear()
+                .env("HOME", sb.home())
+                .env("LUNCHROOM_HOME", sb.lunchroom())
+                .env("CODEX_HOME", sb.home().join(".codex"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", sb.root.join("queue-bin").display()),
+                )
+                .env("LR", env!("CARGO_BIN_EXE_lunchroom"))
+                .env("IN", &input_file)
+                .envs(env.iter().copied())
+                .current_dir(sb.home().join("project"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
         match started {
             Ok(child) => return Some(child),
             Err(e) if e.raw_os_error() == Some(26) => {
@@ -3541,9 +4006,9 @@ fn configure_codex_hooks(sb: &Sandbox, trusted: bool, hooks: &[(&str, &str, &str
         .status();
 }
 
-fn finish(child: Option<std::process::Child>) -> String {
+fn finish(child: Option<common::GroupChild>) -> String {
     child
-        .and_then(|c| c.wait_with_output().ok())
+        .and_then(|c| c.into_output().ok())
         .map(|o| {
             format!(
                 "{}{}",
@@ -3671,6 +4136,45 @@ fn codex_hooks_have_no_approval_channel() {
 // §13::1 (Codex: delivery, guard evidence, identity), §10::1 (Codex), §4::1 (Codex
 // untrusted hooks): a message to a guarded Codex session is handed over through `codex queue`,
 // the session is HELD by it, and it is DELIVERED when its id is in the thread's rollout; the
+// §4 R3.1 (2026-11-03, codexstopped2.txt): a running Codex session whose hook runs
+// through a wrapper (`sh -c`, a script) is not shown STOPPED: the session's process is the nearest
+// `codex` process above the hook, not only the hook's own parent.
+#[test]
+fn a_codex_hook_run_through_a_wrapper_finds_its_codex_process() {
+    let sb = Sandbox::new();
+    configure_guard(&sb);
+    configure_codex(&sb, true);
+    let codex = Identity::new(Harness::Codex, "w1");
+    let named = sb.store().and_then(|s| {
+        s.update(|m| m.register("Wrapped", &codex, Origin::User, None).ok())
+            .ok()
+    });
+    assert!(named.is_some());
+    let pre = codex_input(
+        &sb,
+        "w1",
+        "PreToolUse",
+        &json!({"tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "c1"}),
+    );
+    // The hook runs under `sh`, under the `codex` process; `; true` keeps `sh` from replacing
+    // itself with the guard, so the guard's parent is `sh`.
+    let session = codex_session(
+        &sb,
+        &pre,
+        "sh -c '\"$LR\" guard pretool < \"$IN\"; true'; sleep 4",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let status = sb.user_status();
+    let line = status
+        .lines()
+        .find(|l| l.contains("codex:w1"))
+        .unwrap_or_default()
+        .to_owned();
+    let _ = finish(session);
+    assert!(!line.is_empty(), "{status}");
+    assert!(!line.contains("STOPPED"), "{status}");
+}
+
 // Codex agent's own `lunchroom send`, run under its `codex` process, is bound to its thread and
 // may reply to the holder; with the guard's hook not trusted in Codex's `/hooks`, the session is
 // UNGUARDED, nothing is queued, and the sender is told.
@@ -3741,7 +4245,8 @@ fn codex_delivery_through_codex_queue() {
     // A live session whose guard ran under the trust recorded then; that trust changes (the hook
     // was edited and trusted again, say). The fingerprint the guard recorded no longer holds, so
     // the session is UNGUARDED at once, with no new hook run, and nothing is queued.
-    let session = codex_session(&sb, &pre, "\"$LR\" guard pretool < \"$IN\"; sleep 3");
+    // Alive long enough for the send and the status after it.
+    let session = codex_session(&sb, &pre, "\"$LR\" guard pretool < \"$IN\"; sleep 6");
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let config = sb.home().join(".codex/config.toml");
     let text = std::fs::read_to_string(&config).unwrap_or_default();
@@ -3751,16 +4256,31 @@ fn codex_delivery_through_codex_queue() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stdout.contains("Codex is UNGUARDED."), "{}", run.stdout);
     assert!(!sb.home().join(".codex/queued-x1.txt").exists());
+    // §4::9 (R3.4 item 2, Codex): the guard now trusted has not run in this session.
+    let status = sb.user_status();
+    assert!(
+        codex_why(&status).contains(
+            "No Lunchroom guard hook has run in this Codex session with its configuration"
+        ),
+        "{status}"
+    );
     let _ = finish(session);
     // Untrusted: the guard's hook was not approved in Codex's `/hooks`.
     configure_codex(&sb, false);
-    let session = codex_session(&sb, &pre, "\"$LR\" guard pretool < \"$IN\"; sleep 3");
+    let session = codex_session(&sb, &pre, "\"$LR\" guard pretool < \"$IN\"; sleep 6");
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let _ = std::fs::remove_file(sb.home().join(".codex/queued-x1.txt"));
     let run = send_to_codex(&sb, "c1", "Codex", "Another thing.");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stdout.contains("Codex is UNGUARDED."), "{}", run.stdout);
     assert!(!sb.home().join(".codex/queued-x1.txt").exists());
+    // §4::9 (R3.4 item 1, Codex): this `config.toml` has neither the setting nor the
+    // trust; the setting is named first.
+    let status = sb.user_status();
+    assert!(
+        codex_why(&status).contains("Codex sessions are UNGUARDED until unified_exec_tty is false"),
+        "{status}"
+    );
     let _ = finish(session);
 }
 
@@ -3794,7 +4314,11 @@ fn codex_with_only_the_pretool_hook_is_unguarded_and_not_delivered() {
     let run = send_to_codex(&sb, "c1", "Codex", "Are you there?");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.stdout.contains("Codex is UNGUARDED."), "{}", run.stdout);
-    assert!(!run.stdout.contains("DELIVERED"), "{}", run.stdout);
+    assert!(
+        !run.stdout.lines().any(|l| l.starts_with("DELIVERED")),
+        "{}",
+        run.stdout
+    );
     let id = run
         .stdout
         .split_whitespace()
@@ -3803,19 +4327,42 @@ fn codex_with_only_the_pretool_hook_is_unguarded_and_not_delivered() {
         .to_owned();
     assert_eq!(message_state(&sb, &id), Some("QUEUED"));
     assert!(!sb.home().join(".codex/queued-x1.txt").exists());
-    let status = sb.run(&["status"], "", &[]).stdout;
+    let status = sb.user_status();
     assert!(status.contains("Codex\tcodex:x1\tUNGUARDED"), "{status}");
+    // §4::9 (R3.4, Codex): the reason names the hooks file at fault and what to do.
+    assert!(
+        codex_why(&status).contains(&format!(
+            "Codex's hooks file {} does not hold Lunchroom's whole guard",
+            sb.home().join(".codex/hooks.json").display()
+        )),
+        "{status}"
+    );
     let _ = finish(session);
+}
+
+/// The `why:` line under the Codex agent in `lunchroom status`, empty when there is none.
+fn codex_why(status: &str) -> String {
+    status
+        .lines()
+        .skip_while(|l| !l.starts_with("Codex\t"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .find(|l| l.starts_with("  why: "))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 // §10::1 (Codex): at a Codex turn's end the listener (`lunchroom listen --once` on
 // `Stop`) hands a waiting message over through `codex queue` without waiting; when Codex then
-// shows it, the guard's prompt hook confirms it DELIVERED.
+// shows it, the guard's prompt hook confirms it DELIVERED. The stand-in `codex queue` writes no
+// session record here: with the id in the session record, any check of D1.7 (`lunchroom status`
+// below included) confirms it first, and the prompt hook's confirmation would not be tested.
 #[test]
 fn codex_listener_hands_over_and_the_prompt_hook_confirms() {
     let sb = Sandbox::new();
     configure_guard(&sb);
     configure_codex(&sb, true);
+    queue_stand_in(&sb, "printf '%s' \"$5\" > \"$CODEX_HOME/queued-$3.txt\"");
     name_agents(&sb, &[("Claude", "c1")]);
     let codex = Identity::new(Harness::Codex, "x1");
     let named = sb.store().and_then(|s| {
@@ -3855,6 +4402,8 @@ fn codex_listener_hands_over_and_the_prompt_hook_confirms() {
     );
     let out = finish(session);
     assert!(out.contains("listen=0"), "{out}");
+    // D1.7: the checks the hooks started have ended before the store is read.
+    settle(&sb);
     let queued =
         std::fs::read_to_string(sb.home().join(".codex/queued-x1.txt")).unwrap_or_default();
     assert!(queued.contains(&format!("id: {id}")), "{queued}");
@@ -3945,7 +4494,14 @@ fn codex_send_reports_unconfirmed_and_failed_attempts() {
         "{}",
         run.stdout
     );
-    assert!(!run.stdout.contains("DELIVERED"), "{}", run.stdout);
+    // The text promises a later "DELIVERED"; no line reports this message as delivered now.
+    assert!(
+        !run.stdout
+            .lines()
+            .any(|l| l.starts_with("DELIVERED") || l.starts_with(&format!("{first}: DELIVERED"))),
+        "{}",
+        run.stdout
+    );
     assert_eq!(message_state(&sb, &first), Some("QUEUED"));
     // The next send hands over the next message, never the first again.
     let run = send_to_codex(&sb, "c1", "Codex", "Second.");
@@ -3977,25 +4533,376 @@ fn codex_send_reports_unconfirmed_and_failed_attempts() {
         "{}",
         run.stdout
     );
-    let mut last = String::new();
+    // D1.7: each check (every send, and the check a guard hook starts) offers a message whose
+    // attempt failed again at once, so the three attempts are spent by these sends and their checks.
+    // A failed attempt is not tried again for RETRY_GAP_SECS (10 seconds, CHANGELOG 1.0.2); the
+    // test ends that gap, as the passing of the time would, before each send.
     for text in ["Fourth.", "Fifth."] {
+        end_retry_gap(&sb, &third);
         let run = send_to_codex(&sb, "c1", "Codex", text);
         assert_eq!(run.code, Some(0), "{}", run.stderr);
-        last = run.stdout;
+        settle(&sb);
     }
-    assert!(
-        last.contains(&format!("{third}: codex queue exited 1; FAILED")),
-        "{last}"
-    );
     assert_eq!(message_state(&sb, &third), Some("FAILED"));
-    // D1.4: the sender is told, with the reason, by a notice its listener shows once.
+    // D1.4, D1.8: the sender is told, with the reason, by a notice shown once.
     let told = sb.store().and_then(|s| s.read().ok()).map(|m| {
         m.notices(&Identity::new(Harness::ClaudeCode, "c1"))
             .iter()
-            .any(|n| n.text == format!("{third} FAILED: codex queue exited 1"))
+            .any(|n| {
+                n.text
+                    .starts_with(&format!("{third} FAILED: codex queue exited 1 (to Codex, "))
+            })
     });
     assert_eq!(told, Some(true));
     let _ = finish(session);
+}
+
+/// D1.7: waits until no check a hook started runs or waits to run: each leaves a marker in
+/// `<store>/checks/` from before its hook ends until the check ends. A test that reads the store
+/// after hooks ran, while a message is QUEUED, calls this first, so no check changes the store
+/// under it.
+fn settle(sb: &Sandbox) {
+    let dir = sb.lunchroom().join("store/checks");
+    for _ in 0..1800 {
+        let running = std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_some());
+        if !running {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Moves the hand-over of message `id` `secs` into the past in the store, as if that much time had
+/// passed with no Lunchroom program running.
+fn age_hand_over(sb: &Sandbox, id: &str, secs: u64) {
+    let path = sb.lunchroom().join("store/state.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if let Some(at) = v["messages"][id]["presented_at"].as_u64() {
+        v["messages"][id]["presented_at"] = json!(at.saturating_sub(secs));
+    }
+    let _ = std::fs::write(&path, v.to_string());
+}
+
+/// Ends the pause after message `id`'s failed attempt, as if that much time had passed.
+fn end_retry_gap(sb: &Sandbox, id: &str) {
+    let path = sb.lunchroom().join("store/state.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if v["messages"][id]["told"]["retry_after"].is_u64() {
+        v["messages"][id]["told"]["retry_after"] = json!(0);
+    }
+    let _ = std::fs::write(&path, v.to_string());
+}
+
+/// The failed attempts of message `id`.
+fn failed_attempts(sb: &Sandbox, id: &str) -> Option<u32> {
+    sb.store()
+        .and_then(|s| s.read().ok())
+        .and_then(|m| m.message(id).map(|d| d.failed_attempts))
+}
+
+// §10 D1.7, D1.9, D1.10 (Codex): a hand-over Codex takes but never confirms, with no
+// event afterwards but a later check: `lunchroom status` counts it once it is past its time and
+// offers the message again at once through the recipient's own `codex queue`; a prompt in another
+// session (its guard hook starts a check it does not wait for) does the same, and tells the user of
+// the failed attempt; the third makes the message FAILED, with no fourth hand-over. `status` shows
+// the message with its recipient, age, stage and since when, attempt, and when it is offered again.
+#[test]
+fn a_hand_over_past_its_time_is_offered_again_by_any_check_and_fails_after_three() {
+    let sb = Sandbox::new();
+    codex_and_two_senders(&sb);
+    let log = sb.home().join(".codex/handed.txt");
+    queue_stand_in(
+        &sb,
+        &format!("printf '%s\\n' \"$5\" | grep '^id: ' >> {}", log.display()),
+    );
+    let pre = codex_input(
+        &sb,
+        "x1",
+        "PreToolUse",
+        &json!({
+            "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "c1",
+        }),
+    );
+    let session = codex_session(&sb, &pre, "\"$LR\" guard pretool < \"$IN\"; sleep 90");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let run = send_to_codex(&sb, "c1", "Codex", "Are you there?");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let id = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        run.stdout
+            .contains(&format!("{id}: Not confirmed; still QUEUED")),
+        "{}",
+        run.stdout
+    );
+    let handed = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches(&format!("id: {id}"))
+            .count()
+    };
+    assert_eq!(handed(), 1);
+    let past = 600 + 60;
+    // No event for 11 minutes; then the user runs `lunchroom status`.
+    settle(&sb);
+    age_hand_over(&sb, &id, past);
+    let status = user_status(&sb);
+    assert_eq!(failed_attempts(&sb, &id), Some(1), "{status}");
+    assert_eq!(handed(), 2, "offered again at once");
+    let line = status
+        .lines()
+        .find(|l| {
+            l.trim_start()
+                .starts_with(&format!("{id} to Codex (codex:x1)"))
+        })
+        .unwrap_or_default();
+    for fact in [
+        ", sent ",
+        " ago by Claude, attempt 2 of 3: handed over ",
+        " not yet confirmed",
+        "Lunchroom waits for the message id in that session's record, or its next prompt",
+        "it is offered again at ",
+        " if not confirmed by then",
+    ] {
+        assert!(line.contains(fact), "{fact}\n{status}");
+    }
+    assert!(status.contains("QUEUED messages:"), "{status}");
+    // No event for 11 minutes again; then a prompt in another session. Its hook starts a check it
+    // does not wait for, and the user is told there of the first failed attempt.
+    settle(&sb);
+    age_hand_over(&sb, &id, past);
+    let run = sb.prompt_in("c2", "Hello.", &interactive());
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let shown = system_message(&run);
+    assert!(
+        shown.contains(&format!("Lunchroom: {id} to Codex: attempt 1 of 3 failed")),
+        "{shown}"
+    );
+    settle(&sb);
+    assert_eq!(failed_attempts(&sb, &id), Some(2));
+    assert_eq!(handed(), 3);
+    // The third: FAILED with the reason, never handed over a fourth time.
+    settle(&sb);
+    age_hand_over(&sb, &id, past);
+    let status = user_status(&sb);
+    assert_eq!(message_state(&sb, &id), Some("FAILED"), "{status}");
+    assert_eq!(handed(), 3);
+    assert!(!status.contains(&format!("{id} to Codex")), "{status}");
+    let told = sb.store().and_then(|s| s.read().ok()).map(|m| {
+        m.notices(&Identity::new(Harness::ClaudeCode, "c1"))
+            .iter()
+            .any(|n| {
+                n.text.starts_with(&format!(
+                    "{id} FAILED: no confirmation from the recipient's harness (to Codex, sent "
+                ))
+            })
+    });
+    assert_eq!(told, Some(true));
+    if let Some(mut child) = session {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Codex `x1` running, senders `c1` and `c2` named, and `c1`'s message to Codex (the returned id)
+/// handed over once by a `codex queue` that failed, so it is due to be offered again; the pause
+/// after the failure is over, and the stand-in `codex queue` now logs each message it is given to
+/// the returned file. `go` is a file the session waits for before it runs `script`.
+fn due_message_from_c1(
+    sb: &Sandbox,
+    script: &str,
+    go: &Path,
+) -> (String, std::path::PathBuf, Option<common::GroupChild>) {
+    codex_and_two_senders(sb);
+    let log = sb.home().join(".codex/handed.txt");
+    queue_stand_in(sb, "echo no such thread >&2; exit 1");
+    let pre = codex_input(
+        sb,
+        "x1",
+        "PreToolUse",
+        &json!({
+            "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "c1",
+        }),
+    );
+    let session = codex_session_with(
+        sb,
+        &pre,
+        &format!(
+            "\"$LR\" guard pretool < \"$IN\"; while [ ! -e \"$GO\" ]; do sleep 0.1; done; {script}; sleep 25"
+        ),
+        &[
+            ("GO", &go.display().to_string()),
+            ("OUT", &go.with_extension("out").display().to_string()),
+        ],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let run = send_to_codex(sb, "c1", "Codex", "From c1.");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let id = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    settle(sb);
+    assert_eq!(failed_attempts(sb, &id), Some(1), "{}", run.stdout);
+    queue_stand_in(
+        sb,
+        &format!("printf '%s\\n' \"$5\" | grep '^id: ' >> {}", log.display()),
+    );
+    (id, log, session)
+}
+
+/// `lunchroom status` as the user runs it in a terminal of their own: detached (`setsid --fork`),
+/// so no process above it is one a guard hook recorded. A plain `sb.run` is a child of this test
+/// process, which the tests' `pretool` hooks record as the sender's harness process, so `status`
+/// there is an agent's (D1.1).
+fn user_status(sb: &Sandbox) -> String {
+    let setsid = common::which("setsid");
+    assert!(setsid.is_some(), "this test needs `setsid` on PATH");
+    let mut cmd = sb.command(&setsid.unwrap_or_default().display().to_string());
+    cmd.args(["--fork", env!("CARGO_BIN_EXE_lunchroom"), "status"]);
+    common::finish(cmd, "").stdout
+}
+
+fn handed_ids(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+fn stop(session: Option<common::GroupChild>) {
+    if let Some(mut child) = session {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+// §10 D1.1, D1.7 (DV-03): the check inside `lunchroom send` offers only the sender's
+// own messages. c1's message is due again; c2's send hands over c2's message and its check does not
+// hand c1's over, though it is older and due. A check a guard hook starts (c2's next prompt) offers
+// any sender's, and then does.
+#[test]
+fn a_check_inside_send_never_hands_over_another_senders_message() {
+    let sb = Sandbox::new();
+    let go = sb.root.join("go-send");
+    let (first, log, session) = due_message_from_c1(&sb, "true", &go);
+    // c2's guard hook starts a check of its own, which offers any sender's message; it runs while
+    // c1's pause after the failure is still on, and ends before the pause does. The send then runs
+    // with no hook of its own, so the only check in it is the one inside `send`.
+    assert_eq!(sb.pretool("c2", "true", &interactive()).code, Some(0));
+    settle(&sb);
+    end_retry_gap(&sb, &first);
+    let queue_bin = sb.root.join("queue-bin").display().to_string();
+    let env = vec![
+        ("PATH", format!("{queue_bin}:/usr/bin:/bin")),
+        (
+            "CODEX_HOME",
+            sb.root.join("sender-codex").display().to_string(),
+        ),
+    ];
+    let run = sb.run(&["send", "Codex", "From c2."], "", &env);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let second = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    settle(&sb);
+    let handed = handed_ids(&log);
+    assert!(handed.contains(&format!("id: {second}")), "{handed}");
+    assert!(
+        !handed.contains(&format!("id: {first}")),
+        "c2's send handed over c1's message:\n{handed}"
+    );
+    assert_eq!(failed_attempts(&sb, &first), Some(1));
+    // A check a guard hook started offers any sender's.
+    age_hand_over(&sb, &second, 660);
+    let run = sb.prompt_in("c2", "Hello.", &interactive());
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    settle(&sb);
+    let handed = handed_ids(&log);
+    assert!(handed.contains(&format!("id: {first}")), "{handed}");
+    stop(session);
+}
+
+// §10 D1.1, D1.7 (DV-03): `lunchroom status` run by an agent (here the Codex session's
+// own process tree) offers nobody's message, so no sender's text is put in front of an agent at a
+// time it chooses; run by the user in a terminal of their own it offers any sender's.
+#[test]
+fn status_run_by_an_agent_offers_nothing_and_by_the_user_offers_any() {
+    let sb = Sandbox::new();
+    let go = sb.root.join("go-status");
+    let (first, log, session) = due_message_from_c1(&sb, "\"$LR\" status > \"$OUT\" 2>&1", &go);
+    end_retry_gap(&sb, &first);
+    let _ = std::fs::write(&go, "");
+    let out = go.with_extension("out");
+    for _ in 0..100 {
+        if std::fs::metadata(&out).is_ok_and(|m| m.len() > 0) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        std::fs::metadata(&out).is_ok_and(|m| m.len() > 0),
+        "the agent's status printed nothing"
+    );
+    settle(&sb);
+    let handed = handed_ids(&log);
+    assert!(
+        !handed.contains(&format!("id: {first}")),
+        "an agent's status offered a message:\n{handed}"
+    );
+    assert_eq!(failed_attempts(&sb, &first), Some(1));
+    // The user's `status` offers it.
+    let status = user_status(&sb);
+    let handed = handed_ids(&log);
+    assert!(
+        handed.contains(&format!("id: {first}")),
+        "{handed}\n{status}"
+    );
+    stop(session);
+}
+
+// §10 D1.7, D1.10: a message to an agent that took itself out with `leave` is FAILED at
+// the next check, with that reason, and its sender is told; `status` lists it no more.
+#[test]
+fn a_message_to_an_agent_that_left_is_failed_at_the_next_check() {
+    let sb = Sandbox::new();
+    configure_guard(&sb);
+    name_agents(&sb, &[("Claude", "c1"), ("Mistral", "m1")]);
+    let run = send_as(&sb, "c1", "Mistral", "Still there?");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let id = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let status = sb.run(&["status"], "", &[]).stdout;
+    assert!(
+        status.contains(&format!("{id} to Mistral (claude-code:m1)")),
+        "{status}"
+    );
+    assert_eq!(sb.prompt_in("m1", "leave", &interactive()).code, Some(0));
+    let status = sb.run(&["status"], "", &[]).stdout;
+    assert_eq!(message_state(&sb, &id), Some("FAILED"), "{status}");
+    assert!(!status.contains(&format!("{id} to Mistral")), "{status}");
+    let told = sb.store().and_then(|s| s.read().ok()).map(|m| {
+        m.notices(&Identity::new(Harness::ClaudeCode, "c1"))
+            .iter()
+            .any(|n| {
+                n.text.starts_with(&format!(
+                    "{id} FAILED: Mistral no longer takes messages: it left with `leave`"
+                ))
+            })
+    });
+    assert_eq!(told, Some(true));
 }
 
 // §13::1 (Codex: injection channels), §12::1 (Codex): through a Codex-shaped hook, in
@@ -4301,7 +5208,7 @@ fn a_message_read_from_empty_standard_input_is_refused_and_not_stored() {
         let run = sb.run(&["send", "reviewer", "-"], stdin, &[]);
         assert_eq!(run.code, Some(2), "{stdin:?}: {}", run.stderr);
         assert!(
-            run.stderr.contains("DENIED") && run.stderr.contains("the message is empty"),
+            run.stderr.contains("DENIED") && run.stderr.contains("the message has no text"),
             "{stdin:?}: {}",
             run.stderr
         );
@@ -4318,7 +5225,7 @@ fn a_message_read_from_empty_standard_input_is_refused_and_not_stored() {
 #[test]
 fn guard_input_that_is_not_utf8_is_the_guards_own_error() {
     let sb = Sandbox::new();
-    let failed = "could not check this: ";
+    let failed = "Lunchroom could not check ";
     let mut call = br#"{"session_id":"s1","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"touch a"},"tool_use_id":"t1","x":""#.to_vec();
     call.extend_from_slice(&[0xff, 0xfe, 0xc0, 0x80]);
     call.extend_from_slice(br#""}"#);
@@ -4631,7 +5538,7 @@ fn codex_and_two_senders(sb: &Sandbox) {
 }
 
 /// A running stand-in Codex session `x1` whose own environment also holds `env`.
-fn running_codex(sb: &Sandbox, env: &[(&str, &str)]) -> Option<std::process::Child> {
+fn running_codex(sb: &Sandbox, env: &[(&str, &str)]) -> Option<common::GroupChild> {
     let pre = codex_input(
         sb,
         "x1",

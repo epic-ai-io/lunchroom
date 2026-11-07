@@ -15,6 +15,7 @@
 //! session (fences, identity, Lunchroom commands; a shell script the reader can read also for
 //! Lunchroom's stores).
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
@@ -250,8 +251,14 @@ const GREPS: [&str; 4] = ["grep", "egrep", "fgrep", "zgrep"];
 const COPIERS: [&str; 5] = ["tar", "zip", "cp", "rsync", "scp"];
 
 /// Lunchroom commands that only the user may run, as they are spotted in code (A1.3).
-const LUNCHROOM_USER_ONLY: [&str; 15] = [
+const LUNCHROOM_USER_ONLY: [&str; 18] = [
+    // 1.1: the console is the user's own screen; an agent that ran it would see and press its keys.
+    "console",
     "approve",
+    // Runs the check of the QUEUED messages (D1.7), which counts hand-overs failed and offers
+    // messages again through the recipients' own programs. The hooks start it; an agent that ran
+    // it could make another session's message fail or be offered again.
+    "check",
     "repair",
     "mode",
     "yolo",
@@ -270,7 +277,49 @@ const LUNCHROOM_USER_ONLY: [&str; 15] = [
     // Write the program and the harness configuration that runs the guard (H1.4, A1.3).
     "install",
     "uninstall",
+    // C1.4: "It is the user's command: an agent's attempt to run it is DENIED."
+    "doctor",
 ];
+
+/// Programs that attach to another process or trace it (1.1, rule 3).
+const DEBUGGERS: [&str; 6] = ["gdb", "gdbserver", "lldb", "strace", "ltrace", "ptrace"];
+
+/// Programs that signal processes by id or by name (1.1, rule 2).
+const KILLERS: [&str; 3] = ["kill", "pkill", "killall"];
+
+/// `word` is one of the words of `text`, where a word is a run of letters, digits, `_` and `-`
+/// (so `/usr/local/lib/lunchroom/lunchroom` names it, `my-lunchroom-app` does not).
+fn names_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .any(|w| w == word)
+}
+
+/// `name args...` runs a program as the user or the group `lunchroom` (1.1, rule 5): `sudo`,
+/// `doas`, `runuser` and `pkexec` with the user or group option naming it, `su` and
+/// `machinectl shell` with it as an operand. A word `lunchroom` that is no user (a package name)
+/// is not one.
+fn becomes_lunchroom(name: &str, args: &[&str]) -> bool {
+    const WHO: &str = "lunchroom";
+    match name {
+        "sudo" | "doas" | "runuser" | "pkexec" => args.iter().enumerate().any(|(k, a)| {
+            let attached = a
+                .strip_prefix("--user=")
+                .or_else(|| a.strip_prefix("--group="))
+                .or_else(|| a.strip_prefix("-u"))
+                .or_else(|| a.strip_prefix("-g"))
+                .or_else(|| a.strip_prefix("-l").filter(|_| name == "runuser"));
+            let separate = *a == WHO
+                && k > 0
+                && (matches!(args[k - 1], "-u" | "-g" | "--user" | "--group")
+                    || (name == "runuser" && args[k - 1] == "-l"));
+            attached == Some(WHO) || separate
+        }),
+        "su" | "machinectl" => args
+            .iter()
+            .any(|a| *a == WHO || a.starts_with("lunchroom@")),
+        _ => false,
+    }
+}
 
 /// Options whose value the program runs as a command, from the programs' manuals (2026-10-27): their
 /// values are judged as code, written separately, after `=`, or (one-letter options) attached. Any
@@ -421,6 +470,12 @@ struct Acc {
     new_session: bool,
     /// The call is a reply (§6 item 1): its words are text to send, which it opens as no file.
     reply: bool,
+    /// V1.4: the path, program, word or text at fault for the DENIED class shown, as the guard
+    /// read it; set by the rule that made the class shown.
+    fault: Option<String>,
+    /// How many path-like strings this call has had resolved against the file system
+    /// ([`MAX_RESOLVED`]).
+    resolved: usize,
 }
 
 const fn rank(c: CallClass) -> u8 {
@@ -445,6 +500,29 @@ impl Acc {
             kinds: call.kinds,
             new_session: false,
             reply: false,
+            fault: None,
+            resolved: 0,
+        }
+    }
+
+    /// Raises DENIED for `r`, noting `what` (V1.4) when this rule's class is the one shown and no
+    /// earlier rule of that class noted its own.
+    fn deny(&mut self, r: DenyReason, what: &str) {
+        let c = CallClass::Denied(r);
+        let before = self.class;
+        self.raise(c);
+        if self.class == c && (before != c || self.fault.is_none()) {
+            self.fault = Some(what.to_owned());
+        }
+    }
+
+    /// Takes a DENIED class `sub` reached on text this call runs, with what it found at fault.
+    fn deny_from(&mut self, sub: &Self) {
+        if let CallClass::Denied(r) = sub.class {
+            self.deny(r, sub.fault.as_deref().unwrap_or_default());
+            if self.fault.as_deref() == Some("") {
+                self.fault = None;
+            }
         }
     }
 
@@ -595,19 +673,28 @@ fn tokens(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The path-like strings in one word: the word, its parts, and each part from its first `/` or `~`.
+/// The most path-like strings one call has looked up in the file system (links, wildcards,
+/// folders). Past it a string is judged by its text alone, which still finds a store or transcript
+/// path written out in full, and a HELD call is PROTECTED as unparsed unless it is a reply, whose
+/// words are text to send, not files.
+const MAX_RESOLVED: usize = 1_000;
+
+/// The path-like strings in one word: the word, its parts, and each part from its first `/` or `~`;
+/// each once (a set, not a search of the list: a text of thousands of words took time in
+/// proportion to the square of their number).
 fn candidates(text: &str) -> Vec<&str> {
-    let mut all = vec![text];
-    for part in text.split(|c: char| !is_path_char(c)) {
-        all.push(part);
-        if let Some(k) = part.find(['/', '~']) {
-            all.push(&part[k..]);
+    fn add<'a>(t: &'a str, seen: &mut HashSet<&'a str>, out: &mut Vec<&'a str>) {
+        if !t.is_empty() && !t.starts_with('-') && seen.insert(t) {
+            out.push(t);
         }
     }
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut out: Vec<&str> = Vec::new();
-    for t in all {
-        if !t.is_empty() && !t.starts_with('-') && !out.contains(&t) {
-            out.push(t);
+    add(text, &mut seen, &mut out);
+    for part in text.split(|c: char| !is_path_char(c)) {
+        add(part, &mut seen, &mut out);
+        if let Some(k) = part.find(['/', '~']) {
+            add(&part[k..], &mut seen, &mut out);
         }
     }
     out
@@ -758,17 +845,19 @@ fn code_rules(text: &str) -> Option<DenyReason> {
             if FENCE_PROGRAMS.contains(&name) && fence_args(name, after) {
                 return Some(DenyReason::Fence);
             }
-            // A Lunchroom command only the user may run, or one given an option first.
-            // After help (`--help approve`) a user-only command still counts.
+            // A Lunchroom command only the user may run (A1.3; §15 limit 8: a mention counts).
+            // After help (`--help approve`) a user-only command still counts. Any other word
+            // after the name runs nothing: Lunchroom takes its command from its first argument
+            // and prints its usage for anything else (main.rs), so `--repo
+            // epic-ai-io/lunchroom --pattern x` is not a Lunchroom command.
             let lead = after
                 .iter()
                 .take_while(|n| matches!(**n, "help" | "--help" | "-h" | "--version"))
                 .count();
             if LUNCHROOM_NAMES.contains(&name)
-                && after.get(lead).is_some_and(|n| {
-                    LUNCHROOM_USER_ONLY.contains(n)
-                        || (n.starts_with('-') && !LUNCHROOM_OPEN.contains(n))
-                })
+                && after
+                    .get(lead)
+                    .is_some_and(|n| LUNCHROOM_USER_ONLY.contains(n))
             {
                 return Some(DenyReason::Configuration);
             }
@@ -844,6 +933,48 @@ fn passes_a_prompt(text: &str) -> bool {
     })
 }
 
+/// The most files one `apply_patch` call is judged by. A patch naming more is judged by the first
+/// this many and the HELD call is then PROTECTED as unparsed.
+const MAX_PATCH_PATHS: usize = 200;
+
+/// The files a Codex `apply_patch` patch writes, each once, in order, and whether more than
+/// [`MAX_PATCH_PATHS`] were named. Codex's own parser takes a line, trimmed, that begins `*** Add
+/// File: `, `*** Delete File: `, `*** Update File: ` or `*** Move to: ` and reads the rest as the
+/// path (openai/codex tag `rust-v0.166.0`, `codex-rs/apply-patch/src/streaming_parser.rs` lines
+/// 107-132 and 255, markers in `codex-rs/apply-patch/src/parser.rs` lines 39-42). Every other line
+/// is file content, which this reads for no path.
+fn patch_paths(patch: &str) -> (Vec<&str>, bool) {
+    const MARKERS: [&str; 4] = [
+        "*** Add File: ",
+        "*** Delete File: ",
+        "*** Update File: ",
+        "*** Move to: ",
+    ];
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out: Vec<&str> = Vec::new();
+    for line in patch.lines() {
+        let line = line.trim();
+        let Some(named) = MARKERS.iter().find_map(|m| line.strip_prefix(m)) else {
+            continue;
+        };
+        if named.is_empty() || !seen.insert(named) {
+            continue;
+        }
+        if out.len() >= MAX_PATCH_PATHS {
+            return (out, true);
+        }
+        out.push(named);
+    }
+    (out, false)
+}
+
+/// The files a Codex `apply_patch` patch writes, as the guard judges them ([`patch_paths`]), for a
+/// message that says what a call was (V1.4).
+#[must_use]
+pub fn patch_files(patch: &str) -> Vec<&str> {
+    patch_paths(patch).0
+}
+
 /// Every string in a tool's input, at any depth.
 fn string_leaves<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
     match v {
@@ -852,6 +983,50 @@ fn string_leaves<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
         Value::Object(map) => map.values().for_each(|i| string_leaves(i, out)),
         _ => {}
     }
+}
+
+/// Text the shell parser could not read, split where a command can start (`;`, `&`, `|`, a
+/// newline, a backquote), but never at such a character inside single or double quotes or after a
+/// backslash: quoted text is one word (field, 2026-11-02: `grep "fn bash(&self" x.rs` split at the
+/// `&` made a program `self" x.rs`, missing, DENIED in every session). A quote never closed runs
+/// to the end. Each piece is the original text, quotes and all.
+fn split_unquoted(text: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            // Inside double quotes the shell still runs `` `…` `` and `$(…)` (marked by a newline
+            // before this split): a command starts there, so the text splits there too.
+            Some('"') if c == '`' || c == '\n' => {
+                pieces.push(&text[start..i]);
+                start = i + c.len_utf8();
+            }
+            Some(q) => {
+                if q == '"' && c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(c),
+                ';' | '&' | '|' | '\n' | '`' => {
+                    pieces.push(&text[start..i]);
+                    start = i + c.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+    pieces.push(&text[start..]);
+    pieces
 }
 
 /// Shell text with each heredoc's body lines removed: after a line holding `<<WORD` (`<<-`,
@@ -998,9 +1173,14 @@ fn interpreter_script<'a>(name: &str, args: &[&'a str]) -> Option<&'a str> {
     if matches!(name, "awk" | "gawk" | "mawk") {
         return option_value(args, &["-f", "--file", "-E", "--exec"]);
     }
+    // Python's `-I` (isolated mode) and `-E` (ignore the environment) are flags with no value; the
+    // script is the next word (field, 2026-11-02: `python3 -I run.py data.csv` took the data file
+    // for the script). Ruby's and perl's `-I dir` takes a folder, and perl's `-E` is inline code.
+    let python = name.starts_with("python") || name.starts_with("pypy");
     let mut k = 0;
     while let Some(a) = args.get(k) {
         match *a {
+            "-I" | "-E" if python => k += 1,
             "-c" | "-e" | "-E" | "-m" | "-p" | "-r" | "--eval" | "--print" | "-Command" => {
                 return None;
             }
@@ -1479,6 +1659,21 @@ impl Guard<'_> {
     /// kind the call raised (P1.6: the policy follows the kinds, not the class shown).
     #[must_use]
     pub fn classify_call(&self, tool: &str, input: &Value, cwd: &Path) -> Call {
+        self.classify_explained(tool, input, cwd).0
+    }
+
+    /// [`Guard::classify_call`], with what the rule behind a DENIED class found at fault: the
+    /// path, program, word or text, as the guard read it (V1.4). `None` for a call not DENIED, or
+    /// where the rule names nothing narrower than the whole call.
+    #[must_use]
+    pub fn classify_explained(
+        &self,
+        tool: &str,
+        input: &Value,
+        cwd: &Path,
+    ) -> (Call, Option<String>) {
+        // H1.7: the step named if the guard's time runs out here.
+        let _step = crate::steps::begin(format!("judging the {tool} call"));
         let field = |k: &str| input.get(k).and_then(Value::as_str);
         let mut acc = Acc::new(CallClass::InSlip);
         match tool {
@@ -1513,9 +1708,32 @@ impl Guard<'_> {
                 } else {
                     "file_path"
                 };
-                match field(key) {
+                // P1.4: a file-write call with no path the guard can read is DENIED in every
+                // session, since it may write Lunchroom's stores.
+                match field(key).filter(|p| !p.is_empty()) {
                     Some(p) => self.write_path(p, cwd, &mut acc),
-                    None => self.when_held(&mut acc, CallClass::Protected(ProtectedKind::Unparsed)),
+                    None => acc.deny(DenyReason::Unparsed, &format!("{tool} with no path")),
+                }
+            }
+            "apply_patch" => {
+                // Codex's and OpenClaw's file-edit tool (docs/host-facts/codex-apply-patch.md; the
+                // OpenClaw plugin passes OpenClaw's `input` as `command`): its input is a patch
+                // whose header lines name the files it writes; the lines between them are file
+                // contents, not paths, and are never judged as paths. A patch with no header line
+                // the guard can read is DENIED in every session (P1.4).
+                acc.raise(CallClass::Ordinary);
+                let (paths, cut) = field("command").map_or((Vec::new(), false), patch_paths);
+                if paths.is_empty() {
+                    acc.deny(
+                        DenyReason::Unparsed,
+                        "apply_patch with no file the guard can read",
+                    );
+                }
+                for p in paths {
+                    self.write_path(p, cwd, &mut acc);
+                }
+                if cut {
+                    self.when_held(&mut acc, CallClass::Protected(ProtectedKind::Unparsed));
                 }
             }
             "Bash" => {
@@ -1551,7 +1769,8 @@ impl Guard<'_> {
         if acc.new_session {
             self.when_held(&mut acc, CallClass::Protected(ProtectedKind::OtherSession));
         }
-        acc.call()
+        let fault = if acc.denied() { acc.fault.take() } else { None };
+        (acc.call(), fault)
     }
 
     fn when_held(&self, acc: &mut Acc, c: CallClass) {
@@ -1580,6 +1799,8 @@ impl Guard<'_> {
     /// not be settled (a link loop, a part the guard may not look at, a `..` after a part that does
     /// not exist or after a wildcard), so it may be anywhere.
     fn forms(&self, raw: &str, cwd: &Path) -> Forms {
+        // H1.7: the step named if the guard's time runs out here.
+        let _step = crate::steps::begin(format!("looking up the path {raw}"));
         let joined = absolute(raw, cwd, &self.layout.home);
         let lexical = normalize(raw, cwd, &self.layout.home);
         let mut f = Forms::default();
@@ -1625,12 +1846,22 @@ impl Guard<'_> {
     /// operating system would fail it too); one a shell word names, with no direction, may be
     /// read or written, so it is PROTECTED as everything it could be: unparsed text, a credential,
     /// the guard's configuration. Nothing changes for an agent that is not HELD (P1.2).
-    fn unresolved(&self, reads: bool, acc: &mut Acc) {
+    fn unresolved(&self, reads: bool, what: &str, acc: &mut Acc) {
         if !self.held {
             return;
         }
+        // H1.5, L1.1: a path left unsettled because the guard's time ran out is one Lunchroom could
+        // not check, which goes to the user (as a search cut short does); only a path that cannot be
+        // followed at all is DENIED.
+        if reads && self.fs.out_of_time() {
+            acc.raise(CallClass::Protected(ProtectedKind::Credential));
+            return;
+        }
         if reads {
-            self.denied_read(acc);
+            self.denied_read(
+                &format!("{what} (a path Lunchroom could not follow to the file it opens)"),
+                acc,
+            );
         } else {
             acc.raise(CallClass::Protected(ProtectedKind::Unparsed));
             acc.raise(CallClass::Protected(ProtectedKind::Credential));
@@ -1639,10 +1870,20 @@ impl Guard<'_> {
     }
 
     /// L1.1 for one path a HELD session reads.
-    fn read_facts(&self, p: &Path, acc: &mut Acc) {
+    ///
+    /// `named` is the path as the call wrote it: the part at fault a DENIED message shows is
+    /// always a path the agent itself named, never one the guard found (a link's target, a file in
+    /// a folder searched), which would tell a HELD agent where other sessions' files are.
+    fn read_facts(&self, p: &Path, named: &str, acc: &mut Acc) {
         let f = self.layout.facts(p);
+        // 1.1: another terminal's screen and keys, and another process's memory, environment and
+        // descriptors, are not read in any session.
+        if CONSOLE && f.terminal {
+            acc.deny(DenyReason::Configuration, named);
+        }
+        self.other_process(f.secret_pid, named, acc);
         if f.store || f.transcript {
-            self.denied_read(acc);
+            self.denied_read(named, acc);
         } else if f.credential {
             acc.raise(CallClass::Protected(ProtectedKind::Credential));
         }
@@ -1650,29 +1891,29 @@ impl Guard<'_> {
 
     /// A read of a path L1.1 denies is never inside the slip: DENIED while HELD; for an agent that
     /// is not HELD it is an ordinary call, which runs (L1.1 holds only while HELD).
-    fn denied_read(&self, acc: &mut Acc) {
-        acc.raise(if self.held {
-            CallClass::Denied(DenyReason::DeniedPath)
+    fn denied_read(&self, what: &str, acc: &mut Acc) {
+        if self.held {
+            acc.deny(DenyReason::DeniedPath, what);
         } else {
-            CallClass::Ordinary
-        });
+            acc.raise(CallClass::Ordinary);
+        }
     }
 
     fn read_path(&self, raw: &str, cwd: &Path, search: bool, acc: &mut Acc) {
         let forms = self.forms(raw, cwd);
         for f in &forms.paths {
-            self.read_facts(f, acc);
+            self.read_facts(f, raw, acc);
         }
         if search {
             for f in forms.paths.iter().filter(|f| self.fs.is_dir(f)) {
-                self.search_from(f, acc);
+                self.search_from(f, raw, acc);
             }
         }
         if let Some(prefix) = forms.capped {
-            self.search_from(&prefix, acc);
+            self.search_from(&prefix, raw, acc);
         }
         if forms.unresolved {
-            self.unresolved(true, acc);
+            self.unresolved(true, raw, acc);
         }
     }
 
@@ -1682,11 +1923,13 @@ impl Guard<'_> {
         let base = self.fs.resolve(&head);
         // The folder the pattern starts in, as written and as the operating system reaches it.
         let start = literal_prefix(&normalize(pattern, root, &self.layout.home));
-        self.search_from(&start, acc);
-        self.search_from(&base.path, acc);
+        // The pattern with the folder the call gave it, as the call wrote them together.
+        let named = joined.to_string_lossy();
+        self.search_from(&start, &named, acc);
+        self.search_from(&base.path, &named, acc);
         // A `..` after a wildcard leaves a folder not yet known.
         if !base.complete || tail.components().any(|c| c == Component::ParentDir) {
-            self.unresolved(true, acc);
+            self.unresolved(true, pattern, acc);
         }
     }
 
@@ -1695,10 +1938,15 @@ impl Guard<'_> {
     /// credential, so the search goes to the user. For an agent that is not HELD the walk is not
     /// made, because nothing it could find changes what happens to the call (P1.2); the search is
     /// then an ordinary call, not shown to be inside the slip.
-    fn search_from(&self, dir: &Path, acc: &mut Acc) {
-        self.read_facts(dir, acc);
+    ///
+    /// `named` is the folder as the call wrote it. A DENIED search names that folder and nothing
+    /// found below it: what the walk found is where other sessions' files are, which a HELD agent
+    /// must not learn from the message (L1.1).
+    fn search_from(&self, dir: &Path, named: &str, acc: &mut Acc) {
+        self.read_facts(dir, named, acc);
+        let fault = format!("a search of {named}");
         if self.layout.denied_below(dir) {
-            self.denied_read(acc);
+            self.denied_read(&fault, acc);
         }
         if self.layout.credential_root_below(dir) {
             acc.raise(CallClass::Protected(ProtectedKind::Credential));
@@ -1710,15 +1958,19 @@ impl Guard<'_> {
             acc.raise(CallClass::Ordinary);
             return;
         }
-        let (mut denied, mut credential) = (false, false);
+        let (mut denied, mut credential) = (None::<PathBuf>, false);
+        // H1.7: the step named if the guard's time runs out here.
+        let _step = crate::steps::begin(format!("searching the folder {named}"));
         let end = self.fs.walk(dir, &mut |p| {
             let f = self.layout.facts(p);
-            denied |= f.store || f.transcript;
+            if denied.is_none() && (f.store || f.transcript) {
+                denied = Some(p.to_path_buf());
+            }
             credential |= f.credential;
-            denied
+            denied.is_some()
         });
-        if denied {
-            self.denied_read(acc);
+        if denied.is_some() {
+            self.denied_read(&fault, acc);
         } else if credential || end == WalkEnd::Capped {
             acc.raise(CallClass::Protected(ProtectedKind::Credential));
         }
@@ -1728,29 +1980,42 @@ impl Guard<'_> {
     fn write_path(&self, raw: &str, cwd: &Path, acc: &mut Acc) {
         let forms = self.forms(raw, cwd);
         for f in &forms.paths {
-            self.path_rules(f, false, acc);
+            self.path_rules(f, raw, false, acc);
         }
         if let Some(prefix) = forms.capped {
-            self.capped_rules(&prefix, acc);
+            self.capped_rules(&prefix, raw, acc);
         }
         if forms.unresolved {
-            self.unresolved(false, acc);
+            self.unresolved(false, raw, acc);
         }
     }
 
     /// The rules for one path a call reads or writes (the shell's words have no direction): a
     /// store is DENIED in every session; while HELD, transcripts are DENIED and credentials, guard
     /// configuration and Lunchroom's program (other than running it) are PROTECTED.
-    fn path_rules(&self, p: &Path, runs_it: bool, acc: &mut Acc) {
+    ///
+    /// `named` is the path as the call wrote it, the part at fault a message shows (see
+    /// [`Guard::read_facts`]).
+    fn path_rules(&self, p: &Path, named: &str, runs_it: bool, acc: &mut Acc) {
         let f = self.layout.facts(p);
         if f.store {
-            acc.raise(CallClass::Denied(DenyReason::Configuration));
+            acc.deny(DenyReason::Configuration, named);
         }
+        // 1.1: a terminal device that is not the agent's own controlling terminal, in every
+        // session: another terminal's keys and screen are the user's (the console among them).
+        if CONSOLE && f.terminal {
+            acc.deny(DenyReason::Configuration, named);
+        }
+        // 1.1: the installed program is root's; it is named only to run it.
+        if p == Path::new(crate::setgid::PROGRAM) && !runs_it {
+            acc.deny(DenyReason::Configuration, named);
+        }
+        self.other_process(f.secret_pid, named, acc);
         if !self.held {
             return;
         }
         if f.transcript {
-            acc.raise(CallClass::Denied(DenyReason::DeniedPath));
+            acc.deny(DenyReason::DeniedPath, named);
         }
         if f.credential {
             acc.raise(CallClass::Protected(ProtectedKind::Credential));
@@ -1762,27 +2027,46 @@ impl Guard<'_> {
     }
 
     /// A wildcard cut short may match anything below its literal prefix.
-    fn capped_rules(&self, prefix: &Path, acc: &mut Acc) {
+    fn capped_rules(&self, prefix: &Path, named: &str, acc: &mut Acc) {
         if self.layout.lunchroom_home.starts_with(prefix) || self.layout.facts(prefix).store {
-            acc.raise(CallClass::Denied(DenyReason::Configuration));
+            acc.deny(
+                DenyReason::Configuration,
+                &format!("the wildcard {named}, which may match anything in Lunchroom's folder"),
+            );
         }
         if self.held {
-            self.search_from(prefix, acc);
+            self.search_from(prefix, named, acc);
+        }
+    }
+
+    /// The path rules for one string, by its text alone: nothing is looked up in the file system.
+    /// A string past [`MAX_RESOLVED`] gets this, so a store or transcript path written out in
+    /// full is still found, and a HELD call is PROTECTED as unparsed for the rest (links and
+    /// wildcards in it were not looked at), unless it is a reply.
+    fn lexical_rules(&self, c: &str, cwd: &Path, acc: &mut Acc) {
+        self.path_rules(&normalize(c, cwd, &self.layout.home), c, false, acc);
+        if !acc.reply {
+            self.when_held(acc, CallClass::Protected(ProtectedKind::Unparsed));
         }
     }
 
     fn word_paths(&self, text: &str, cwd: &Path, runs_it: bool, acc: &mut Acc) {
         for c in candidates(text) {
+            if acc.resolved >= MAX_RESOLVED {
+                self.lexical_rules(c, cwd, acc);
+                continue;
+            }
+            acc.resolved += 1;
             let forms = self.forms(c, cwd);
             for f in &forms.paths {
-                self.path_rules(f, runs_it && c == text, acc);
+                self.path_rules(f, c, runs_it && c == text, acc);
             }
             if let Some(prefix) = forms.capped {
-                self.capped_rules(&prefix, acc);
+                self.capped_rules(&prefix, c, acc);
             }
             // A long reply's text is too long for the system to take as a path at all.
             if forms.unresolved && !(acc.reply && unspellable(c)) {
-                self.unresolved(false, acc);
+                self.unresolved(false, c, acc);
             }
         }
     }
@@ -1796,8 +2080,13 @@ impl Guard<'_> {
     fn unparsed(&self, text: &str, cwd: &Path, acc: &mut Acc) {
         let home = self.home();
         let text = text.replace("${HOME}", &home).replace("$HOME", &home);
+        // Field, 2026-11-02: quoted text is one word, never a place a command starts. A split that
+        // ignored the quotes made `grep "fn bash(&self" x.rs` a program `self" x.rs`, missing, and
+        // DENIED in every session. The text inside quotes is masked before the split.
+        // Only where the text splits is read from the masked copy; every piece is the original text,
+        // so a quoted channel word or identity variable is still seen by the rules below.
         let head = without_heredoc_bodies(&text).replace("$(", "\n");
-        let raw: Vec<&str> = head.split([';', '&', '|', '\n', '`']).collect();
+        let raw: Vec<&str> = split_unquoted(&head);
         let pieces: Vec<Vec<&str>> = raw.iter().map(|p| tokens(p)).collect();
         let at: Vec<Vec<usize>> = pieces.iter().map(|t| program_positions(t)).collect();
         let fed = pieces
@@ -1816,7 +2105,20 @@ impl Guard<'_> {
             || toks.iter().any(|t| *t == "sessions_send" || is_identity(t))
             || names_chat_api(live)
         {
-            acc.raise(CallClass::Denied(DenyReason::Unparsed));
+            // The word at fault where one is a channel's own word or an identity variable; else
+            // the text that names the channel.
+            let word = toks
+                .iter()
+                .find(|t| **t == "sessions_send" || is_identity(t) || names_chat_api(t))
+                .copied();
+            acc.deny(DenyReason::Unparsed, word.unwrap_or(live));
+        }
+        // 1.1: the console's wall holds for text the guard cannot read in full, at each piece's
+        // programs.
+        for (t, ps) in pieces.iter().zip(&at).filter(|_| CONSOLE) {
+            for p in runnable_positions(t, ps) {
+                self.console_wall(t, p, &text, acc);
+            }
         }
         for t in toks {
             self.word_paths(t, cwd, false, acc);
@@ -1829,7 +2131,10 @@ impl Guard<'_> {
                 && let Some(w) = program_word(piece).filter(|w| w.contains('/'))
                 && !self.fs.exists(&self.physical(w, cwd))
             {
-                acc.raise(CallClass::Denied(DenyReason::Unparsed));
+                acc.deny(
+                    DenyReason::Unparsed,
+                    &format!("{w} (a program that does not exist)"),
+                );
             }
             built |= builds(t);
         }
@@ -1846,11 +2151,13 @@ impl Guard<'_> {
         // of an identity variable counts as a change; text it cannot parse shows `unparsed`
         // (F1.2).
         if depth > 0 && mentions_identity(text) {
-            acc.raise(CallClass::Denied(if parsed == Parsed::Unparsed {
+            let reason = if parsed == Parsed::Unparsed {
                 DenyReason::Unparsed
             } else {
                 DenyReason::Fence
-            }));
+            };
+            let word = tokens(text).into_iter().find(|t| is_identity(t));
+            acc.deny(reason, word.unwrap_or(text));
         }
         match parsed {
             Parsed::Unparsed => self.unparsed(text, cwd, acc),
@@ -1882,7 +2189,7 @@ impl Guard<'_> {
             Self::program_rules(words, &texts, p, positions.contains(&p), acc);
             // A word an unknown wrapper is given may be a setting it applies or a URL it calls.
             if !positions.contains(&p) && (is_identity(texts[p]) || names_chat_api(texts[p])) {
-                acc.raise(CallClass::Denied(DenyReason::Fence));
+                acc.deny(DenyReason::Fence, texts[p]);
             }
             // A word an unknown wrapper may run is judged as code, its value too when it is
             // attached to a one-letter option (`-x 'codex queue …'`).
@@ -1892,18 +2199,22 @@ impl Guard<'_> {
                     .filter(|r| !r.starts_with('-'))
                     .and_then(|r| r.get(1..));
                 if let Some(r) = code_rules(texts[p]).or_else(|| attached.and_then(code_rules)) {
-                    acc.raise(CallClass::Denied(r));
+                    acc.deny(r, texts[p]);
                 }
             }
+        }
+        // 1.1: the console's wall, after the rules above, so a reason they gave stays the one shown.
+        for &p in runnable.iter().filter(|_| CONSOLE) {
+            self.console_wall(&texts, p, full, acc);
         }
         // Settings before the program: `CODEX_THREAD_ID=x cmd`, `GIT_SSH_COMMAND=... git`.
         let first = positions.first().copied().unwrap_or(texts.len());
         for a in &texts[..first] {
             if is_identity(a) {
-                acc.raise(CallClass::Denied(DenyReason::Fence));
+                acc.deny(DenyReason::Fence, a);
             }
             if let Some(r) = a.split_once('=').and_then(|(_, v)| code_rules(v)) {
-                acc.raise(CallClass::Denied(r));
+                acc.deny(r, a);
             }
         }
         for &i in &runnable {
@@ -1918,7 +2229,14 @@ impl Guard<'_> {
                 .as_deref()
                 .is_some_and(|s| FENCE_PROGRAMS.contains(&s) && fence_args(s, &texts[p + 1..]))
             {
-                acc.raise(CallClass::Denied(DenyReason::Fence));
+                acc.deny(
+                    DenyReason::Fence,
+                    &format!(
+                        "{} (a link to {})",
+                        texts[p..].join(" "),
+                        stem.as_deref().unwrap_or_default()
+                    ),
+                );
             }
             acc.new_session |= stem.as_deref().is_some_and(|s| {
                 FENCE_PROGRAMS.contains(&s)
@@ -1938,7 +2256,10 @@ impl Guard<'_> {
         for &p in &positions {
             if !*built && texts[p].contains('/') && !self.fs.exists(&self.physical(texts[p], here))
             {
-                acc.raise(CallClass::Denied(DenyReason::Unparsed));
+                acc.deny(
+                    DenyReason::Unparsed,
+                    &format!("{} (a program that does not exist)", texts[p]),
+                );
             }
         }
         *built |= builds(&texts);
@@ -1983,7 +2304,9 @@ impl Guard<'_> {
     fn program_rules(words: &[Word], texts: &[&str], p: usize, known: bool, acc: &mut Acc) {
         let args = &texts[p + 1..];
         let name = basename(texts[p]);
-        let deny = |acc: &mut Acc, r| acc.raise(CallClass::Denied(r));
+        // V1.4: the program and its arguments, as the guard read this command.
+        let what = texts[p..].join(" ");
+        let deny = |acc: &mut Acc, r| acc.deny(r, &what);
         if prog_names(&words[p]).iter().any(|n| fence_args(n, args)) {
             deny(acc, DenyReason::Fence);
         }
@@ -2166,7 +2489,7 @@ impl Guard<'_> {
                         // program runs it (K1.8): then those files are searched like a script.
                         let data = !self.script_runs_data(n, rest, here);
                         for (k, a) in rest.iter().enumerate() {
-                            self.code_text(a, acc);
+                            self.code_text(a, a, acc);
                             let file = if data {
                                 script_option_file(n, rest, k)
                             } else {
@@ -2175,7 +2498,7 @@ impl Guard<'_> {
                             if let Some(f) = file
                                 && let Script::Text(t) = self.fs.script(&self.physical(f, here))
                             {
-                                self.code_text(&t, acc);
+                                self.code_text(&t, &format!("the script {f}"), acc);
                             }
                         }
                     } else {
@@ -2186,7 +2509,7 @@ impl Guard<'_> {
                             .and_then(|s| rest.iter().position(|a| *a == s))
                             .map_or(rest.len(), |k| k + 1);
                         for a in &rest[..end] {
-                            self.code_text(a, acc);
+                            self.code_text(a, a, acc);
                         }
                     }
                     // The script it runs, also when attached to its option (`awk -fprog.awk`).
@@ -2195,9 +2518,12 @@ impl Guard<'_> {
                     // resolves names its own way (`node app` loads `app.js`).
                     if let Some(s) = interpreter_script(n, rest) {
                         match self.fs.script(&self.physical(s, here)) {
-                            Script::Text(t) => self.code_text(&t, acc),
+                            Script::Text(t) => self.code_text(&t, &format!("the script {s}"), acc),
                             Script::TooLarge => {
-                                acc.raise(CallClass::Denied(DenyReason::Unparsed));
+                                acc.deny(
+                                    DenyReason::Unparsed,
+                                    &format!("{s} (a script too large for Lunchroom to read)"),
+                                );
                             }
                             Script::Unreadable => {}
                         }
@@ -2284,22 +2610,30 @@ impl Guard<'_> {
             script = self.fs.script(&p);
         }
         match script {
-            Script::Text(t) => self.shell_script(&t, here, depth, acc),
+            Script::Text(t) => self.shell_script(&t, &format!("the script {f}"), here, depth, acc),
             Script::TooLarge | Script::Unreadable => {
-                acc.raise(CallClass::Denied(DenyReason::Unparsed));
+                acc.deny(
+                    DenyReason::Unparsed,
+                    &format!("{f} (a script Lunchroom cannot find, read or search in full)"),
+                );
             }
         }
     }
 
-    /// A shell script's text: one the reader can read is classified as an agent that is not HELD
-    /// would be, keeping only a DENIED result; one it cannot is judged as code ([`code_rules`]).
-    fn shell_script(&self, text: &str, here: &Path, depth: usize, acc: &mut Acc) {
+    /// A shell script's text, `source` naming it (`the script ./x.sh`): one the reader can read is
+    /// classified as an agent that is not HELD would be, keeping only a DENIED result; one it
+    /// cannot is judged as code ([`code_rules`]).
+    fn shell_script(&self, text: &str, source: &str, here: &Path, depth: usize, acc: &mut Acc) {
         // I1.2: any mention of an identity variable in a script counts, parsed or not.
         if mentions_identity(text) {
-            acc.raise(CallClass::Denied(DenyReason::Fence));
+            let word = tokens(text).into_iter().find(|t| is_identity(t));
+            acc.deny(
+                DenyReason::Fence,
+                &format!("{} in {source}", word.unwrap_or("an identity variable")),
+            );
         }
         if shell::parse(text, &self.home()) == Parsed::Unparsed {
-            self.code_text(text, acc);
+            self.code_text(text, source, acc);
             return;
         }
         let g = Guard {
@@ -2309,20 +2643,165 @@ impl Guard<'_> {
         let mut sub = Acc::new(CallClass::Ordinary);
         g.shell_text(text, here, depth + 1, &mut sub);
         if sub.denied() {
-            acc.raise(sub.class);
+            sub.fault = Some(match sub.fault.take() {
+                Some(f) => format!("{f}, in {source}"),
+                None => source.to_owned(),
+            });
+            acc.deny_from(&sub);
         }
         acc.new_session |= sub.new_session;
     }
 
-    /// Script or code text that is not a shell command (K1.8).
-    /// Every rule of [`code_rules`], identity changes included.
-    fn code_text(&self, text: &str, acc: &mut Acc) {
+    /// Script or code text that is not a shell command (K1.8), `what` naming it for a denial
+    /// (V1.4). Every rule of [`code_rules`], identity changes included.
+    fn code_text(&self, text: &str, what: &str, acc: &mut Acc) {
         let home = self.home();
         let text = text.replace("${HOME}", &home).replace("$HOME", &home);
         if let Some(r) = code_rules(&text) {
-            acc.raise(CallClass::Denied(r));
+            acc.deny(r, what);
+        }
+        // 1.1: code that names `ptrace` (python's ctypes, perl's `syscall`) attaches to a process.
+        if CONSOLE && text.to_ascii_lowercase().contains("ptrace") {
+            acc.deny(DenyReason::Configuration, what);
         }
         acc.new_session |= code_starts_session(&text);
+    }
+
+    /// The memory, environment, descriptors and maps of a process outside the agent's own subtree
+    /// (`secret_pid`, from the path's facts). With the console's rules on (1.1) they are DENIED in
+    /// every session. In 1.0.2 they are a credential read (the lesson of the 2026 Hugging Face
+    /// incident, where agents dumped other processes' environments for tokens): PROTECTED while
+    /// HELD, nothing added otherwise.
+    fn other_process(&self, secret_pid: Option<u32>, named: &str, acc: &mut Acc) {
+        if secret_pid.is_none_or(|pid| self.own_process(pid)) {
+            return;
+        }
+        if CONSOLE {
+            acc.deny(DenyReason::DeniedPath, named);
+        } else {
+            self.when_held(acc, CallClass::Protected(ProtectedKind::Credential));
+        }
+    }
+
+    /// The process `pid` is in the agent's own subtree: the harness process its commands run
+    /// under, or a descendant. The console and every other user's process are not.
+    fn own_process(&self, pid: u32) -> bool {
+        // The guard itself is what `/proc/self` resolves to, and it runs in the agent's subtree.
+        self.layout.console_pid != Some(pid)
+            && (pid == std::process::id()
+                || self
+                    .layout
+                    .agent_root
+                    .is_some_and(|root| self.fs.descends_from(pid, root)))
+    }
+
+    /// 1.1, the console's wall: the rules the kernel leaves open. `p` is the position of a program
+    /// word, `full` the whole text of the command.
+    fn console_wall(&self, texts: &[&str], p: usize, full: &str, acc: &mut Acc) {
+        let name = basename(texts[p]);
+        let args = &texts[p + 1..];
+        let what = texts[p..].join(" ");
+        // Rule 3: a debugger or tracer.
+        if DEBUGGERS.contains(&name) {
+            acc.deny(DenyReason::Configuration, &what);
+        }
+        // Rule 2: signalling the console, or anything called lunchroom.
+        if KILLERS.contains(&name) {
+            let pid = self.layout.console_pid.map(|p| p.to_string());
+            let names_pid = pid.as_deref().is_some_and(|pid| {
+                args.iter()
+                    .any(|a| *a == pid || a.strip_prefix('-').is_some_and(|r| r == pid))
+            });
+            if names_pid || names_word(full, "lunchroom") {
+                acc.deny(DenyReason::Configuration, &what);
+            }
+        }
+        // Rule 5: becoming the user or the group `lunchroom`.
+        if becomes_lunchroom(name, args) {
+            acc.deny(DenyReason::Configuration, &what);
+        }
+        // Rule 4: another terminal's keys and screen through tmux or screen.
+        match name {
+            "tmux" => self.tmux_keys(args, &what, acc),
+            "screen" => self.screen_keys(args, &what, acc),
+            _ => {}
+        }
+    }
+
+    /// Rule 4 for tmux: `send-keys`, `capture-pane` and `pipe-pane` type into or read a pane. The
+    /// agent's own pane (`TMUX_PANE`, named by `-t` or by none) is PROTECTED while HELD; any other
+    /// target, or another tmux server (`-L`, `-S`), is DENIED.
+    fn tmux_keys(&self, args: &[&str], what: &str, acc: &mut Acc) {
+        let mut other_server = false;
+        let mut k = 0;
+        // Global options before the subcommand; `-L`, `-S`, `-f`, `-c`, `-T` take a value.
+        while let Some(a) = args.get(k).filter(|a| a.starts_with('-')) {
+            if matches!(*a, "-L" | "-S") || a.starts_with("-L") || a.starts_with("-S") {
+                other_server = true;
+            }
+            k += if matches!(*a, "-L" | "-S" | "-f" | "-c" | "-T") {
+                2
+            } else {
+                1
+            };
+        }
+        let Some(sub) = args.get(k) else { return };
+        if !matches!(
+            *sub,
+            "send-keys" | "send" | "capture-pane" | "capturep" | "pipe-pane" | "pipep"
+        ) {
+            return;
+        }
+        let rest = &args[k + 1..];
+        let target = rest.iter().enumerate().find_map(|(i, a)| {
+            if *a == "-t" {
+                rest.get(i + 1).copied()
+            } else {
+                a.strip_prefix("-t").filter(|t| !t.is_empty())
+            }
+        });
+        let own = !other_server
+            && match target {
+                None => true,
+                Some(t) => self.layout.own_pane.as_deref() == Some(t),
+            };
+        if own {
+            self.when_held(acc, CallClass::Protected(ProtectedKind::OtherSession));
+        } else {
+            acc.deny(DenyReason::Configuration, what);
+        }
+    }
+
+    /// Rule 4 for screen: `-X stuff` types into a session and `-X hardcopy` reads one. The
+    /// agent's own session (`STY`, named by `-S` or by none) is PROTECTED while HELD; any other is
+    /// DENIED.
+    fn screen_keys(&self, args: &[&str], what: &str, acc: &mut Acc) {
+        let Some(x) = args.iter().position(|a| *a == "-X") else {
+            return;
+        };
+        // The command follows -X; options may come after it too (`screen -X -S name stuff x`).
+        let after = &args[x + 1..];
+        if !after.iter().any(|a| matches!(*a, "stuff" | "hardcopy")) {
+            return;
+        }
+        let target = args.iter().enumerate().find_map(|(i, a)| {
+            if matches!(*a, "-S" | "-r" | "-x") {
+                args.get(i + 1).copied()
+            } else {
+                a.strip_prefix("-S").filter(|t| !t.is_empty())
+            }
+        });
+        let own = target.is_none_or(|t| {
+            self.layout
+                .own_screen
+                .as_deref()
+                .is_some_and(|sty| sty == t || sty.split('.').nth(1) == Some(t))
+        });
+        if own {
+            self.when_held(acc, CallClass::Protected(ProtectedKind::OtherSession));
+        } else {
+            acc.deny(DenyReason::Configuration, what);
+        }
     }
 
     /// The real path of the program a word runs: by its path, or found through `PATH`.
@@ -2346,13 +2825,20 @@ impl Guard<'_> {
             Script::Text(t) => t,
             // F1.2: a script it cannot read or search in full.
             Script::TooLarge | Script::Unreadable => {
-                acc.raise(CallClass::Denied(DenyReason::Unparsed));
+                acc.deny(
+                    DenyReason::Unparsed,
+                    &format!(
+                        "{} (a script Lunchroom cannot read or search in full)",
+                        path.display()
+                    ),
+                );
                 return;
             }
         };
+        let source = format!("the script {}", path.display());
         // No `#!` line: the shell that started it runs it as a script of its own.
         if !t.starts_with("#!") {
-            self.shell_script(&t, here, depth, acc);
+            self.shell_script(&t, &source, here, depth, acc);
             return;
         }
         {
@@ -2363,9 +2849,9 @@ impl Guard<'_> {
                 name = interp.find(|a| !a.starts_with('-') && !is_assignment(a));
             }
             if name.is_some_and(|n| SHELLS.contains(&n)) {
-                self.shell_script(&t, here, depth, acc);
+                self.shell_script(&t, &source, here, depth, acc);
             } else {
-                self.code_text(&t, acc);
+                self.code_text(&t, &source, acc);
             }
         }
     }
@@ -2399,7 +2885,7 @@ impl Guard<'_> {
     /// A1.3: an agent runs only Lunchroom's open commands.
     fn lunchroom_at(&self, texts: &[&str], p: usize, here: &Path, acc: &mut Acc) {
         if self.is_lunchroom(texts[p], here) && !lunchroom_args_open(&texts[p + 1..]) {
-            acc.raise(CallClass::Denied(DenyReason::Configuration));
+            acc.deny(DenyReason::Configuration, &texts[p..].join(" "));
         }
     }
 
@@ -2430,7 +2916,13 @@ impl Guard<'_> {
                     .capped
                     .is_some_and(|c| self.layout.lunchroom_home.starts_with(c))
             {
-                acc.raise(CallClass::Denied(DenyReason::Configuration));
+                acc.deny(
+                    DenyReason::Configuration,
+                    &format!(
+                        "{} {a} (it changes everything in {a}, Lunchroom's folder among it)",
+                        texts[p]
+                    ),
+                );
             }
         }
     }
@@ -2463,10 +2955,17 @@ impl Guard<'_> {
                 .filter(|a| !a.starts_with('-'))
                 .collect()
         };
-        let mut roots: Vec<PathBuf> = Vec::new();
+        // Each folder with the operand that named it (the part at fault a message shows).
+        let mut roots: Vec<(PathBuf, String)> = Vec::new();
         for a in &operands {
             let forms = self.forms(a, here);
-            roots.extend(forms.paths.into_iter().filter(|f| self.fs.is_dir(f)));
+            roots.extend(
+                forms
+                    .paths
+                    .into_iter()
+                    .filter(|f| self.fs.is_dir(f))
+                    .map(|f| (f, (*a).to_owned())),
+            );
         }
         // `grep -r`, `du` and `ls -R` given only files read only those files; a word the shell
         // expands into the working folder (`*`, `$X`) may name its folders, so it still counts as
@@ -2482,13 +2981,20 @@ impl Guard<'_> {
             !roots.is_empty()
         };
         if !given && searcher {
-            roots.push(here.to_path_buf());
+            roots.push((here.to_path_buf(), here.to_string_lossy().into_owned()));
         }
-        for r in roots {
-            self.search_from(&r, acc);
+        for (r, named) in roots {
+            self.search_from(&r, &named, acc);
         }
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "console"))]
+mod console_tests;
+
+/// The console's guard rules (1.1) are on: built with the feature `console`. Without it (1.0.2) no
+/// console exists, and these rules would only block an agent's ordinary work in every session.
+const CONSOLE: bool = cfg!(feature = "console");

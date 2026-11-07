@@ -41,6 +41,7 @@ case "$STUB_MODE" in
   exit1) exit 1 ;;
   slow) sleep 1 ;;
   garbage) printf 'not json' ;;
+  event) printf '%s' '{"systemMessage":"Lunchroom: bob is UNGUARDED.","hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"Lunchroom: agent text"}}' ;;
 esac
 exit 0
 `,
@@ -107,12 +108,20 @@ test("a call for the user is DENIED in a run where nobody can answer (A1.2)", as
 test("a guard that cannot answer sends the call to the user, or DENIES it where nobody can answer (H1.5)", async () => {
   mode("signal");
   const out = await beforeToolCall(exec, ctx, STUB);
-  assert.match(out.requireApproval.description, /^Lunchroom: could not check this call/);
-  assert.match(out.requireApproval.description, /Any script this call runs was not read\./);
+  assert.ok(
+    out.requireApproval.description.startsWith(
+      "Lunchroom could not check this call: stopped by SIGTERM. It needs your yes: answer this prompt " +
+        "(yes runs the call once, no stops it). Lunchroom did not read any script this call runs.",
+    ),
+    out.requireApproval.description,
+  );
   assert.match((await beforeToolCall(exec, { runId: "r1" }, STUB)).requireApproval.description, /which session/);
   const none = await beforeToolCall(exec, { ...ctx, runId: "unseen" }, STUB);
-  assert.equal(none.block, true);
-  assert.match(none.blockReason, /^Lunchroom: could not check this call/);
+  assert.deepEqual(none, {
+    block: true,
+    blockReason:
+      "Lunchroom could not check this call: stopped by SIGTERM. Nobody can be asked in this session, so this call is DENIED.",
+  });
   assert.equal((await beforeToolCall(exec, {}, STUB)).block, true);
 });
 
@@ -181,7 +190,7 @@ test("an unjudged or sessionless call still asks the healthy guard, and is never
     assert.equal((await beforeToolCall(exec, c, STUB)).requireApproval.description, "Lunchroom: s1 is HELD.");
     // The guard lets it run, yet what the plugin knows holds: the user decides.
     mode("allow");
-    assert.match((await beforeToolCall(exec, c, STUB)).requireApproval.description, /^Lunchroom: could not/);
+    assert.match((await beforeToolCall(exec, c, STUB)).requireApproval.description, /^Lunchroom could not/);
   }
   const absent = join(dir, "absent");
   for (const command of ["lunchroom approve", "LUNCHROOM mode relaxed", "'lunch''room' yolo on", "l\\unchroom approve",
@@ -205,7 +214,8 @@ test("an approval request for a call the guard could not judge shows the call in
   for (const [c, program] of [[ctx, join(dir, "absent")], [{ runId: "r1" }, STUB]]) {
     mode("allow");
     const d = (await beforeToolCall(call, c, program)).requireApproval.description;
-    assert.ok(d.startsWith("Lunchroom: "), d.slice(0, 40));
+    assert.ok(d.startsWith("Lunchroom could not "), d.slice(0, 40));
+    assert.ok(d.includes("It needs your yes: answer this prompt (yes runs the call once, no stops it)."));
     assert.ok(d.includes(command));
     assert.ok(d.includes('"workdir": "/d"'));
     assert.ok(d.includes("exec"));
@@ -295,6 +305,54 @@ test("at a turn's end the next waiting message is asked for (D1.1)", async () =>
   assert.equal(sent().session_id, "agent:main:a");
 });
 
+// G4-2. OpenClaw (tag v2026.10.7) reads a `before_agent_run` answer only when it is a block
+// (src/agents/harness/before-agent-run.ts:34-36), a block's `message` is what the user is shown
+// (src/plugins/hook-decision-types.ts:13-30), and `agent_end` has no result
+// (src/plugins/hook-types.ts:830-833, :865). So the guard is told it can show the user and the agent
+// nothing in these hooks, and nothing it says is turned into text that is then lost.
+test("the guard is told the prompt hook and the turn's end show no text, and text it gives is not forwarded (G4-2)", async () => {
+  mode("event");
+  const owner = { senderIsOwner: true };
+  // A guard answer with notices for the user and the agent: the prompt goes on, as is.
+  assert.deepEqual(await beforeAgentRun({ prompt: "hi", ...owner }, ctx, STUB), { outcome: "pass" });
+  assert.deepEqual(args(), ["guard", "prompt"]);
+  assert.equal(sent().can_show_user, false);
+  assert.equal(sent().can_tell_agent, false);
+  assert.equal(await agentEnd({}, ctx, STUB), undefined);
+  assert.deepEqual(args(), ["listen", "--once"]);
+  assert.equal(sent().can_show_user, false);
+  assert.equal(sent().can_tell_agent, false);
+  // The other hooks do not carry the flags: they are the prompt hook's and the listener's.
+  await beforeToolCall(exec, ctx, STUB);
+  assert.equal("can_show_user" in sent(), false);
+});
+
+test("a prompt the guard blocks shows the user why: the text is the block's message, not only its internal reason (G4-2)", async () => {
+  mode("deny");
+  assert.deepEqual(await beforeAgentRun({ prompt: "x" }, ctx, STUB), {
+    outcome: "block",
+    reason: "Lunchroom: DENIED · fence",
+    message: "Lunchroom: DENIED · fence",
+  });
+  // A guard that gave no text still gives a reason OpenClaw accepts (it refuses an empty one).
+  mode("signal");
+  const out = await beforeAgentRun({ prompt: "[lr:lr-1]> do it", senderIsOwner: true }, ctx, STUB);
+  assert.equal(out.outcome, "block");
+  assert.equal(out.reason, out.message);
+  assert.equal(
+    out.message,
+    "Lunchroom could not check this prompt: stopped by SIGTERM. It carries another agent's text or did not come " +
+      "from you, so Lunchroom blocked it. Send it again once `lunchroom doctor` shows Lunchroom works.",
+  );
+  const hooks = {};
+  plugin.register({ on: (name, fn) => { hooks[name] = fn; } });
+  const thrown = await hooks.before_agent_run({ get prompt() { throw new Error("boom"); }, senderIsOwner: false }, ctx);
+  assert.equal(thrown.outcome, "block");
+  assert.equal(thrown.reason, thrown.message);
+  assert.match(thrown.message, /^Lunchroom could not check this prompt: boom\. /);
+  mode("allow");
+});
+
 test("OpenClaw's version is read from its package above the entry script (H1.2)", async () => {
   const pkg = join(dir, "oc", "node_modules", "openclaw");
   mkdirSync(join(pkg, "dist"), { recursive: true });
@@ -335,20 +393,22 @@ test("the plugin entry registers every hook, with id lunchroom and an empty conf
 });
 
 test("the guard runs without blocking the gateway, and an unreadable answer or input never lets a call run (H1.5)", async () => {
+  // A session of its own: an earlier test's failed prompt hook leaves `agent:main:a` unjudged (H1.5).
+  const c = { ...ctx, sessionKey: "agent:main:g" };
   surfaces.set("r1", true);
   mode("slow");
   let ticked = false;
   setTimeout(() => { ticked = true; }, 50);
-  assert.equal(await beforeToolCall(exec, ctx, STUB), undefined);
+  assert.equal(await beforeToolCall(exec, c, STUB), undefined);
   assert.equal(ticked, true);
   mode("garbage");
-  assert.match((await beforeToolCall(exec, ctx, STUB)).requireApproval.description, /could not be read/);
+  assert.match((await beforeToolCall(exec, c, STUB)).requireApproval.description, /could not be read/);
   mode("allow");
   const loop = { command: "ls" };
   loop.self = loop;
-  const out = await beforeToolCall({ toolName: "exec", params: loop }, ctx, STUB);
+  const out = await beforeToolCall({ toolName: "exec", params: loop }, c, STUB);
   assert.equal(out.block, true);
-  assert.match(out.blockReason, /DENIED.*unreadable input/);
+  assert.match(out.blockReason, /^Lunchroom could not check this call: unreadable input: [\s\S]*This call is DENIED/);
 });
 
 // Spec §7 A2.1: "An approval covers one tool call: the session id, the tool name and its exact input".
@@ -445,7 +505,7 @@ test("a hook that throws fails closed after recording the session as unjudged (H
   // before_tool_call: blocked, session recorded.
   const out = await hooks.before_tool_call({ get toolName() { return boom(); }, params: {} }, c);
   assert.equal(out.block, true);
-  assert.match(out.blockReason, /^Lunchroom: DENIED/);
+  assert.equal(out.blockReason, "Lunchroom could not check this call: boom. This call is DENIED.");
   assert.ok(unjudged.has("agent:main:t"));
   unjudged.delete("agent:main:t");
   // after_tool_call: nothing returned, session recorded.

@@ -1,0 +1,214 @@
+
+######## apt
+MEASURED free space on /: 11885 MB
+== building lunchroom-realworld-packages-apt from Containerfile.apt
+MEASURED image lunchroom-realworld-packages-apt: 416 MB
+
+== facts of this system (apt)
+os: Ubuntu 24.04.5 LTS
+kernel: 6.8.0-147-generic
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+
+== 1. Claude Code from Anthropic's apt repository
+PASS /usr/bin/claude exists and is executable
+MEASURED dpkg says /usr/bin/claude is owned by 'claude-code', release '2.1.311-1'
+MEASURED the program itself says: 2.1.311 (Claude Code)
+PASS dpkg: the package claude-code owns /usr/bin/claude
+PASS dpkg records a release of claude-code: 2.1.311-1
+PASS the repository file names downloads.claude.ai/claude-code/apt/stable
+
+== 2. Lunchroom 1.0.2 installed for a user, and a real session
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code put the program and the hooks on dev's account
+PASS the passphrase check is set
+MEASURED the session is pid 83; /proc/83/exe -> /usr/bin/claude
+PASS the session process runs the installed /usr/bin/claude (its /proc exe is that path, not marked deleted)
+PASS the process name is claude
+
+== 3. what 'lunchroom status' says
+    1 agent: 1 AVAILABLE
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    standin	claude-code:f86163c7-dac8-47f5-8b5d-2696c9e92c53	AVAILABLE	QUEUED 0
+PASS status lists the session 'standin'
+PASS the session is AVAILABLE (guarded)
+PASS status does not say UNGUARDED
+PASS status gives no 'release cannot be read' reason
+
+== 4. what 'lunchroom doctor' says
+    PASS Lunchroom's program is installed at /home/dev/.lunchroom/bin/lunchroom
+    FAIL no program named lunchroom is on your PATH: put /home/dev/.local/bin on your PATH and run lunchroom install again in a terminal of your own, which links /home/dev/.lunchroom/bin/lunchroom there
+    PASS the passphrase check is in place (/etc/lunchroom/1001.verifier)
+    PASS Claude Code: Lunchroom is installed and its configuration runs the whole guard
+    PASS Claude Code: release 2.1.311-1, read from /usr/bin/claude. This is the release Lunchroom was tested with, or a later one.
+    PASS the guard decided every call in the last 24 hours
+    PASS agent standin (Claude Code) is AVAILABLE: its guard is running and no other agent's text is in its session
+PASS doctor: release 2.1.311-1 (the dpkg record's version), read from /usr/bin/claude
+PASS doctor has no FAIL line for Claude Code
+PASS doctor does not say UNGUARDED
+PASS '2.1.311-1' carries a packaging suffix the program never prints: doctor read it from dpkg
+
+== 5. control: the same program bytes, not owned by any package
+PASS dpkg: /opt/notpkg/claude is owned by no package
+PASS /opt/notpkg/claude is byte for byte the installed program
+PASS the control session runs /opt/notpkg/claude
+    2 agents: 1 AVAILABLE, 1 UNGUARDED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    copy	claude-code:b9dcef60-4ca6-4bd4-a9ad-c41d3bc57b19	UNGUARDED	QUEUED 0
+      why: Claude Code's release cannot be read from the install of its program (/opt/notpkg/claude): Lunchroom reads it from the native installer's …/claude/versions/<release>, Homebrew's …/Caskroom/claude-code/<release>, the npm package @anthropic-ai/claude-code (or its platform package) above the program, or the system package named claude-code that installed the program (dpkg, apk or rpm records). To fix it, install Claude Code one of those ways, then start the session anew.
+    standin	claude-code:f86163c7-dac8-47f5-8b5d-2696c9e92c53	AVAILABLE	QUEUED 0
+PASS the copy outside the package database is UNGUARDED
+PASS its reason is 'release cannot be read ... (/opt/notpkg/claude)': it is the package record that makes the first session guarded
+PASS the packaged session is still AVAILABLE beside it
+
+== result
+RESULT: 22 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-packages-apt removed
+
+######## dnf
+MEASURED free space on /: 11885 MB
+== building lunchroom-realworld-packages-dnf from Containerfile.dnf
+MEASURED image lunchroom-realworld-packages-dnf: 539 MB
+
+== facts of this system (dnf)
+os: Fedora Linux 44 (Container Image)
+kernel: 6.8.0-147-generic
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+
+== 1. Claude Code from Anthropic's dnf repository
+PASS /usr/bin/claude exists and is executable
+MEASURED rpm says /usr/bin/claude is owned by 'claude-code', release '2.1.311'
+MEASURED the program itself says: 2.1.311 (Claude Code)
+PASS rpm: the package claude-code owns /usr/bin/claude
+PASS rpm records a release of claude-code: 2.1.311
+PASS the repository file names downloads.claude.ai/claude-code/rpm/stable
+
+== 2. Lunchroom 1.0.2 installed for a user, and a real session
+MEASURED dev's password: dev P; hash scheme $y$
+MEASURED sudo rule for dev: NOPASSWD (sudo's password check fails in this container)
+PASS lunchroom install claude-code put the program and the hooks on dev's account
+PASS the passphrase check is set
+MEASURED the session is pid 73; /proc/73/exe -> /usr/bin/claude
+PASS the session process runs the installed /usr/bin/claude (its /proc exe is that path, not marked deleted)
+PASS the process name is claude
+
+== 3. what 'lunchroom status' says
+    1 agent: 1 AVAILABLE
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    standin	claude-code:efd9fa7b-1590-4f86-83d9-89c3ef6bc89d	AVAILABLE	QUEUED 0
+PASS status lists the session 'standin'
+PASS the session is AVAILABLE (guarded)
+PASS status does not say UNGUARDED
+PASS status gives no 'release cannot be read' reason
+
+== 4. what 'lunchroom doctor' says
+    PASS Lunchroom's program is installed at /home/dev/.lunchroom/bin/lunchroom
+    FAIL no program named lunchroom is on your PATH: put /home/dev/.local/bin on your PATH and run lunchroom install again in a terminal of your own, which links /home/dev/.lunchroom/bin/lunchroom there
+    PASS the passphrase check is in place (/etc/lunchroom/1000.verifier)
+    PASS Claude Code: Lunchroom is installed and its configuration runs the whole guard
+    PASS Claude Code: release 2.1.311, read from /usr/bin/claude. This is the release Lunchroom was tested with, or a later one.
+    PASS the guard decided every call in the last 24 hours
+    PASS agent standin (Claude Code) is AVAILABLE: its guard is running and no other agent's text is in its session
+PASS doctor: release 2.1.311 (the rpm record's version), read from /usr/bin/claude
+PASS doctor has no FAIL line for Claude Code
+PASS doctor does not say UNGUARDED
+
+== 5. control: the same program bytes, not owned by any package
+PASS rpm: /opt/notpkg/claude is owned by no package
+PASS /opt/notpkg/claude is byte for byte the installed program
+PASS the control session runs /opt/notpkg/claude
+    2 agents: 1 AVAILABLE, 1 UNGUARDED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    copy	claude-code:29608575-bb11-479b-9e9a-b79a92212fa1	UNGUARDED	QUEUED 0
+      why: Claude Code's release cannot be read from the install of its program (/opt/notpkg/claude): Lunchroom reads it from the native installer's …/claude/versions/<release>, Homebrew's …/Caskroom/claude-code/<release>, the npm package @anthropic-ai/claude-code (or its platform package) above the program, or the system package named claude-code that installed the program (dpkg, apk or rpm records). To fix it, install Claude Code one of those ways, then start the session anew.
+    standin	claude-code:efd9fa7b-1590-4f86-83d9-89c3ef6bc89d	AVAILABLE	QUEUED 0
+PASS the copy outside the package database is UNGUARDED
+PASS its reason is 'release cannot be read ... (/opt/notpkg/claude)': it is the package record that makes the first session guarded
+PASS the packaged session is still AVAILABLE beside it
+
+== result
+RESULT: 21 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-packages-dnf removed
+
+######## apk
+MEASURED free space on /: 11884 MB
+== building lunchroom-realworld-packages-apk from Containerfile.apk
+MEASURED image lunchroom-realworld-packages-apk: 346 MB
+
+== facts of this system (apk)
+os: Alpine Linux v3.24
+kernel: 6.8.0-147-generic
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+
+== 1. Claude Code from Anthropic's apk repository
+PASS /usr/bin/claude exists and is executable
+MEASURED apk says /usr/bin/claude is owned by 'claude-code', release '2.1.311-r1'
+MEASURED the program itself says: 2.1.311 (Claude Code)
+PASS apk: the package claude-code owns /usr/bin/claude
+PASS apk records a release of claude-code: 2.1.311-r1
+PASS the repository file names downloads.claude.ai/claude-code/apk/stable
+
+== 2. Lunchroom 1.0.2 installed for a user, and a real session
+chpasswd: password for 'dev' changed
+MEASURED dev's password: passwd: unrecognized
+BusyBox v1.37.0
+
+Usage: passwd
+
+Change USER's
+
+	-a ALG	des,md5,sha256/512
+	-d	Set password
+	-l	Lock (disable)
+	-u	Unlock (enable); hash scheme $6$
+PASS lunchroom install claude-code put the program and the hooks on dev's account
+PASS the passphrase check is set
+MEASURED the session is pid 73; /proc/73/exe -> /usr/bin/claude
+PASS the session process runs the installed /usr/bin/claude (its /proc exe is that path, not marked deleted)
+PASS the process name is claude
+
+== 3. what 'lunchroom status' says
+    1 agent: 1 AVAILABLE
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    standin	claude-code:5c5a4bac-c96b-4f26-a930-6b52e9486d34	AVAILABLE	QUEUED 0
+PASS status lists the session 'standin'
+PASS the session is AVAILABLE (guarded)
+PASS status does not say UNGUARDED
+PASS status gives no 'release cannot be read' reason
+
+== 4. what 'lunchroom doctor' says
+    PASS Lunchroom's program is installed at /home/dev/.lunchroom/bin/lunchroom
+    FAIL no program named lunchroom is on your PATH: put /home/dev/.local/bin on your PATH and run lunchroom install again in a terminal of your own, which links /home/dev/.lunchroom/bin/lunchroom there
+    PASS the passphrase check is in place (/etc/lunchroom/1000.verifier)
+    PASS Claude Code: Lunchroom is installed and its configuration runs the whole guard
+    PASS Claude Code: release 2.1.311-r1, read from /usr/bin/claude. This is the release Lunchroom was tested with, or a later one.
+    PASS the guard decided every call in the last 24 hours
+    PASS agent standin (Claude Code) is AVAILABLE: its guard is running and no other agent's text is in its session
+PASS doctor: release 2.1.311-r1 (the apk record's version), read from /usr/bin/claude
+PASS doctor has no FAIL line for Claude Code
+PASS doctor does not say UNGUARDED
+PASS '2.1.311-r1' carries a packaging suffix the program never prints: doctor read it from apk
+
+== 5. control: the same program bytes, not owned by any package
+PASS apk: /opt/notpkg/claude is owned by no package
+PASS /opt/notpkg/claude is byte for byte the installed program
+PASS the control session runs /opt/notpkg/claude
+    2 agents: 1 AVAILABLE, 1 UNGUARDED
+    hold mode: Balanced
+    slip: read any file except the paths Lunchroom denies or protects; reply with lunchroom send
+    copy	claude-code:5415ab87-ff11-4574-82f7-f6bf1ef8340e	UNGUARDED	QUEUED 0
+      why: Claude Code's release cannot be read from the install of its program (/opt/notpkg/claude): Lunchroom reads it from the native installer's …/claude/versions/<release>, Homebrew's …/Caskroom/claude-code/<release>, the npm package @anthropic-ai/claude-code (or its platform package) above the program, or the system package named claude-code that installed the program (dpkg, apk or rpm records). To fix it, install Claude Code one of those ways, then start the session anew.
+    standin	claude-code:5c5a4bac-c96b-4f26-a930-6b52e9486d34	AVAILABLE	QUEUED 0
+PASS the copy outside the package database is UNGUARDED
+PASS its reason is 'release cannot be read ... (/opt/notpkg/claude)': it is the package record that makes the first session guarded
+PASS the packaged session is still AVAILABLE beside it
+
+== result
+RESULT: 22 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-packages-apk removed
+
+RESULT: 65 PASS, 0 FAIL

@@ -23,6 +23,30 @@ nonce, and a harness marker never count.
    every message, log event and audit field takes them from there. A tool call the guard DENIES
    shows its reason and, from the same table, what the agent or the user can do next.
 3. A test fails if any user-facing string contains a retired word from that file.
+4. A DENIED call is explained in full, never by its reason label alone.
+   Its message says, in plain words: what was DENIED (the path, program, command or text at fault,
+   as the call wrote it; a search is named by the folder it was given, never by a file the guard
+   found below it, since that would tell a HELD agent where other sessions' files are); why (the
+   rule, and for a session that is HELD, the agent and message id that hold it); and every way
+   forward that exists for that call (what the agent can do instead, and what the user can do: run
+   it in a terminal of their own, type in the session to clear the hold, approve the exact call
+   with `lunchroom approve`, or change how strict Lunchroom is; the message names that last way
+   without its command, since a HELD agent reads every message its session shows, and the commands
+   are in `lunchroom help` and the README). The same applies to a message `lunchroom send` DENIES.
+   The message reaches the agent and the user both. Claude Code folds a hook's block reason and its
+   error text behind one line ("Ran 1 shell command") until the user presses ctrl+o, and shows a
+   hook's `systemMessage` in full (measured 2026-11-03, Claude Code 2.1.311): so in Claude Code the
+   guard gives the message as the block reason, which the agent reads, and again as the
+   `systemMessage`, which the user reads.
+5. Tests: for each reason in the table, a DENIED call's message names what was DENIED, the rule,
+   for a HELD session the holding agent and message id, and each way forward that exists for it;
+   a DENIED search names the folder searched and no file found below it; no DENIED message carries
+   a command that changes how strict Lunchroom is; no printed text carries a clause code (item 6)
+   and HELD is defined where a message first uses it (item 7); in Claude Code a DENIED call's
+   message is on the user's screen without unfolding, and is in what the agent receives.
+6. No printed text carries a clause code such as `(L1.1)`.
+7. HELD is defined the first time a message uses it: a message from another agent is in this
+   session, so Lunchroom restricts what it may do.
 
 
 ## §2 R1. HALTED: a conversation that repeats itself stops at 8 messages
@@ -101,23 +125,49 @@ Basis: Meta's Rule of Two; every harness checked keeps a floor under its own YOL
 rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
 
 
-## §4 R3. UNGUARDED and STOPPED: no delivery to an agent nothing is checking
+## §4 R3. UNGUARDED and STOPPED: no delivery to an agent without evidence of its guard
 
 1. Lunchroom treats an agent as guarded only when its guard has run in that agent's current session
    and the harness configuration that runs the guard is still in place (installed, and for Codex
    every Lunchroom hook in its hooks file trusted and enabled). With no such evidence the agent is UNGUARDED if it is running, and STOPPED if it is not
-   running or cannot be reached. The evidence for each harness is fixed in the adapter section in
+   running or cannot be reached. UNGUARDED says that Lunchroom lacks that evidence, not that the
+   agent's guard has stopped: a session whose harness program was replaced while it ran still runs
+   its hooks, and Lunchroom's text for UNGUARDED says only what is known (measured 2026-11-03,
+   Claude Code 2.1.309 to 2.1.317 by apt). A running Codex session whose hooks run through a
+   wrapper is not shown STOPPED: Lunchroom takes the session's process as the nearest `codex`
+   process above the hook, so a hook run through a wrapper (`sh -c`, a script) finds it too
+   (measured 2026-11-03, Codex 0.166.0: with each hook run through a wrapper script, a running
+   session showed STOPPED). The evidence for each harness is fixed in the adapter section in
    step 3 and proven by tests for each supported harness.
 2. Lunchroom never delivers a message to an UNGUARDED or STOPPED agent. The message stays QUEUED and
    the sender is told "<agent> is UNGUARDED." (or STOPPED; card 6: "Mistral is UNGUARDED."). It is delivered once the
    agent is guarded again.
 3. Lunchroom's status shows every agent's state from the vocabulary table. An agent is never shown
    AVAILABLE or HELD without the evidence in item 1.
-4. Lunchroom tells the user when an agent becomes UNGUARDED.
+4. Lunchroom tells the user when an agent becomes UNGUARDED, and why.
+   That notice, `lunchroom status` and `lunchroom doctor` (C1.4) give each UNGUARDED agent one
+   reason, the first of these its evidence lacks, and what the user does about it: its harness
+   configuration does not run the whole guard (naming the harness, and for Codex the setting or hook
+   at fault); no guard hook has run in its current session; its harness release cannot be read from
+   its install (naming the program's path; the cause may be that the program was replaced while its
+   session was running, that the package database is rpm's and the computer has no `rpm`
+   program, or, for Hermes, that its git checkout belongs to a user other than root and the
+   session's own user, which git refuses to read, and the user gives the checkout to the user who
+   runs Hermes or to root, and starts Hermes anew); or its release is older than the one its adapter passed with (naming both releases).
+   The reason has two forms: the user's, in `lunchroom status` and `lunchroom doctor` run in a
+   terminal of their own, names the setting, hook or program path at fault; the form an agent
+   reads (a sender's notice, `lunchroom status` run inside a guarded session) names the harness
+   and what the user does, and no path of another session's configuration.
 5. Tests, for each harness: hooks not installed, hooks installed but untrusted (Codex "Continue
-   without trusting (hooks won't run)"), for Codex any one Lunchroom hook not trusted or disabled, and a guard that crashes, each give
+   without trusting (hooks won't run)"), for Codex any one Lunchroom hook not trusted or disabled, each give
    UNGUARDED and no delivery; an ended session gives STOPPED and no delivery; restoring the guard delivers the
-   QUEUED message once.
+   QUEUED message once; each case of item 4 shows its own reason. A Claude Code session whose
+   program a package upgrade replaced while it ran shows UNGUARDED with that reason, its hooks
+   still DENY a fenced call, and no text Lunchroom shows for it says that nothing is checked; a
+   Hermes checkout owned by root is read, and one owned by another user who is not root gives the
+   reason of item 4 for it. A guard that fails on a call is
+   recorded (H1.8) and `lunchroom doctor` FAILs on it for 24 hours (C1.4); K1.9 states what a guard
+   stopped by the system leaves.
 
 
 ## §5 T1. Threat model (free version)
@@ -152,7 +202,9 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
 7. A tool's output, a failed tool's error and, when a hook first sees a session, that session's
    transcript put the session in HELD when they carry a label naming a message Lunchroom sent (a
    forked or branched session is a new session with the old context). A label quoted with no such
-   id, as in Lunchroom's own documentation and source, holds nothing.
+   id, as in Lunchroom's own documentation and source, holds nothing. The transcript is read once,
+   from its start, up to 32 MiB and 10,000 message ids; a transcript the guard could not read to
+   the end holds the session, as a tool output the guard did not judge does, until the user types.
 
 
 ## §6 P1. Permission slip: what a HELD agent may still do
@@ -180,7 +232,14 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    guard (R3.1), and any command the guard cannot parse (F1.2). An agent's call that writes
    Lunchroom's stores, other than through `lunchroom send`, or changes any agent's slip, registration or the rate limit is DENIED, never
    asked; only the user, at a terminal, changes those (A1.3). A tool the guard does not know counts
-   as sending data off the computer. A command that names a path in Lunchroom's stores, a reply included, or that
+   as sending data off the computer. Codex's and OpenClaw's `apply_patch` are file-write tools (the
+   patch is Codex's `command` field and OpenClaw's `input` field): each path on its
+   `*** Add File:`, `*** Update File:`, `*** Delete File:` and `*** Move to:` lines is judged as a
+   write of that path, the text between those lines is file contents and is never judged as paths,
+   and a patch naming more than 200 files is PROTECTED while the agent is HELD. A call to a
+   file-write tool whose input holds no path or patch the guard can read is DENIED in every session,
+   since it may write Lunchroom's stores. A command that names
+   a path in Lunchroom's stores, a reply included, or that
    changes everything in a folder holding them, counts as writing them. Likewise a command that
    names Lunchroom's program, other than to run it, or the harness configuration that runs the
    guard counts as writing it. The harness's own program (`claude`, `codex`, `openclaw`, `hermes`
@@ -194,7 +253,10 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    reply to any other agent is DENIED; in the Strict hold mode its file edit and any other command
    each reach the user, a `lunchroom send` joined to another command included; the user's attempt
    to add an edit or any other command to a slip is refused; an agent's attempt to edit a slip is
-   DENIED.
+   DENIED; each header line of a Codex or OpenClaw `apply_patch` is judged as a write of its path,
+   and a patch naming more than 200 files is PROTECTED while the agent is HELD; a real OpenClaw
+   `apply_patch` into Lunchroom's stores is DENIED in a session that is not HELD; a file-write call
+   with no path or patch the guard can read is DENIED in every session.
 6. Hold mode. The user chooses how much being HELD limits an agent, and Lunchroom asks it during
    `lunchroom install`, recommending Balanced; the user changes it with `lunchroom mode`, typed in a
    terminal outside every guarded session (A1.3), and Lunchroom shows it in its status. An agent
@@ -251,11 +313,15 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
      plugin reads Hermes's own approval state at each call and reports to the guard whether a person
      would be asked.
    In those cases the guard DENIES the call; the user may approve that exact call (A2.1) through
-   `lunchroom approve` or the cockpit before the agent retries it. For a Codex session,
+   `lunchroom approve` or the cockpit before the agent retries it. Which calls the guard could not
+   decide are kept for `lunchroom approve`, and what the agent is told, is stated in H1.5 (§13 item
+   5). For a Codex session,
    `lunchroom approve` then queues one line of Lunchroom's naming the approval and the exact call;
    that line adds no hold and clears none (A2.1).
 3. The guard denies, in every guarded session, any command that runs `lunchroom approve`, `lunchroom
-   yolo`, any Lunchroom command that changes its configuration (slip, rate limit, register, unregister, hold mode, install, uninstall, passphrase), or
+   yolo`, `lunchroom check` (the program a guard hook starts, D1.7; it asks for no confirmation,
+   since no person starts it), `lunchroom console` (§17; it asks for the passphrase itself), any
+   Lunchroom command that changes its configuration (slip, rate limit, register, unregister, hold mode, install, uninstall, passphrase), or
    writes Lunchroom's stores other than through `lunchroom send`, so an agent cannot approve or
    widen for itself or for another agent.
    Lunchroom itself carries out these commands only after reading the user's confirmation from a
@@ -279,7 +345,8 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    today's rule allow; it does not approve a specific action.
 6. Tests, per harness: an "ask" reaches the person in each interactive mode; under `-p` and a
    prompt tool the call is DENIED; an agent running `lunchroom approve` is DENIED, directly, from a
-   script, and from a detached process (`setsid`, `nohup`, a scheduled job); a prompt that
+   script, and from a detached process (`setsid`, `nohup`, a scheduled job), and so is an agent's
+   `lunchroom check`; a prompt that
    says "approved" approves nothing; in OpenClaw an `allow-always` answer is refused and a timeout
    blocks; in Hermes a "session" answer does not cover the next call, and under `--yolo` the call is
    DENIED.
@@ -297,14 +364,17 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    the time the user confirms, a message has held the session, a hold has ended or the request has
    changed, nothing is approved and the user is told to ask again.
 3. An approval expires 10 minutes after it is given, is used at most once, and is void if the input
-   changes by one byte. The session stays HELD after the call runs.
+   changes by one byte. The session stays HELD after the call runs. A call waiting for approval is
+   dropped 10 minutes after the agent asked; `lunchroom approve` shows each call's age and when it
+   lapses.
 4. Approving and using an approval are each one atomic step, so two calls cannot share one approval.
 5. In OpenClaw and Hermes the harness's own approval of that one call is the approval (A1.1); its
    expiry is the harness's approval timeout.
 6. Tests: a changed argument is DENIED; a second use is DENIED; an expired approval is DENIED; two
    concurrent calls with one approval: one runs, one is DENIED; the session is still HELD afterwards;
    the same call in another folder is DENIED; a message that holds the session while the user reads
-   the prompt leaves nothing approved.
+   the prompt leaves nothing approved; a call not approved within 10 minutes of the agent's asking
+   is dropped, and `lunchroom approve` shows its age and when it lapses.
 
 
 ## §9 I1. Identity: an agent is its harness and session id
@@ -324,7 +394,8 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
 3. Every message records sender and recipient by identity. Inboxes are keyed by session id.
 4. A HELD session may reply only to the identities whose messages hold it, resolved from the record
    of those messages, never from the current name table. Renaming or re-registering a name changes
-   nobody's reply permission.
+   nobody's reply permission and never redirects a reply; a reply to a holder that no name labels any
+   more is DENIED as to an agent no longer named, since only a named session receives (item 5).
 5. Receiving is opt-in by the user, session by session: a session receives messages only after the
    user names it, by typing `join` or `join <name>` as the whole prompt in that session (the
    user's own typing, as the prompt hook tells it: T1, K1.2; in Claude Code only in an attended
@@ -332,17 +403,23 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    typing, in Codex in any prompt that carries no marker of another agent's text, since Codex's
    hook says nothing of who typed, the same sign by which typing clears HELD there, while F1 fences
    the commands that put a turn into a Codex session), or by `lunchroom register` through
-   the approval channel (A1). With no name given, the session takes its harness and its folder's
+   the approval channel (A1). A Claude Code session run as one prompt (its command line has `-p`,
+   `--print` or `--permission-prompt-tool`) cannot join by typing, so its start hook asks it
+   nothing, and its listener returns at once, since Claude Code runs a `-p`
+   prompt only after its start hooks finish (measured 2026-11-03 on Claude Code 2.1.317, where the
+   listener held a scheduled `claude -p` run until it was killed). With no name given, the session takes its harness and its folder's
    name in lower case, any character a name cannot hold as `-` and cut to 18 characters so the name
    stays within 32 (`claude-myproject`), with `-2`, `-3` and on when another session has that
    name, the name cut shorter before the suffix where the suffix needs the room; joining under
    a new name gives up the session's earlier names. When the user joins a session, its agent is
-   told its name and the two commands it may run (`lunchroom send` and `lunchroom status`), and in
+   told its name and the five commands it may run (`lunchroom send`, `lunchroom status`,
+   `lunchroom codex-threads`, `lunchroom help` and `lunchroom version`), and in
    Claude Code the name becomes the session's title unless the session has a custom title, which
    Lunchroom never replaces. The title Lunchroom last gave the session, until a hook shows
    Lunchroom a custom title in its place, is not custom, and neither is a title equal to a name
    the join gives up. When a session of a harness with a session-start hook (Claude Code, Codex)
-   starts, the user is shown how to include it, also when Lunchroom cannot use its store; a joined
+   starts, the user is shown how to include it, also when Lunchroom cannot use its store, except a
+   Claude Code session run as one prompt (below); a joined
    session that starts again keeps its name and its agent is told it, and in Claude Code it takes
    the name as its title only if it has no custom title and only on `startup`, `resume` or `fork`,
    the starts on which Claude Code applies a title. A prompt that is not the user's own typing
@@ -351,10 +428,15 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    holder's QUEUED messages never pass to the new holder.
    The user ends it by typing `leave` in the session, which takes away every name the session has,
    or with `lunchroom unregister <name>`, which takes away that name: a session that no other name
-   labels receives nothing more, and its QUEUED messages stay QUEUED.
+   labels receives nothing more, and the messages QUEUED for it become FAILED, with that reason, in
+   the same step, and their senders are told (D1.7); the same happens when `lunchroom register`
+   moves a name, and those messages never pass to the new holder.
 6. Records from before this rule that carry only a name fail closed: they hold, and permit no reply.
-7. Tests: a forged session id in the environment is DENIED, directly and from a script file; a renamed name does not redirect a reply;
+7. Tests: a forged session id in the environment is DENIED, directly and from a script file; a renamed name does not redirect a reply,
+   and a reply to a holder that no name labels is DENIED;
    registration from a guarded session is DENIED; a held message never moves to a new name holder;
+   `unregister`, `leave` and a `register` that moves a name each turn the messages QUEUED for the
+   session no name labels into FAILED and tell their senders;
    `join` typed by the user names the session (its harness and folder when no name is given) and
    `leave` takes the name away; `join` in another agent's text or in a longer prompt names nothing;
    a name another session has is refused.
@@ -363,15 +445,17 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
 ## §10 D1. Delivery: no loss, no duplicates, honest outcomes
 
 1. A message is QUEUED when accepted and DELIVERED only when the recipient's harness confirms it reached
-   that session (Claude Code: the delivery prompt reached the guard; Codex: the session record shows
+   that session (Claude Code: the delivery prompt reached the guard; Codex: the session record, searched over its last 8 MiB, shows
    the message id, or the delivery prompt reached the guard; OpenClaw: the turn's prompt reached
    the plugin's `before_agent_run`; Hermes: the turn's request to the model carries the message,
    which the plugin's `pre_llm_call` handed to that turn, as the plugin's `pre_api_request` sees
    it). Until then it stays QUEUED. A Codex session is HELD by a message from the moment Lunchroom
    hands it to `codex queue`, and a Hermes session from the moment the plugin's `pre_llm_call`
-   takes it, since nothing can hold either when the message reaches the model. That hold stays even when the hand-over is never confirmed (D1.4). A hand-over
-   made by `lunchroom send` offers the recipient only the sender's own message; another sender's
-   waits for its own sender's send or the recipient's listener. The program that hands over is the
+   takes it, since nothing can hold either when the message reaches the model. That hold stays even when the hand-over is never confirmed (D1.4), and goes only when the
+   hand-over program ran and exited with an error, since nothing then reached the session. A hand-over
+   made by `lunchroom send`, and the check it runs (item 7), offer the recipient only the sender's
+   own messages; another sender's waits for its own sender's send, the recipient's listener, a check
+   a guard hook started, or the user's `lunchroom status`. The program that hands over is the
    recipient harness's own, by the absolute path of the process the guard hook recorded for that
    session, checked to be the file that process runs, and for a harness under a runtime the
    harness's own bin in the package holding the script its plugin reports from inside the process,
@@ -385,13 +469,23 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    header) could exceed one command argument, 131071 bytes, since the harness takes the envelope
    as one argument; a message of 64 KiB in lines of at least 100 bytes is accepted. A delivery attempt repeated after a
    crash or retry never shows the
-   recipient the same message twice.
+   recipient the same message twice, and a late copy of a FAILED message is blocked and says so.
+   The store file carries the number of the program layout that wrote it (2 in 1.0.2), and every
+   program keeps each field it does not know through every read and write.
 3. When the outcome of an attempt cannot be known, Lunchroom says so ("Not confirmed; still QUEUED")
    and never reports DELIVERED. A hand-over that could not start because the recipient's program
    cannot be established (D1.1) is not an attempt: the message stays QUEUED and the sender is told.
-4. A message is FAILED, with the reason, only after 3 failed attempts, and the sender is told. A
-   hand-over to a Codex, OpenClaw or Hermes session that its harness has not confirmed 10 minutes
-   later counts as one failed attempt, and the message is offered again.
+4. A message is FAILED, with the reason, after 3 failed attempts, and the sender is told; a
+   message whose recipient is no longer named is FAILED at once (item 7). A failed attempt is one
+   of: a hand-over to a Codex, OpenClaw or Hermes session that its harness has not confirmed 10
+   minutes later; an offer to a Claude Code session that its guard has not confirmed 60 seconds
+   later, even when no listener asks for it again; a hand-over program that ran and exited with an
+   error (Codex or OpenClaw did not take the message, and the hold taken for it goes). The first
+   two are counted at the next check (item 7), whatever program runs it; a stamp more than 5
+   seconds ahead of the checking program's clock is a stamp from a clock that stepped back, and
+   that attempt has run out. After a failed attempt the message is not offered again for 10
+   seconds. A hand-over that could not start because the recipient's program cannot be established
+   is not an attempt (item 3).
 5. A message to a HELD session is delivered like any other: being HELD never stops delivery, and
    whatever stops a message to any session (a DENIED rule such as L1.4, HALTED, R3, I1.5, D1.4)
    stops it here too. Each delivered message is added to the record of what holds that session. (More text gives
@@ -400,24 +494,89 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
 6. Tests: a crash between delivery and confirmation leads to exactly one delivery; a lost
    confirmation is reported as not confirmed; a message delivered to a HELD session is added to what
    holds it; a message longer than 64 KiB, or one whose envelope would not fit one argument, is
-   refused and nothing is stored; a sender's hand-over offers only its own message; a hand-over
-   whose program cannot be established leaves the message QUEUED.
+   refused and nothing is stored; a sender's hand-over, and the check inside its `lunchroom send`,
+   offer only its own message, while `lunchroom status` run inside a guarded session offers none
+   and a check a guard hook started offers any sender's; a hand-over whose program cannot be
+   established leaves the message QUEUED; a hand-over program that exits with an error counts as
+   one failed attempt and releases the hold; a late copy of a FAILED message is blocked with its
+   own text; a store field no program knows survives a read and a write.
+7. No message waits without an end. Lunchroom checks every QUEUED
+   message's time limits whenever any of its programs runs: every guard hook in any session (the
+   hook starts `lunchroom check` in a process of its own once it has written its answer, so the
+   check never adds to a decision's time; a hook past its 10-second time starts none), every
+   listener, every `lunchroom send` and every `lunchroom status`. At each check it looks again for
+   the recipient's confirmation (D1.1), counts an attempt past its time as failed (item 4), FAILS at
+   once, with that reason, a message to an agent that is no longer named or no longer takes
+   messages after `leave`, and offers again each Codex or OpenClaw message that is due, through the
+   recipient harness's own program as D1.1 says. A check that was killed holds up no later one.
+   Which messages a check offers depends on who runs it: a check a guard hook or a listener
+   started, and the user's `lunchroom status` in a terminal of their own, offer any sender's due
+   message; the check inside `lunchroom send` offers only the sender's own; `lunchroom status` run
+   inside a guarded session offers none. A Claude Code or Hermes message is offered again only by
+   that session's own listener, when that session runs, since no program of Lunchroom's can put a
+   message in front of those harnesses from outside. So a message to a guarded Codex or OpenClaw
+   recipient is DELIVERED or FAILED within three hand-over times and three gaps of its first
+   hand-over whenever any Lunchroom program runs in that time; a message to a Claude Code or Hermes
+   recipient, within that time of its session running its listener; a message to an UNGUARDED or
+   STOPPED recipient waits, uncounted, as R3.2 says.
+8. The user and the sender are told while a message waits and when it ends: when a hand-over has
+   had no confirmation for 2 minutes; when an attempt counts as failed; when the message is FAILED;
+   when it cannot be handed over (the recipient UNGUARDED, with its R3.4 reason in the form an
+   agent may read, or STOPPED; its program cannot be established; the hand-over program failed);
+   and when it is DELIVERED after any of these. Each notice names the message id, the recipient,
+   how long ago it was sent, the attempt (n of 3), what Lunchroom is waiting for (for Codex: the
+   message id in that session's record, or its next prompt), when and by what program it will be
+   offered again, and what the user can do. Where a notice is told depends on what the harness lets
+   a hook show: in Claude Code, the next prompt a person types shows the user's notices to the user
+   and the session's own (as a sender) to its agent; in Codex, the next prompt a person types shows
+   the user's, and the `Stop` listener shows the session's own to its agent; in OpenClaw and
+   Hermes, whose prompt hook and turn end can show the user nothing (OpenClaw, the agent nothing
+   either; H1.3), the notices wait for `lunchroom status`, which lists the notices not yet told,
+   and for a prompt the user types in a Claude Code or Codex session of theirs. A prompt no person
+   typed (`claude -p`, `codex exec`, `codex review`) is told nothing. A list keeps at most 50
+   notices and 8 of one message; past that the oldest go and one line says how many; a notice
+   identical to one waiting is not added twice; the notices of a session no longer running go
+   after a day, the user's after a week. A notice is marked told once the answer that carries it is
+   produced, so it is shown at least once; a hook killed between the two shows it again.
+9. `lunchroom status` shows every QUEUED message, whatever its recipient, with the same facts as
+   item 8: recipient, age, whether it is waiting to be handed over or handed over and waiting for
+   confirmation (and since when), the attempt (n of 3), when it will be offered again, and why it
+   cannot be handed over, if it cannot.
+10. Tests: with no event but a later check of item 7 (any hook, `send` or `status`), a hand-over past
+    its time is counted, and for a Codex or OpenClaw recipient with no listener running it is offered
+    again no sooner than 10 seconds after, and after three a message is FAILED; for a Claude Code or
+    Hermes recipient the same three expiries run with that session's listener running; a message to
+    an agent that left is FAILED with that reason; a killed check holds up no later one; each case
+    of item 8 gives its notice with each named fact, on the channel each harness has (H1.3);
+    `lunchroom status` shows each fact of item 9.
 
 
 ## §11 L1. Leaks: replies and reads while HELD
 
-1. A HELD session may read, except: Lunchroom's stores; any harness transcript or session store
+1. A HELD session may read, except: Lunchroom's stores; `/etc/lunchroom` (the passphrase
+   verifiers), in every build; any harness transcript or session store
    (`~/.claude/projects`, `~/.codex/sessions`, `~/.openclaw`, `~/.hermes`); and a process's files
    under `/proc` (`/proc/<pid>`, `/proc/self`); other `/proc` files, such as `/proc/loadavg`, may
    be read. Reading
-   these, or searching from a parent folder that would reach them, is DENIED. Reading a credential
+   these, or searching from a parent folder that would reach them, is DENIED. `lunchroom
+   codex-threads`, one of the commands a HELD agent may run (I1.5), is not such a read: Lunchroom's
+   own program lists the Codex threads from the names of Codex's session files and its session
+   index, and reads no session's contents (a thread id carries no text and gives no authority,
+   I1.2, and it is what `lunchroom register` needs). Reading a credential
    path (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `.npmrc`), or
    searching from a parent folder that would reach one, is PROTECTED (P1.4): it goes to the user in
    the Strict and Balanced hold modes (P1.6). A path is resolved as the operating system resolves it,
    part by part, so `..` leaves the folder a symbolic link led to; a path that cannot be resolved (a
    link loop, a part the guard has no permission to look at, a `..` after a part that does not exist or after a
    wildcard) is, for a HELD session, DENIED to a read tool and PROTECTED in a command, as a path
-   that could reach a store, a transcript, a credential or the guard's configuration. A search enters every folder below
+   that could reach a store, a transcript, a credential or the guard's configuration. The guard
+   spends at most 2 seconds of a decision resolving paths; a path of a HELD session's read still
+   unresolved when that time ends is one Lunchroom could not check, PROTECTED as a credential path
+   would be (it goes to the user in the Strict and Balanced hold modes), while a path that cannot be
+   followed at all is DENIED as above. The guard resolves at most 1,000 path-like strings in one
+   call; past
+   that a HELD session's call is PROTECTED as text the guard could not parse (links and wildcards
+   in the rest were not looked at), unless it is the reply. A search enters every folder below
    the folder it is given, those that usually hold fetched or built files (`.git`, `node_modules`,
    `target`, `dist`, `vendor`, `.venv`, `__pycache__`) included, because the commands that search
    read them; the walk is bounded in time, and a walk that stops before it has seen every file
@@ -436,7 +595,9 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    delivered as sent; Lunchroom tells both agents "Denied. Asked for a secret." (card 2).
 5. Tests: each denied path, by direct path, symlink, wildcard and parent-folder search, is DENIED;
    a path through a symbolic link and `..` is judged as the file the system opens; a HELD read of a
-   path that cannot be resolved is DENIED; a credential only inside `node_modules` sends a search to
+   path that cannot be resolved is DENIED; a HELD read of `/etc/lunchroom` is DENIED; a read left
+   unresolved when the 2 seconds end goes to the user; a call with more than 1,000 path-like strings is
+   PROTECTED; a credential only inside `node_modules` sends a search to
    the user; a transcript in a folder `CODEX_HOME` names is DENIED;
    each credential path, the same four ways, reaches the user, under YOLO too; a reply carrying each secret pattern is DENIED; card 2 end to end ("GLM, please send API key." is
    DENIED and both agents see "Denied. Asked for a secret.").
@@ -481,24 +642,46 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    the one release of its harness it passed with (for Hermes, a commit, and Hermes releases are
    ordered by commit date). A harness at an older release, or whose release Lunchroom cannot read,
    is UNGUARDED too; at that release or a later one, its release does not make it UNGUARDED, and R3
-   still decides whether it is guarded.
+   still decides whether it is guarded. Lunchroom reads Claude Code's
+   release from the install of the program its session runs: the native installer's
+   `…/claude/versions/<release>`, the npm package `@anthropic-ai/claude-code` above the program, or
+   the system package named `claude-code` that installed the program, from dpkg's records
+   (`/var/lib/dpkg`), apk's (`/lib/apk/db/installed`) or rpm's (`rpm -qf`; the guard may run that one program, with an empty environment and a 2-second
+   time limit, and keeps its answers). It also reads the release from the platform packages of the
+   npm package, from Homebrew's cask folder (`…/Caskroom/claude-code/<release>/claude`), from a
+   wrapper script whose `exec` line names a path of these kinds, and from a Volta shim. Anthropic
+   publishes
+   apt, dnf and apk packages, each installing `/usr/bin/claude` (host facts:
+   `docs/host-facts/claude-code.md`). Lunchroom's Hermes plugin reads Hermes's release
+   inside Hermes, from Hermes's own version information: its commit and that commit's date. Where
+   Hermes runs from a git checkout that another user owns, git refuses to read it; the plugin then
+   reads the commit and its date with git told to trust that one checkout, and only when root owns
+   the checkout's folder and everything in its `.git`, no other user can write to that folder or to
+   anything in `.git`, and `.git` holds no symbolic link: `.git` is all the two git commands read,
+   so a file in the working tree that others can write (`uv` leaves `.venv/.lock` writable by all,
+   measured 2026-11-04) does not matter.
 3. Adapter form: hooks for Claude Code and Codex; a plugin for OpenClaw (`before_tool_call`) and
    Hermes (`pre_tool_call`). Facts measured on the dates in `docs/host-facts/`, and for
-   "Ask a person" in OpenClaw and Hermes read from source (openclaw 2026.10.7, hermes-agent 9976f48)
-   and observed in live runs (`docs/host-facts/openclaw-and-hermes.md`), each proven by the H1 tests:
+   "Ask a person" in OpenClaw and Hermes read from source (openclaw 2026.10.7, hermes-agent 9976f48), each proven by the H1 tests:
 
-| Harness | Block a call | Ask a person | Identity in hook | Wake an idle session |
-|---|---|---|---|---|
-| Claude Code 2.1.310 | yes | yes, interactive only | session id | delivery prompt |
-| Codex 0.163.0 | yes | no ("ask" fails open) | thread id | `codex queue` |
-| OpenClaw 2026.10.6 (tests), 2026.10.7 (source) | yes | `requireApproval` (source read; OpenClaw blocks it where no person can answer) | agentId, sessionKey, sessionId (any may be absent) | `openclaw agent --session-key` (a turn from the user, no provenance), `gateway call agent`, `sessions_send` (provenance `inter_session`), `cron add`/`edit`, `acp` |
-| Hermes 5894e75 (tests), 9976f48 (source) | yes, also in `--yolo` | `approve` (source read); Hermes auto-approves it in the cases of A1.2, so the guard DENIES there | session_id | local API (API sessions only); a chat or terminal session gets a message at the start of its next turn, through the plugin's `pre_llm_call` |
-| OpenCode | not yet proven for wake and identity | not tested | not tested | not tested |
+| Harness | Block a call | Ask a person | Identity in hook | Wake an idle session | Shows text on a prompt / at a turn's end |
+|---|---|---|---|---|---|
+| Claude Code 2.1.309 (the release Anthropic's stable apt, dnf and apk channels served on 2026-11-02) | yes | yes, interactive only | session id | delivery prompt | yes / yes |
+| Codex 0.163.0 | yes | no ("ask" fails open) | thread id | `codex queue` | yes (prompt) / agent only (`Stop`) |
+| OpenClaw 2026.10.6 (tests), 2026.10.7 (source) | yes | `requireApproval` (source read; OpenClaw blocks it where no person can answer) | agentId, sessionKey, sessionId (any may be absent) | `openclaw agent --session-key` (a turn from the user, no provenance), `gateway call agent`, `sessions_send` (provenance `inter_session`), `cron add`/`edit`, `acp` | none / none |
+| Hermes 5894e75 (tests), 9976f48 (source) | yes, also in `--yolo` | `approve` (source read); Hermes auto-approves it in the cases of A1.2, so the guard DENIES there | session_id | local API (API sessions only); a chat or terminal session gets a message at the start of its next turn, through the plugin's `pre_llm_call` | agent only / none |
+| OpenCode | not yet proven for wake and identity | not tested | not tested | not tested | not tested |
+
+   The last column is what each harness's prompt hook and turn end can show, as the plugin or hook
+   reports it to the guard (`can_show_user`, `can_tell_agent`); D1.8 relies on it. A Codex or
+   OpenClaw listener finishes within 50 seconds and leaves what it did not get to for the next
+   check.
 
 4. `lunchroom install` with no harness named finds each supported harness whose folder exists for
-   the user (`~/.claude`; `CODEX_HOME` or `~/.codex`; `OPENCLAW_STATE_DIR` or `~/.openclaw`;
-   `HERMES_HOME` or `~/.hermes`) and offers each in turn; only those the user answers yes to are
-   installed. The installer writes each harness's configuration beside the old one, keeps a backup, and tells the
+   the user (`CLAUDE_CONFIG_DIR` or `~/.claude`; `CODEX_HOME` or `~/.codex`; `OPENCLAW_STATE_DIR`
+   or `~/.openclaw`; `HERMES_HOME` or `~/.hermes`) and offers each in turn; only those the user answers yes to are
+   installed. The installer writes each harness's configuration, for Claude Code in the folder
+   `CLAUDE_CONFIG_DIR` names when it is set, beside the old one, keeps a backup, and tells the
    user any step only they can do. It never writes a harness's trust records itself. For Codex it also
    sets `unified_exec_tty = false` under `[features]` in `config.toml`, says so before the user's yes
    and keeps a backup; a Codex session is guarded only with that setting, and not where a
@@ -515,7 +698,12 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    rules that need no record, as for a HELD agent: a call inside the slip as shipped runs, and a
    call those rules DENY is DENIED, so a broken store does not send every read to the user. A
    reply passes this way too, and `lunchroom send` then DENIES it while it cannot use its store
-   (I1.4 cannot be checked without the record).
+   (I1.4 cannot be checked without the record). That second judging takes at most 2 seconds; one
+   that does not finish sends the call to the user, or DENIES it where there is no approval channel.
+   Where such a call is DENIED for want of an approval channel, a call undecided by the guard's own
+   error is kept for `lunchroom approve` while the store can hold it, and a call undecided for want
+   of a usable store, or past its time, is not kept, and the agent is told to try it once more and
+   then tell the user (A1.2).
    A failure never blocks a prompt the user types; a prompt carrying another
    agent's text (T1) is blocked instead, since the guard could not hold the session it reaches. The installer sets no
    harness option that turns a guard failure into a block (Claude Code's `onFailure: block`).
@@ -524,7 +712,27 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    when the guard fails, and a prompt carrying another agent's text is blocked; with a store the
    guard cannot use, a read inside the shipped slip runs, a fence is DENIED and a reply is DENIED
    by `lunchroom send`, while a guard past its time sends even a read to the user; the installed configuration has no option that turns a failure into a
-   block.
+   block; a call undecided by the guard's own error is kept for `lunchroom approve`, and one
+   undecided for want of a usable store or past its time is DENIED and not kept; a second judging
+   that does not finish in 2 seconds sends the call to the user.
+7. A call the guard cannot decide (item 5) is explained as V1.4 explains a DENIED call: the call; the cause, which is the guard's own error (naming it), a store it
+   cannot use (naming what is wrong with it), or no answer within 10 seconds (naming the step that
+   was still running when the time ran out); and the ways forward: `lunchroom approve` for that
+   exact call where it is kept for the user (item 5: only after the guard's own error), running it in a terminal of their own, and
+   `lunchroom doctor`.
+8. The guard records each call it cannot decide, and each decision that takes longer than 2
+   seconds, in a file in Lunchroom's own folder: the time, the session, the call as V1.4 shows it,
+   the slowest step and how long it took. It keeps the latest 200 records and sends nothing
+   anywhere. A record has its control characters removed and its secrets replaced before it is
+   written and again when it is read; the file is readable by its user alone; a guard that cannot
+   take the records lock within a second writes its record to a file of its own beside it, which
+   the next guard folds in, so no record is dropped. `lunchroom doctor` shows the records of the
+   last 24 hours (C1.4).
+9. Tests: each cause of item 7 gives its message with the call, the cause and the ways forward;
+   a decision past 2 seconds and each undecided call is recorded with its step and time; the file
+   keeps only the latest 200 records; a record's control characters and secrets are removed when
+   written and when read; the file is private to its user; a record written while the lock is busy
+   is not dropped.
 
 ## §14 C1. Cockpit
 
@@ -532,7 +740,12 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    UNGUARDED, STOPPED) and YOLO beside it when its harness reports it, with the end time of a `lunchroom yolo` (R2.6), what holds it (sender and message ids), its QUEUED messages, HALTED pairs,
    and pending approvals. Every figure comes from Lunchroom's records at that moment. `lunchroom
    status` opens with a count of agents by state, lists running agents before STOPPED ones, and
-   counts holds that no message caused (a tool's output, a transcript) by their source.
+   counts holds that no message caused (a tool's output, a transcript) by their source. It runs the
+   check of D1.7 first (and so writes the store), prints the total of calls waiting for the user,
+   and lists the notices not yet told: the user's when run in a terminal of their own, the
+   session's own when run inside a guarded session. While another Lunchroom process holds the
+   store, `lunchroom status` waits for it 10 seconds in all, not 10 seconds for each read, and then
+   says the store is busy and stops.
 2. From the cockpit the user can approve or deny a pending call (A2) and set or
    end a `lunchroom yolo` (R2.2). These are A1 channels: an agent cannot reach them. In version 1.0
    the cockpit is the user's own terminal: `lunchroom status` shows,
@@ -540,6 +753,30 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    not approve never runs, which is how it is denied.
 3. Version 1.0 has no Lunchroom phone app. Away from the computer, the user
    approves OpenClaw and Hermes calls in the chat or app they already use with that agent (A1.1).
+4. `lunchroom doctor` checks the user's setup and changes nothing. It
+   prints one line for each check, PASS or FAIL, and for each FAIL what the user does: Lunchroom's
+   program is installed and runs by name from the user's `PATH`; the passphrase check is in place
+   (A1.3); for each supported harness whose folder exists, Lunchroom is installed and the harness
+   configuration runs the whole guard, and the harness release is the release its adapter passed with
+   or later (H1.2): for Claude Code and Codex read from the install of its program on the user's
+   `PATH`; for OpenClaw, the release its plugin reported in its latest session, with when,
+   otherwise read from the program on `PATH`; for Hermes, whose release its plugin reads inside Hermes, the release the plugin
+   reported in its latest session, a FAIL until a Hermes session has run; each running
+   agent's state, with its reason (R3.4) when UNGUARDED; and the guard's records of the last 24
+   hours (H1.8), a FAIL when any of them is a call it could not decide. It exits 0 when every check passes and 1
+   otherwise. A running agent that is HELD prints a line that is neither PASS nor FAIL, naming what
+   holds it, and leaves the exit code as it was. When the store was last written by an older
+   Lunchroom program, it prints a FAIL line saying that a session started before the upgrade still
+   runs its old listener and that those sessions are to be started anew. It reads only local files
+   and sends nothing anywhere. It is the user's command: an agent's attempt to run it is DENIED. It
+   runs only where the user's own commands run (A1.3: no guarded session in its parent chain, a
+   controlling terminal, not a guarded session's terminal), asks no passphrase, and otherwise prints
+   why it did not run and what to do.
+5. Tests: each check of item 4 passes on a complete setup and fails, with its own fix, when its
+   condition is broken; the exit code is 0 only when every check passes; doctor changes no file;
+   an agent's `lunchroom doctor` is DENIED; doctor run with no controlling terminal, or inside a
+   guarded session's terminal, prints why it did not run and asks no passphrase; a HELD agent
+   prints its own line and leaves the exit code; an older store writer gives its FAIL line.
 
 
 ## §15 K1. Stated limits (published with the product)
@@ -583,15 +820,17 @@ These are statements for users of what Lunchroom does not prevent; they are not 
    leaves no such trace.
 10. The passphrase check (A1.3) does not hold where an agent has passwordless `sudo`: such an
     agent acts as root, and can write the verifier, remove it, or change Lunchroom's own files.
-11. An agent can read the verifier (every user may read it) and guess the passphrase offline. A
+11. An agent that is not HELD can read the verifier (every user may read it; a HELD agent's read
+    of it is DENIED, L1.1) and guess the passphrase offline. A
     minimum of 12 characters and 600000 PBKDF2 rounds slow that guessing; they do not prevent it
     for a weak passphrase.
 12. A program that records the user's keystrokes defeats any secret typed at a terminal, the
     passphrase included. Until the first passphrase is set, the install that sets it is confirmed
     with a typed `yes`, which a process of the user's own can type.
 13. The envelope reaches a Codex or OpenClaw session as one argument of `codex queue` or
-    `openclaw agent`, so another user of the computer can read it in `/proc/<pid>/cmdline` while
-    that program runs; Lunchroom's own store is readable by its user alone.
+    `openclaw agent`, so any other process, of this user or another, can read it (`ps -eo args`,
+    `/proc/<pid>/cmdline`) while that program runs; Lunchroom's own store is readable by its user
+    alone.
 14. The passphrase step needs `sudo` (not `doas`), `install` and `stty` in `/usr/bin`, `/bin`,
     `/usr/sbin` or `/sbin`; a system without `sudo` installs the hooks but no passphrase, and says
     so, and the commands only the user may run stay DENIED until a passphrase is set.
@@ -623,6 +862,24 @@ These are statements for users of what Lunchroom does not prevent; they are not 
     the Strict hold mode without a `lunchroom yolo`, and there the script comes to you (in Codex,
     through `lunchroom approve`): you are shown the script, not what it writes. Putting the records out of an agent's reach takes a separate account, which this release
     does not do.
+20. On a slow file system a HELD agent's ordinary read can reach the user, because the guard
+    stopped resolving paths after 2 seconds (L1.1).
+21. A transcript is searched for message labels only up to its first 32 MiB and 10,000 message ids
+    (T1.7). A transcript cut off by either limit holds the session until the user types, so a session
+    resumed with a transcript over 32 MiB starts HELD, and a program's run (`claude -p`) on such a
+    transcript stays HELD throughout.
+22. A `codex` run whose first word after its options is `exec`, `e` or `review` is recognised as a
+    program's prompt and is told no notices (D1.8). One written with an option that takes a value
+    before that word (`codex -m <model> exec`) is not, and is told the notices as a person would be.
+23. A message older than the last 8 MiB of a Codex session record is not confirmed from the record;
+    it is confirmed when its delivery prompt reaches the guard (D1.1).
+24. A call with more than 1,000 strings in it is judged by its text alone, and for a HELD session it
+    is PROTECTED (L1.1).
+25. A notice shown by a hook that was killed before it wrote its answer is shown again (D1.8).
+26. A Lunchroom 1.0.1 program that is still running (a listener runs up to 23 hours) rewrites the
+    store without the 1.0.2 fields and without the layout number (D1.2): notices repeat and the
+    10-second gap before an offer is offered again is lost, until that session ends. Start sessions
+    anew after an upgrade; `lunchroom doctor` says so (C1.4).
 
 ## §16 The handout cards: the product does what they show
 
@@ -642,3 +899,60 @@ The six cards are printed. The product matches the cards.
 
 2. Tests: each card's three lines are replayed end to end with the card's agents, and Lunchroom's
    output contains the card's Lunchroom line.
+
+## §17 C2. The console (1.1, not in the 1.0.2 build)
+
+This section describes version 1.1. It is not part of the 1.0.2 build, and nothing in it is promised
+or tested for 1.0.2 except item 1, item 7 and the last rule of item 5.
+
+1. The 1.0.2 build ships the console and its guard rules switched off; `lunchroom install console`
+   says so and changes nothing. In that build the console's own lines and notices do not appear
+   (the line `lunchroom doctor` prints for the console's mode, and the notice that the console is
+   not running), the guard keeps no record of DENIED decisions (H1.8 keeps its 200 records), and a
+   HELD read of `/var/lib/lunchroom` or `/usr/local/lib/lunchroom` is not a read of a store, since
+   those folders exist only with the console.
+2. The `lunchroom` user and the store. `lunchroom install` creates the system user and group
+   `lunchroom`; the store moves to `/var/lib/lunchroom/<uid>/` (group `lunchroom`, a setgid folder,
+   mode 2770), and the program is installed at `/usr/local/lib/lunchroom/lunchroom`, setgid
+   `lunchroom`. The user is not in that group, so no process of the user's, an agent's included, can
+   enter the store; only the program can, through its own logic. A program running with that group
+   ignores `LUNCHROOM_HOME` and every other variable that sets a path, takes the store only from
+   the fixed folder, and drops the group before it runs any other program.
+3. The console runs as user `lunchroom`, in a terminal of the user's own that is owned by that user
+   and not by the developer (the controlling terminal A1.3 requires). It asks the passphrase once,
+   asks it again for every loosening action (`mode balanced`, `mode relaxed`, `yolo`), and locks
+   after 15 minutes without a key; `approve` and `unregister` within those 15 minutes ride on the
+   first passphrase. It shows the agents, the QUEUED and FAILED messages with their reasons, the
+   notices for the user, including those OpenClaw and Hermes cannot show (D1.8), the calls waiting
+   for approval with their age, the counts of DENIED decisions, the guard's timeouts and slow
+   decisions, and the checks of `lunchroom doctor`.
+4. The guard keeps each DENIED decision (time, session, reason word, and no command text) in its
+   records, up to 1,000 beside the 200 of H1.8, so that a burst of DENIED calls never pushes out an
+   undecided call. Five or more DENIED decisions in 10 minutes from one agent are a probing alert,
+   shown on the console and given to the user as a notice.
+5. Guard rules, each with a classifier test and an end-to-end test:
+   - a read or write of `/dev/pts/*`, `/dev/tty*` or `/dev/vcs*` other than the agent's own
+     controlling terminal is DENIED;
+   - `kill`, `pkill` or `killall` naming the console's process or the word `lunchroom` is DENIED;
+   - `gdb`, `strace`, `ltrace`, ptrace through `python` or `perl`, and `/proc/<pid>/mem`,
+     `environ`, `fd` and `maps` of a process that is not in the agent's own subtree, are DENIED;
+   - `tmux send-keys`, `capture-pane` and `pipe-pane`, and `screen -X stuff` and `hardcopy`, are
+     PROTECTED while the agent is HELD, and DENIED when the target is not the agent's own pane;
+   - `sudo`, `su`, `runuser`, `machinectl shell` and `pkexec` to user `lunchroom`, and any write to
+     `/var/lib/lunchroom`, `/usr/local/lib/lunchroom` or `/etc/lunchroom`, are DENIED;
+   - running the program with `console` is DENIED (A1.3).
+6. Limits, published with the 1.1 release: a person who walks away from an unlocked console for
+   under 15 minutes leaves `approve` open to whoever is at its keyboard, as `sudo`'s timeout does;
+   the console's own terminal cannot be read by the developer's processes, but the developer's
+   outer terminal, which relays to it, is owned by the developer, and a process that opens it can
+   race to read keystrokes, the passphrase included.
+7. A HELD read of `/etc/lunchroom`, where the passphrase verifiers are, is DENIED in every build
+   (L1.1).
+8. The console's wall (items 2 and 3) holds only where the developer's account needs a password
+   for `sudo`: an account with password-free `sudo`, as K1.10 describes, acts as root and as
+   `lunchroom`, and can read the store, kill the console and read its terminal, around the guard's
+   rules. `lunchroom install console` and `lunchroom doctor` read `sudo -n -l` for the developer:
+   where it allows any command without a password, install still sets the console up, and both say
+   plainly that the wall does not hold on this account until that rule is removed, and `lunchroom
+   doctor` prints that as a FAIL. The proof covers both accounts: one whose `sudo` asks for a
+   password (every attack refused) and one with password-free `sudo` (the FAIL line shown).

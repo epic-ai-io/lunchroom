@@ -25,6 +25,17 @@ pub struct Layout {
     /// Harness configuration that runs the guard, kept outside the usual places: the same
     /// variables, `OPENCLAW_CONFIG_PATH` and a Claude Code `--settings` file.
     pub guard_config_roots: Vec<PathBuf>,
+    /// The terminal devices that are the agent's own (1.1): the paths its controlling terminal has
+    /// (`/dev/pts/3`). Every other terminal device is another process's.
+    pub own_terminals: Vec<PathBuf>,
+    /// The harness process the agent's commands run under (1.1): the processes in its subtree are
+    /// the agent's own; no other process's `/proc` secrets may be read.
+    pub agent_root: Option<u32>,
+    /// The console's process id, from its liveness file (1.1), when it runs.
+    pub console_pid: Option<u32>,
+    /// The agent's own tmux pane (`TMUX_PANE`, `%3`) and screen session (`STY`), when it has them.
+    pub own_pane: Option<String>,
+    pub own_screen: Option<String>,
 }
 
 impl Layout {
@@ -39,6 +50,11 @@ impl Layout {
             programs: Vec::new(),
             transcript_roots: Vec::new(),
             guard_config_roots: Vec::new(),
+            own_terminals: Vec::new(),
+            agent_root: None,
+            console_pid: None,
+            own_pane: None,
+            own_screen: None,
         }
     }
 
@@ -91,9 +107,18 @@ impl Layout {
         let in_lunchroom = p.starts_with(&self.lunchroom_home);
         let in_program = p.starts_with(&self.program_dir) || self.programs.iter().any(|q| p == q);
         let (seg_store, seg_program) = lunchroom_segments(&segs);
+        // The console's wall holds every path in its system folders but the setgid program itself
+        // (which `system_store` leaves out): a file planted beside the program is the store's
+        // kind, DENIED, even where that folder is also the program folder of this layout.
+        // `/var/lib/lunchroom` and the program folder are 1.1 only (feature `console`): 1.0.2
+        // ships the console off, and they are not Lunchroom's stores there. `/etc/lunchroom`, the
+        // passphrase checks, is a store in every build (L1.1, K1.11).
+        let system = system_store(p);
         Facts {
-            store: (in_lunchroom && !in_program) || seg_store,
-            program: in_program || seg_program,
+            store: (in_lunchroom && !in_program) || seg_store || system,
+            program: in_program || seg_program || p == Path::new(crate::setgid::PROGRAM),
+            terminal: terminal_device(p) && !self.own_terminals.iter().any(|t| t == p),
+            secret_pid: process_secret_pid(p, &segs),
             transcript: in_process_folder(p, &segs)
                 || TRANSCRIPT_SEQS.iter().any(|s| has_seq(&segs, s))
                 || self.transcript_roots.iter().any(|r| p.starts_with(r)),
@@ -147,6 +172,12 @@ pub struct Facts {
     pub store: bool,
     /// Lunchroom's program.
     pub program: bool,
+    /// A terminal device (`/dev/pts/N`, `/dev/ttyN`, `/dev/vcs*`) that is not the agent's own
+    /// controlling terminal (1.1). `/dev/tty` names the caller's own and is never one.
+    pub terminal: bool,
+    /// `/proc/<pid>/{mem,environ,fd,maps}` (or below): the process id, which the caller compares
+    /// with the agent's own subtree (1.1). `/proc/self/...` is the command's own process and none.
+    pub secret_pid: Option<u32>,
     /// A harness transcript or session store, or a process's folder in `/proc` (L1.1).
     pub transcript: bool,
     /// A credential path (L1.1).
@@ -237,6 +268,62 @@ fn in_process_folder(p: &Path, segs: &[String]) -> bool {
             matches!(s.as_str(), "self" | "thread-self")
                 || (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         })
+}
+
+/// The folders and files of the console's wall: the passphrase checks (`/etc/lunchroom`), in every
+/// build (they exist from 1.0.2, A1.3, and a HELD agent's read of one is DENIED, L1.1); and, with
+/// the console (1.1, feature `console`) only, the store folders (`/var/lib/lunchroom`) and
+/// everything in the program folder except the program itself.
+fn system_store(p: &Path) -> bool {
+    p.starts_with("/etc/lunchroom")
+        || (cfg!(feature = "console")
+            && (p.starts_with(crate::setgid::STORE_ROOT)
+                || (p.starts_with(crate::setgid::PROGRAM_DIR)
+                    && p != Path::new(crate::setgid::PROGRAM))))
+}
+
+/// A terminal device other than `/dev/tty` itself: `/dev/pts/N`, `/dev/ttyN`, `/dev/ttySN`,
+/// `/dev/vcs`, `/dev/vcsN`, `/dev/vcsaN`. The folder `/dev/pts` alone is not one.
+fn terminal_device(p: &Path) -> bool {
+    if p.starts_with("/dev/pts") {
+        return p != Path::new("/dev/pts");
+    }
+    p.parent() == Some(Path::new("/dev"))
+        && p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| (n.starts_with("tty") && n != "tty") || n.starts_with("vcs"))
+}
+
+/// The process id in `/proc/<pid>/{mem,environ,fd,maps}` or below one of them.
+fn process_secret_pid(p: &Path, segs: &[String]) -> Option<u32> {
+    if !p.starts_with("/proc") {
+        return None;
+    }
+    let pid = segs.get(1)?.parse::<u32>().ok()?;
+    segs.get(2)
+        .is_some_and(|s| matches!(s.as_str(), "mem" | "environ" | "fd" | "maps"))
+        .then_some(pid)
+}
+
+/// The paths a controlling terminal with the number `tty_nr` (field 7 of `/proc/<pid>/stat`) has:
+/// `/dev/pts/N` for a pseudo-terminal, `/dev/ttyN` for a virtual console, `/dev/ttySN` for a serial
+/// line; none for 0 (no terminal) or a device not known here.
+#[must_use]
+pub fn terminal_paths(tty_nr: u64) -> Vec<PathBuf> {
+    if tty_nr == 0 {
+        return Vec::new();
+    }
+    let major = (tty_nr >> 8) & 0xfff;
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+    match major {
+        136..=143 => vec![PathBuf::from(format!(
+            "/dev/pts/{}",
+            (major - 136) * 256 + minor
+        ))],
+        4 if minor < 64 => vec![PathBuf::from(format!("/dev/tty{minor}"))],
+        4 => vec![PathBuf::from(format!("/dev/ttyS{}", minor - 64))],
+        _ => Vec::new(),
+    }
 }
 
 /// The normal components of a path, as text.
@@ -389,6 +476,93 @@ mod tests {
         assert!(prog.program && !prog.store);
         assert!(l.facts(Path::new("/home/u/.lunchroom")).store);
         assert!(!l.facts(Path::new("/home/u/project/src/main.rs")).transcript);
+    }
+
+    // 1.1: the paths a controlling terminal number has, from the kernel's encoding of the device.
+    #[test]
+    fn terminal_numbers_name_their_devices() {
+        let nr = |major: u64, minor: u64| (major << 8) | (minor & 0xff) | ((minor & !0xff) << 12);
+        assert_eq!(terminal_paths(0), Vec::<PathBuf>::new());
+        assert_eq!(
+            terminal_paths(nr(136, 3)),
+            vec![PathBuf::from("/dev/pts/3")]
+        );
+        assert_eq!(
+            terminal_paths(nr(136, 255)),
+            vec![PathBuf::from("/dev/pts/255")]
+        );
+        assert_eq!(
+            terminal_paths(nr(137, 4)),
+            vec![PathBuf::from("/dev/pts/260")]
+        );
+        assert_eq!(terminal_paths(nr(4, 2)), vec![PathBuf::from("/dev/tty2")]);
+        assert_eq!(terminal_paths(nr(4, 65)), vec![PathBuf::from("/dev/ttyS1")]);
+        assert_eq!(terminal_paths(nr(5, 0)), Vec::<PathBuf>::new());
+    }
+
+    // 1.1: another terminal device, `/proc/<pid>/{mem,environ,fd,maps}`, and the stores and
+    // program folder of the console are facts; the agent's own terminal, `/dev/tty`, `/dev/pts`
+    // itself, `/proc/<pid>/status` and the program are not (the program is the program).
+    #[test]
+    fn the_console_wall_facts() {
+        let mut l = layout();
+        l.own_terminals = vec![PathBuf::from("/dev/pts/3")];
+        for p in [
+            "/dev/pts/7",
+            "/dev/tty1",
+            "/dev/ttyS0",
+            "/dev/vcs1",
+            "/dev/vcsa2",
+        ] {
+            assert!(l.facts(Path::new(p)).terminal, "{p}");
+        }
+        for p in [
+            "/dev/pts/3",
+            "/dev/tty",
+            "/dev/pts",
+            "/dev/null",
+            "/dev/stdout",
+        ] {
+            assert!(!l.facts(Path::new(p)).terminal, "{p}");
+        }
+        assert_eq!(l.facts(Path::new("/proc/42/environ")).secret_pid, Some(42));
+        assert_eq!(l.facts(Path::new("/proc/42/fd/3")).secret_pid, Some(42));
+        assert_eq!(l.facts(Path::new("/proc/42/maps")).secret_pid, Some(42));
+        assert_eq!(l.facts(Path::new("/proc/42/mem")).secret_pid, Some(42));
+        for p in [
+            "/proc/42/status",
+            "/proc/self/environ",
+            "/proc/loadavg",
+            "/proc/42",
+        ] {
+            assert_eq!(l.facts(Path::new(p)).secret_pid, None, "{p}");
+        }
+        // DV-09: the passphrase checks in `/etc/lunchroom` are a store in every build (a HELD
+        // agent's read of one is DENIED, L1.1, K1.11); the console's other two system folders are
+        // stores only with the console (1.1).
+        for p in [
+            "/etc/lunchroom",
+            "/etc/lunchroom/1000.verifier",
+            "/etc/lunchroom/1000.verifier.tmp",
+        ] {
+            assert!(l.facts(Path::new(p)).store, "{p}");
+        }
+        for p in [
+            "/var/lib/lunchroom",
+            "/var/lib/lunchroom/1000/store/state.json",
+            "/usr/local/lib/lunchroom/other",
+        ] {
+            assert_eq!(
+                l.facts(Path::new(p)).store,
+                cfg!(feature = "console"),
+                "{p}"
+            );
+        }
+        assert!(!l.facts(Path::new("/etc/lunchrooms/x")).store);
+        let program = l.facts(Path::new("/usr/local/lib/lunchroom/lunchroom"));
+        assert!(program.program && !program.store);
+        assert!(!l.facts(Path::new("/var/lib/lunchrooms")).store);
+        assert!(!l.facts(Path::new("/usr/local/lib/lunchroom-other")).store);
     }
 
     // §11 L1.1: each credential pattern, by name and by folder.

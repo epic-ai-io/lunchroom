@@ -1,0 +1,28 @@
+# Proof 1 (packages), apk: Claude Code from Anthropic's own apk repository on Alpine Linux.
+#
+# The repository setup is Anthropic's, copied from "Install with Linux package managers" (apk tab)
+# at https://code.claude.com/docs/en/setup.md (read 2026-11-03): the key from
+# https://downloads.claude.ai/keys/claude-code.rsa.pub (sha256
+# 395759c1f7449ef4cdef305a42e820f3c766d6090d142634ebdb049f113168b6, checked by the build) and the
+# repository https://downloads.claude.ai/claude-code/apk/stable. The page's "Alpine Linux and
+# musl-based distributions" section adds the runtime packages bash, curl, libgcc, libstdc++ and
+# ripgrep, and USE_BUILTIN_RIPGREP=0.
+#
+# Build context: made by ../prove.sh.
+FROM alpine:latest
+
+ENV DISTRO=apk
+ENV USE_BUILTIN_RIPGREP=0
+RUN apk add --no-cache bash curl libgcc libstdc++ ripgrep ca-certificates \
+      sudo python3 procps su-exec coreutils
+
+RUN wget -O /etc/apk/keys/claude-code.rsa.pub https://downloads.claude.ai/keys/claude-code.rsa.pub \
+ && echo "395759c1f7449ef4cdef305a42e820f3c766d6090d142634ebdb049f113168b6  /etc/apk/keys/claude-code.rsa.pub" | sha256sum -c - \
+ && echo "https://downloads.claude.ai/claude-code/apk/stable" >> /etc/apk/repositories \
+ && apk add claude-code
+
+COPY lunchroom lib.sh ptyrun.py sessionpty.py plaintext.py hang.py inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/sessionpty.py \
+      /opt/proof/plaintext.py /opt/proof/hang.py
+
+CMD ["/opt/proof/inner.sh"]

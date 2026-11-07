@@ -1,0 +1,26 @@
+# Proof 7 (codex): the real Codex CLI, its real hooks, a real apply_patch call, and what the user sees
+# of Lunchroom's multi-line hook text in Codex.
+#
+# Codex is OpenAI's own npm package @openai/codex, pinned to 0.166.0, the release the host facts
+# (docs/host-facts/codex-apply-patch.md) were read at; install: `npm install -g @openai/codex`
+# (https://github.com/openai/codex, "Installing and running Codex CLI"). The build stops if the
+# installed release is not 0.166.0.
+#
+# Build context: made by ../prove.sh.
+FROM docker.io/library/node:22
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISTRO=npm
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sudo python3 python3-pyte procps util-linux ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @openai/codex@0.166.0 \
+ && codex --version | tee /tmp/codex.version \
+ && grep -qx 'codex-cli 0.166.0' /tmp/codex.version
+
+COPY lunchroom lib.sh ptyrun.py sessionpty.py plaintext.py codexmock.py screen.py tee-hook.sh inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/sessionpty.py \
+      /opt/proof/plaintext.py /opt/proof/codexmock.py /opt/proof/screen.py /opt/proof/tee-hook.sh
+
+CMD ["/opt/proof/inner.sh"]

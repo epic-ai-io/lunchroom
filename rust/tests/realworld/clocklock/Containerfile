@@ -1,0 +1,16 @@
+# Proof 5 (clock skew and lock contention): Lunchroom 1.0.2 on Ubuntu 24.04, no Claude Code needed.
+#
+# Build context: made by ../prove.sh (the static `lunchroom` program, the files of ../common and
+# the files of this folder, side by side).
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sudo python3 procps util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY lunchroom lib.sh ptyrun.py plaintext.py hook.py hold.py msg.py inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/plaintext.py \
+      /opt/proof/hook.py /opt/proof/hold.py /opt/proof/msg.py
+
+CMD ["/opt/proof/inner.sh"]

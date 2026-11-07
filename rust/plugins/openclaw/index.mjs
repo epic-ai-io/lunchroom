@@ -200,9 +200,22 @@ export async function beforeToolCall(event, ctx, program = PROGRAM) {
   // A call the guard cannot judge goes to the user where a person can answer, else it is DENIED;
   // one the rules needing no record DENY is DENIED.
   // The request shows the call in full (A1.4).
+  // Each message says what happened, why and what happens next in its first line.
   const notJudged = (why) => {
-    if (deniedWithoutRecord(event)) return { block: true, blockReason: `Lunchroom: DENIED. ${why}` };
-    return channel ? approval(`Lunchroom: ${why} Any script this call runs was not read.${shown(event, ctx)}`) : { block: true, blockReason: `Lunchroom: ${why}` };
+    if (deniedWithoutRecord(event)) {
+      return {
+        block: true,
+        blockReason:
+          `Lunchroom ${why} This call is DENIED, because it names Lunchroom or another agent's session, ` +
+          "which Lunchroom never lets through unchecked.",
+      };
+    }
+    return channel
+      ? approval(
+          `Lunchroom ${why} It needs your yes: answer this prompt (yes runs the call once, no stops it). ` +
+            `Lunchroom did not read any script this call runs.${shown(event, ctx)}`,
+        )
+      : { block: true, blockReason: `Lunchroom ${why} Nobody can be asked in this session, so this call is DENIED.` };
   };
   // What the plugin knows that the guard's record may not: no session, or another agent's text
   // that reached the session unjudged. The guard still answers for the call when it can.
@@ -323,11 +336,29 @@ export function failClosed(handler, onError) {
   };
 }
 
+// A prompt OpenClaw is told to block. `reason` is OpenClaw's internal detail and `message` is what
+// it shows the user in place of the prompt, behind "Your message could not be sent:"
+// (openclaw/openclaw tag v2026.10.7, `src/plugins/hook-decision-types.ts:13-30`, `:32-46`), so the
+// text goes in both.
+function blocked(text) {
+  const said = (text || "").trim() || "Lunchroom blocked this prompt.";
+  return { outcome: "block", reason: said, message: said };
+}
+
 // before_agent_run: the turn's prompt reaches the guard. Lunchroom's delivery is confirmed here
 // and a repeated one is blocked; the user's own turn clears HELD; another session's text holds.
 // When the guard cannot judge it, or its program is missing, a prompt that is not the user's own
 // typing, or that carries Lunchroom's labels, is blocked, since nothing could hold the session it
 // reaches (H1.5, T1); the user's own typing still goes on.
+//
+// What this hook can show: nothing, when the prompt goes on. OpenClaw reads the hook's answer only
+// for a block (`src/agents/harness/before-agent-run.ts:34-36`: any outcome but "block" returns
+// undefined), and `before_prompt_build`, the hook that can add context (`prependContext`,
+// `src/plugins/hook-before-agent-start.types.ts:30-33`), runs before this one in a turn
+// (`src/agents/embedded-agent-runner/run/attempt-prompt-phase.ts:203` and `:234`), so the guard's
+// answer cannot reach it in the same turn. The guard is therefore told it can show the user and the
+// agent nothing here (`can_show_user: false`, `can_tell_agent: false`): it takes no notice that
+// would be lost, and `lunchroom status` shows what waits.
 export async function beforeAgentRun(event, ctx, program = PROGRAM) {
   if (ctx && ctx.runId) surfaces.set(ctx.runId, personCanAnswer(ctx));
   if (!sessionOf(ctx)) return { outcome: "pass" };
@@ -338,24 +369,36 @@ export async function beforeAgentRun(event, ctx, program = PROGRAM) {
     prompt,
     prompt_id: (ctx && ctx.runId) || "",
     user_typed: typed,
+    can_show_user: false,
+    can_tell_agent: false,
   }, program);
   if (run.status === 2) {
-    return { outcome: "block", reason: run.stderr.trim() || "Lunchroom: blocked" };
+    return blocked(run.stderr);
   }
   if (typed && run.status === 0) unjudged.delete(sessionOf(ctx));
   const notJudged = run.failed || run.missing;
   if (notJudged && (!typed || ENVELOPE_LABELS.some((l) => prompt.includes(l)))) {
     const why = run.failed || "its program is missing";
-    return { outcome: "block", reason: `Lunchroom could not check this prompt: ${why}.` };
+    return blocked(
+      `Lunchroom could not check this prompt: ${why}. It carries another agent's text or did not come from you, ` +
+        "so Lunchroom blocked it. Send it again once `lunchroom doctor` shows Lunchroom works.",
+    );
   }
   return { outcome: "pass" };
 }
 
-// agent_end: the turn is over; the next waiting message goes to the session (D1.1).
+// agent_end: the turn is over; the next waiting message goes to the session (D1.1). The guard's
+// listener hands the message over itself (it starts `openclaw agent`, openclaw.rs) and OpenClaw has
+// nothing to show from this hook: its handler has no result (`src/plugins/hook-types.ts:830-833`,
+// `:865`), so the listener's text is not read.
 export async function agentEnd(event, ctx, program = PROGRAM) {
   if (ctx && ctx.runId) surfaces.delete(ctx.runId);
   if (!sessionOf(ctx)) return;
-  await runGuard(["listen", "--once"], base(event, ctx, "Stop"), program);
+  await runGuard(
+    ["listen", "--once"],
+    { ...base(event, ctx, "Stop"), can_show_user: false, can_tell_agent: false },
+    program,
+  );
 }
 
 // resolve_exec_env: the session's name for `lunchroom send` in this exec command (I1.2).
@@ -383,7 +426,7 @@ export default {
   register(api) {
     api.on("before_tool_call", failClosed(beforeToolCall, (event, ctx, e) => ({
       block: true,
-      blockReason: `Lunchroom: DENIED. could not check this call: ${e && e.message}.`,
+      blockReason: `Lunchroom could not check this call: ${e && e.message}. This call is DENIED.`,
     })));
     api.on("after_tool_call", failClosed(afterToolCall, () => undefined));
     api.on("before_agent_run", failClosed(beforeAgentRun, (event, ctx, e) => {
@@ -394,7 +437,9 @@ export default {
       } catch {
         // Not shown to be the user's.
       }
-      return typed ? { outcome: "pass" } : { outcome: "block", reason: `Lunchroom could not check this prompt: ${e && e.message}.` };
+      return typed
+        ? { outcome: "pass" }
+        : blocked(`Lunchroom could not check this prompt: ${e && e.message}. Lunchroom blocked it because it did not come from you.`);
     }));
     api.on("agent_end", failClosed(agentEnd, () => undefined));
     api.on("resolve_exec_env", (event, ctx) => resolveExecEnv(event, ctx));

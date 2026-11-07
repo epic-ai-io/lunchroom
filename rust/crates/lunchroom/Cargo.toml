@@ -14,6 +14,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The console (1.1): `lunchroom console` and `lunchroom install console`. Built but switched off
+# in 1.0.2; the 1.1 release builds with it on.
+console = ["lunchroom-core/console"]
+
 [dependencies]
 lunchroom-core = { path = "../lunchroom-core" }
 serde.workspace = true

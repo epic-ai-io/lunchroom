@@ -1,0 +1,37 @@
+# Proof 9 (hermes): the real Hermes Agent at commit 9976f4857b72439d79016354d7b6e1a3ee952e2f, Lunchroom's
+# real plugin loaded in it, and the paths a tool call takes through the plugin.
+#
+# Hermes is NousResearch/hermes-agent, the commit the host facts (docs/host-facts/openclaw-and-hermes.md)
+# were read at; its core dependencies are installed only on Python 3.14 (pyproject.toml marks every
+# one `python_version >= '3.14'`), from its own uv.lock: `uv sync --frozen`. The build stops if the
+# checkout is not that commit.
+#
+# Build context: made by ../prove.sh.
+FROM docker.io/library/python:3.14
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISTRO=git
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git sudo procps util-linux ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# A shallow fetch of that one commit (the full history made the layer too large for a tight disk:
+# the build failed with "no space left on device" twice on 2026-11-04); the checkout is the same commit.
+ENV UV_NO_CACHE=1
+RUN mkdir /opt/hermes-agent && cd /opt/hermes-agent \
+ && git init -q . \
+ && git remote add origin https://github.com/NousResearch/hermes-agent.git \
+ && git fetch -q --depth 1 origin 9976f4857b72439d79016354d7b6e1a3ee952e2f \
+ && git checkout -q FETCH_HEAD \
+ && test "$(git -C /opt/hermes-agent rev-parse HEAD)" = 9976f4857b72439d79016354d7b6e1a3ee952e2f \
+ && pip install -q --no-cache-dir uv \
+ && cd /opt/hermes-agent && uv sync --frozen \
+ && ln -s /opt/hermes-agent/.venv/bin/hermes /usr/local/bin/hermes \
+ && chmod -R a+rX /opt/hermes-agent \
+ && hermes --version | head -1
+
+COPY lunchroom lib.sh ptyrun.py plaintext.py chatmock.py inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/plaintext.py \
+      /opt/proof/chatmock.py
+
+CMD ["/opt/proof/inner.sh"]

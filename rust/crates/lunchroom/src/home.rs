@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lunchroom_core::paths::{Layout, normalize};
+use lunchroom_core::setgid;
 
 /// `p` as the classifier compares paths: absolute, with symlinks followed where it exists and
 /// `.` and `..` resolved, so a store reached by another spelling of the same folder is still
@@ -17,6 +18,28 @@ fn resolve(p: &Path) -> PathBuf {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         normalize(&p.to_string_lossy(), &cwd, Path::new("/"))
     })
+}
+
+/// Program names of the harnesses whose subtree is an agent's own.
+const HARNESS_NAMES: [&str; 5] = ["claude", "codex", "opencode", "openclaw", "hermes"];
+
+/// The variables a setgid process ignores because they set a path (1.1).
+const PATH_VARS: [&str; 5] = [
+    "HOME",
+    "LUNCHROOM_HOME",
+    "CODEX_HOME",
+    "HERMES_HOME",
+    "CLAUDE_CONFIG_DIR",
+];
+
+/// Claude Code's user settings folder (H1.4): `CLAUDE_CONFIG_DIR` when it is set and not empty,
+/// else `~/.claude`. Install and uninstall find and write this folder, as `lunchroom doctor` reads
+/// it.
+#[must_use]
+pub fn claude_home(config_dir: Option<String>, home: &Path) -> PathBuf {
+    config_dir
+        .filter(|d| !d.is_empty())
+        .map_or_else(|| home.join(".claude"), PathBuf::from)
 }
 
 /// The process's view of where it runs.
@@ -34,6 +57,8 @@ pub struct Env {
     pub claude_session: Option<String>,
     /// `CODEX_THREAD_ID`, as Codex sets it in an agent's commands (measured, codex-cli 0.163.0).
     pub codex_thread: Option<String>,
+    /// Claude Code's user settings folder: `CLAUDE_CONFIG_DIR`, or `~/.claude` (see [`claude_home`]).
+    pub claude_home: PathBuf,
     /// Codex's folder: `CODEX_HOME`, or `~/.codex`.
     pub codex_home: PathBuf,
     /// Hermes's folder: `HERMES_HOME`, or `~/.hermes`.
@@ -53,15 +78,39 @@ impl Env {
     /// # Errors
     /// When `HOME` is unset or empty.
     pub fn from_process() -> Result<Self, String> {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let home = resolve(&PathBuf::from(var("HOME").ok_or("HOME is not set")?));
-        let lunchroom_home =
-            resolve(&var("LUNCHROOM_HOME").map_or_else(|| home.join(".lunchroom"), PathBuf::from));
+        let ids = setgid::current();
+        let hostile = ids.is_some_and(setgid::is_setgid);
+        let env_var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        // A setgid process (1.1) reads no variable that sets a path: its environment was chosen by
+        // the developer or an agent running as them.
+        let var = |k: &str| {
+            if hostile && PATH_VARS.contains(&k) {
+                None
+            } else {
+                env_var(k)
+            }
+        };
+        let home = if hostile {
+            let uid = ids.map_or(0, |i| i.uid);
+            let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+            resolve(&setgid::home_from_passwd(&passwd, uid).ok_or(
+                "the home folder of this user is not in /etc/passwd, and the environment is not \
+                 trusted to name it",
+            )?)
+        } else {
+            resolve(&PathBuf::from(var("HOME").ok_or("HOME is not set")?))
+        };
+        let lunchroom_home = resolve(&setgid::lunchroom_home(
+            ids,
+            var("LUNCHROOM_HOME").map(PathBuf::from),
+            &home,
+        ));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let codex_home = var("CODEX_HOME").map_or_else(|| home.join(".codex"), PathBuf::from);
         let hermes_home = var("HERMES_HOME").map_or_else(|| home.join(".hermes"), PathBuf::from);
+        let claude_home = claude_home(var("CLAUDE_CONFIG_DIR"), &home);
         Ok(Self {
             home,
             lunchroom_home,
@@ -72,10 +121,49 @@ impl Env {
             codex_thread: var("CODEX_THREAD_ID"),
             hermes_session: var("HERMES_SESSION_ID"),
             lunchroom_session: var("LUNCHROOM_SESSION"),
+            claude_home,
             codex_home,
             hermes_home,
             now,
         })
+    }
+
+    /// The view of the console (1.1), which runs as the user `lunchroom` for the developer with
+    /// user id `uid`: the developer's home folder from the account database, Lunchroom's folder
+    /// the fixed `/var/lib/lunchroom/<uid>`, and no variable of the environment read.
+    ///
+    /// # Errors
+    /// When the account database has no home folder for `uid`.
+    #[cfg(feature = "console")]
+    pub fn for_console(uid: u32) -> Result<Self, String> {
+        let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+        let home = setgid::home_from_passwd(&passwd, uid)
+            .ok_or_else(|| format!("the home folder of user {uid} is not in /etc/passwd"))?;
+        Ok(Self::console_view(uid, home))
+    }
+
+    /// [`Env::for_console`] with the home folder given.
+    #[must_use]
+    #[cfg(feature = "console")]
+    pub fn console_view(uid: u32, home: PathBuf) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Self {
+            claude_home: home.join(".claude"),
+            codex_home: home.join(".codex"),
+            hermes_home: home.join(".hermes"),
+            lunchroom_home: setgid::store_home(uid),
+            home,
+            claude_pid: None,
+            attended: None,
+            entrypoint: None,
+            claude_session: None,
+            codex_thread: None,
+            hermes_session: None,
+            lunchroom_session: None,
+            now,
+        }
     }
 
     /// The folder of Lunchroom's crash-safe store.
@@ -84,16 +172,48 @@ impl Env {
         self.lunchroom_home.join("store")
     }
 
+    /// What the console's wall (1.1) needs to know about the agent: its harness process, its own
+    /// terminal, tmux pane and screen session, and the console's process.
+    fn console_wall_facts(&self, layout: &mut Layout) {
+        let ancestors = ancestors();
+        let harness = self.claude_pid.or_else(|| {
+            ancestors.iter().copied().find(|pid| {
+                crate::process::name(*pid).is_some_and(|n| HARNESS_NAMES.contains(&n.as_str()))
+            })
+        });
+        layout.agent_root = harness;
+        // The terminal of the harness, else of the nearest process above this one that has one.
+        let tty = harness
+            .into_iter()
+            .chain(ancestors.iter().copied())
+            .find_map(|pid| crate::process::tty(pid).filter(|t| *t != 0));
+        if let Some(nr) = tty {
+            layout.own_terminals = lunchroom_core::paths::terminal_paths(nr);
+        }
+        // 1.1 only (feature `console`): no console runs in a 1.0.2 build.
+        #[cfg(feature = "console")]
+        {
+            layout.console_pid = crate::console::alive_pid(&self.lunchroom_home);
+        }
+        layout.own_pane = std::env::var("TMUX_PANE").ok().filter(|v| !v.is_empty());
+        layout.own_screen = std::env::var("STY").ok().filter(|v| !v.is_empty());
+    }
+
     /// Where Lunchroom and the harnesses keep their files, for the classifier.
     #[must_use]
     pub fn layout(&self) -> Layout {
         let mut layout = Layout::for_home(&self.home);
-        layout.program_dir = self.lunchroom_home.join("bin");
+        layout.program_dir = if setgid::active() {
+            PathBuf::from(setgid::PROGRAM_DIR)
+        } else {
+            self.lunchroom_home.join("bin")
+        };
         layout.lunchroom_home.clone_from(&self.lunchroom_home);
         if let Ok(exe) = std::env::current_exe() {
             layout.programs.push(exe);
         }
         Locations::gather(self).apply(&mut layout);
+        self.console_wall_facts(&mut layout);
         layout
     }
 }

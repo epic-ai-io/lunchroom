@@ -4,7 +4,7 @@
 //! times), §1 V1.2 (the words come from the one table), §2 R1.3 and R1.4, §3 R2.2, §4 R3.2.
 
 use crate::loops::LOOP_COUNT;
-use crate::vocab::{AgentState, Reason, Verdict, Word};
+use crate::vocab::{AgentState, MessageState, Reason, Verdict, Word};
 
 /// A table word in sentence case, as the cards print a verdict at the start of a sentence.
 fn sentence(word: &str) -> String {
@@ -122,6 +122,23 @@ pub fn stopped(agent: &str) -> String {
     format!("{agent} is {}.", AgentState::Stopped.word())
 }
 
+/// What the sender is told of message `id` when Lunchroom handed it to the recipient's session and
+/// the session has not yet shown that it took it (D1.3): it stays QUEUED, it may still arrive, and
+/// what to do. It starts with `<id>: Not confirmed; still QUEUED`.
+#[must_use]
+pub fn not_confirmed(id: &str) -> String {
+    format!(
+        "{id}: Not confirmed; still {}. Lunchroom handed the message to the session but has not \
+         yet seen it arrive, so it may still arrive. Nothing is needed: Lunchroom keeps looking and \
+         tells you when it is {} or has {} after {} tries. Do not send it again; `lunchroom status` \
+         shows where it stands.",
+        MessageState::Queued.word(),
+        MessageState::Delivered.word(),
+        MessageState::Failed.word(),
+        crate::mail::MAX_ATTEMPTS
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +189,18 @@ mod tests {
         assert_eq!(unguarded("Mistral"), "Mistral is UNGUARDED.");
         assert_eq!(conversation_halted(), "Conversation halted.");
         assert_eq!(stopped("Mistral"), "Mistral is STOPPED.");
+    }
+
+    // G2-21: a message handed over and not yet seen arrive is reported with what it means and what
+    // to do, in full; it still starts with the words the sender's report always began with.
+    #[test]
+    fn a_message_not_yet_confirmed_says_what_to_do() {
+        assert_eq!(
+            not_confirmed("lr-00000007"),
+            "lr-00000007: Not confirmed; still QUEUED. Lunchroom handed the message to the \
+             session but has not yet seen it arrive, so it may still arrive. Nothing is needed: \
+             Lunchroom keeps looking and tells you when it is DELIVERED or has FAILED after 3 \
+             tries. Do not send it again; `lunchroom status` shows where it stands."
+        );
     }
 }

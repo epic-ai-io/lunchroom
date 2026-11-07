@@ -122,23 +122,59 @@ fn fold(c: char) -> char {
 
 /// A keyword (any case) at `i`, then `\s*[:=]\s*` and at least 6 characters that are not spaces.
 fn keyword_assignment(s: &[char], i: usize) -> bool {
-    KEYWORDS.iter().any(|kw| {
+    keyword_end(s, i).is_some()
+}
+
+/// Where the value ends, when [`keyword_assignment`] matches at `i`.
+fn keyword_end(s: &[char], i: usize) -> Option<usize> {
+    KEYWORDS.iter().find_map(|kw| {
         let len = kw.chars().count();
-        let Some(word) = s.get(i..i + len) else {
-            return false;
-        };
+        let word = s.get(i..i + len)?;
         if !word.iter().zip(kw.chars()).all(|(a, b)| fold(*a) == b) {
-            return false;
+            return None;
         }
         let mut k = i + len;
         k += run(s, k, is_space);
         if !matches!(s.get(k), Some(':' | '=')) {
-            return false;
+            return None;
         }
         k += 1;
         k += run(s, k, is_space);
-        run(s, k, |c| !is_space(c)) >= 6
+        let value = run(s, k, |c| !is_space(c));
+        (value >= 6).then_some(k + value)
     })
+}
+
+/// What stands in the place of a secret in text that is kept.
+pub const REMOVED: &str = "[secret removed]";
+
+/// `text` with every secret [`has_secret`] finds replaced by [`REMOVED`]: a keyword's value, a
+/// token or key to the end of its word, and a private key's header with all the text after it.
+/// Text with no secret in it is returned as it was.
+#[must_use]
+pub fn redact(text: &str) -> String {
+    let s: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < s.len() {
+        if secret_at(&s, i) {
+            out.push_str(REMOVED);
+            i = secret_end(&s, i).max(i + 1);
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Where the secret that [`secret_at`] found at `i` ends.
+fn secret_end(s: &[char], i: usize) -> usize {
+    if starts(s, i, "-----BEGIN ") {
+        // The key's lines follow the header: none of them is kept.
+        return s.len();
+    }
+    keyword_end(s, i).unwrap_or_else(|| i + run(s, i, |c| !is_space(c)))
 }
 
 /// Verbs that ask for something to be handed over (L1.4: send, share, paste).
@@ -441,5 +477,35 @@ mod tests {
         ] {
             assert!(!asks_for_secret(text), "{text}");
         }
+    }
+
+    // G1-4: text kept (the guard's records) has each secret replaced and the rest left as it was.
+    // Samples are assembled here, as in the test above.
+    #[test]
+    fn redact_replaces_each_secret_and_nothing_else() {
+        let x36 = "a".repeat(36);
+        let token = format!("ghp_{x36}");
+        assert_eq!(
+            redact(&format!("curl -H {token} https://example.com")),
+            format!("curl -H {REMOVED} https://example.com")
+        );
+        let assignment = ["pass", "word: hunter22 and more"].concat();
+        assert_eq!(redact(&assignment), format!("{REMOVED} and more"));
+        assert_eq!(
+            redact(&["export API", "_KEY=abcdef123 && ls"].concat()),
+            format!("export {REMOVED} && ls")
+        );
+        let uri = ["mongodb://u:p", "@host/db ok"].concat();
+        assert_eq!(redact(&uri), format!("{REMOVED} ok"));
+        let word = "KEY";
+        let key =
+            format!("-----BEGIN RSA PRIVATE {word}-----\nMIIB\n-----END RSA PRIVATE {word}-----");
+        assert_eq!(redact(&format!("see {key}")), format!("see {REMOVED}"));
+        assert_eq!(redact("git push origin main"), "git push origin main");
+        assert_eq!(redact(""), "");
+        // What it leaves holds no secret, and redacting again changes nothing.
+        let once = redact(&format!("a {token} b {assignment}"));
+        assert!(!has_secret(&once), "{once}");
+        assert_eq!(redact(&once), once);
     }
 }

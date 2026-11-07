@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::approvals::{Approval, Request};
 use crate::identity::{Harness, Identity};
@@ -20,6 +21,28 @@ use crate::vocab::{AgentState, MessageState, Reason};
 
 /// Failed delivery attempts after which a message is FAILED (D1.4).
 pub const MAX_ATTEMPTS: u32 = 3;
+
+/// The number a store written by this program carries, so a later program can tell a store an
+/// older program rewrote (it drops the number) from one this program wrote. 1.0.1 wrote none.
+pub const SCHEMA: u32 = 2;
+
+/// Seconds a failed hand-over waits before the same message is offered again: attempts that fail
+/// at once (a program that exits with an error) are not used up back to back.
+pub const RETRY_GAP_SECS: u64 = 10;
+
+/// Seconds a stamp may stand ahead of a process's own clock before it is taken for a stamp from a
+/// clock that stepped back. Two processes read the clock at different moments, and a check that
+/// waited for the store's lock reads an older one than the hand-over it finds.
+pub const FUTURE_SLACK_SECS: u64 = 5;
+
+/// How many notices a list keeps: past it the oldest are dropped, and one line says how many.
+pub const NOTICES_KEPT: usize = 50;
+
+/// How many notices of one message a list keeps.
+const NOTICES_PER_MESSAGE: usize = 8;
+
+/// How long the notices of a session that is no longer running are kept: a day.
+pub const GONE_NOTICE_SECS: u64 = 86_400;
 
 /// The longest message text Lunchroom accepts, in UTF-8 bytes (64 KiB). Every send is stored whole
 /// in `state.json`, rewritten on every guard hook, and handed to a harness as one argument.
@@ -98,7 +121,58 @@ pub struct Message {
     /// D1.3).
     #[serde(default)]
     pub handed_over: bool,
+    /// What the user and the sender have been told of it while it waits (D1.8), and why it cannot
+    /// be handed over now (D1.9). A store written before 1.0.2 reads as nothing told.
+    #[serde(default)]
+    pub told: Told,
+    /// Fields a later program wrote that this one does not know, carried through every read and
+    /// write so an older program in a session that stays open does not erase them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
+
+/// What Lunchroom has told of a QUEUED message, and why it cannot be handed over (D1.8, D1.9).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // independent facts about what was told, read separately
+pub struct Told {
+    /// The hand-over (its `presented_at`) whose wait of [`WAITING_TOLD_SECS`] was told.
+    #[serde(default)]
+    pub waiting: Option<u64>,
+    /// Why the message cannot be handed over now, found at a hand-over (its program cannot be
+    /// established), while that holds; `None` once a hand-over goes ahead.
+    #[serde(default)]
+    pub blocked: Option<String>,
+    /// That reason was told.
+    #[serde(default)]
+    pub blocked_told: bool,
+    /// Why the message cannot be handed over now, from its recipient's state (UNGUARDED with its
+    /// R3.4 reason, or STOPPED); `None` while the recipient is guarded.
+    #[serde(default)]
+    pub unreachable: Option<String>,
+    /// That reason was told.
+    #[serde(default)]
+    pub unreachable_told: bool,
+    /// The reason of its last failed attempt.
+    #[serde(default)]
+    pub last_failure: Option<String>,
+    /// Something about it was told, so its DELIVERED is told too.
+    #[serde(default)]
+    pub any: bool,
+    /// The sender was told why it cannot be handed over when it sent it, so that reason is not
+    /// queued to the sender again (the user is still told).
+    #[serde(default)]
+    pub sender_told: bool,
+    /// The time before which a failed hand-over is not offered again ([`RETRY_GAP_SECS`]).
+    #[serde(default)]
+    pub retry_after: Option<u64>,
+    /// Fields a later program wrote that this one does not know.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// D1.8: how long a hand-over waits for its confirmation before the user and the sender are told.
+/// A message that cannot be handed over is told as soon as that is found.
+pub const WAITING_TOLD_SECS: u64 = 120;
 
 /// A message that holds a session (D1.5, I1.4). A record from before I1 carries only the sender's
 /// name: it holds the session and permits no reply (I1.6).
@@ -138,6 +212,13 @@ pub enum Evidence {
 pub struct Notice {
     pub message: String,
     pub text: String,
+    /// When it was made (seconds since the Unix epoch); a notice from before 1.0.2 has none.
+    #[serde(default)]
+    pub at: u64,
+    /// It states why the message cannot be handed over or waits: a newer one for the same message
+    /// replaces it while unread.
+    #[serde(default)]
+    pub reason: bool,
 }
 
 /// Who may register a name (I1.5).
@@ -227,6 +308,10 @@ pub enum AttemptOutcome {
 /// Every message, name, hold and approval Lunchroom keeps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mail {
+    /// The [`SCHEMA`] of the program that last wrote the store: every write stamps the current one,
+    /// and a store an older program rewrote reads as less. 0 is a store from before 1.0.2.
+    #[serde(default, serialize_with = "write_schema")]
+    schema: u32,
     next_message: u64,
     /// Identity keys of the sessions a hook has seen (I1.2).
     seen: BTreeSet<String>,
@@ -255,6 +340,13 @@ pub struct Mail {
     /// What holds each session, by identity key (D1.5).
     holds: BTreeMap<String, Vec<Hold>>,
     notices: BTreeMap<String, Vec<Notice>>,
+    /// What the user is told of messages that wait or end (D1.8), in the next prompt or listener
+    /// of any guarded session; each once.
+    #[serde(default)]
+    user_notices: Vec<Notice>,
+    /// The latest time a check of D1.7 ran at (seconds since the Unix epoch).
+    #[serde(default)]
+    seen_at: u64,
     conversations: Conversations,
     pub(crate) next_approval: u64,
     pub(crate) approvals: Vec<Approval>,
@@ -280,6 +372,11 @@ pub struct Mail {
     /// it (R3.1, Codex adapter).
     #[serde(default)]
     guard_fingerprints: BTreeMap<String, String>,
+    /// For each harness, the guard fingerprint recorded last in any of its sessions, kept after
+    /// that session is gone: for a plugin harness, the plugin's file and the release it reported
+    /// (C1.4: `lunchroom doctor` reads the release Hermes's plugin reported in its latest session).
+    #[serde(default)]
+    latest_guard_fingerprint: BTreeMap<Harness, String>,
     /// Every session a hook saw in each harness process, by `<pid>:<start time>`: one OpenClaw or
     /// Hermes gateway process runs many sessions (I1.2).
     #[serde(default)]
@@ -291,6 +388,89 @@ pub struct Mail {
     /// it is Lunchroom's own, not a custom title (I1.5). It outlives the session's names.
     #[serde(default)]
     titles: BTreeMap<String, String>,
+    /// Fields a later program wrote that this one does not know, carried through every read and
+    /// write.
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+/// Writes the current [`SCHEMA`] whatever the store was read with. (Serde hands the field by
+/// reference; generic over its type, the function takes it as serde gives it.)
+fn write_schema<T, S: serde::Serializer>(_read: &T, out: S) -> Result<S::Ok, S::Error> {
+    out.serialize_u32(SCHEMA)
+}
+
+/// The text of the line a list of notices starts with once it has dropped some.
+fn dropped_line(count: usize) -> String {
+    format!(
+        "{count} earlier notice{} dropped because the list holds at most {NOTICES_KEPT}.",
+        if count == 1 { " was" } else { "s were" }
+    )
+}
+
+/// How many notices the first line of `list` says were dropped, if it is that line.
+fn dropped_count(list: &[Notice]) -> usize {
+    let ending = format!(" dropped because the list holds at most {NOTICES_KEPT}.");
+    list.first()
+        .filter(|n| n.message.is_empty() && n.text.ends_with(&ending))
+        .and_then(|n| n.text.split(' ').next()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Adds `notice` to `list`, which stays small: an identical notice is not added twice; with
+/// `clears` (or when the notice states a reason) the unread reasons of the same message go, since
+/// the newer one replaces them; no more than [`NOTICES_PER_MESSAGE`] stand for one message; and
+/// past [`NOTICES_KEPT`] the oldest go, the list starting with one line that says how many.
+fn push_notice(list: &mut Vec<Notice>, notice: Notice, clears: bool) {
+    if list
+        .iter()
+        .any(|n| n.message == notice.message && n.text == notice.text)
+    {
+        return;
+    }
+    if notice.message.is_empty() {
+        list.push(notice);
+    } else {
+        if clears || notice.reason {
+            list.retain(|n| !(n.message == notice.message && n.reason));
+        }
+        let id = notice.message.clone();
+        list.push(notice);
+        while list.iter().filter(|n| n.message == id).count() > NOTICES_PER_MESSAGE {
+            if let Some(oldest) = list.iter().position(|n| n.message == id) {
+                list.remove(oldest);
+            }
+        }
+    }
+    if list.len() > NOTICES_KEPT {
+        let already = dropped_count(list);
+        if already > 0 {
+            list.remove(0);
+        }
+        let excess = list.len().saturating_sub(NOTICES_KEPT - 1);
+        list.drain(..excess);
+        list.insert(
+            0,
+            Notice {
+                message: String::new(),
+                text: dropped_line(already + excess),
+                at: 0,
+                reason: false,
+            },
+        );
+    }
+}
+
+/// Removes from `list` one notice equal (message and text) to each of `told`.
+fn drop_told(list: &mut Vec<Notice>, told: &[Notice]) {
+    for t in told {
+        if let Some(at) = list
+            .iter()
+            .position(|n| n.message == t.message && n.text == t.text)
+        {
+            list.remove(at);
+        }
+    }
 }
 
 /// How long the text of a DELIVERED or FAILED message that holds nobody is kept: a week.
@@ -303,6 +483,23 @@ impl Mail {
     /// message's record stays, so a late copy is still known for what it is (D1.2).
     pub fn prune(&mut self, now: u64, alive: impl Fn(&str) -> bool) {
         self.expire_handovers(now);
+        self.expire_requests(now);
+        // Notices nobody read: those of a session no longer running, after a day, and the user's
+        // after a week; the sender's of a session that still runs are kept (capped by count).
+        let running: BTreeSet<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, r)| alive(&r.process))
+            .map(|(k, _)| k.clone())
+            .collect();
+        self.notices.retain(|k, list| {
+            if !running.contains(k) {
+                list.retain(|n| now.saturating_sub(n.at) < GONE_NOTICE_SECS);
+            }
+            !list.is_empty()
+        });
+        self.user_notices
+            .retain(|n| now.saturating_sub(n.at) < KEEP_SECS);
         self.processes.retain(|k, _| alive(k));
         self.process_members.retain(|k, _| alive(k));
         let holding: BTreeSet<String> = self
@@ -326,6 +523,7 @@ impl Mail {
     pub fn record_guard_fingerprint(&mut self, who: &Identity, fingerprint: Option<String>) {
         match fingerprint {
             Some(f) => {
+                self.latest_guard_fingerprint.insert(who.harness, f.clone());
                 self.guard_fingerprints.insert(who.key(), f);
             }
             None => {
@@ -338,6 +536,15 @@ impl Mail {
     #[must_use]
     pub fn guard_fingerprint(&self, who: &Identity) -> Option<&str> {
         self.guard_fingerprints.get(&who.key()).map(String::as_str)
+    }
+
+    /// The guard fingerprint recorded last in any session of `harness` (C1.4), or `None` when no
+    /// session of it has recorded one.
+    #[must_use]
+    pub fn latest_guard_fingerprint(&self, harness: Harness) -> Option<&str> {
+        self.latest_guard_fingerprint
+            .get(&harness)
+            .map(String::as_str)
     }
 
     /// R3.4: given every named agent that is UNGUARDED now, the ones the user has not yet been
@@ -535,7 +742,8 @@ impl Mail {
     /// Gives `name` to `who`, who from then on receives messages (I1.5). A taken name is never
     /// moved silently: the first attempt is refused with [`RegisterRefusal::Taken`], which names
     /// the holder for the user to see, and only a second attempt that passes back that same holder
-    /// as `replacing` moves the name. The earlier holder's messages stay addressed to it (I1.5).
+    /// as `replacing` moves the name. The messages QUEUED for the moved name never reach the new
+    /// holder (I1.5); they become FAILED at the next check, and their senders are told.
     ///
     /// # Errors
     /// [`RegisterRefusal`] when it comes from a guarded session, or the name is taken and
@@ -562,14 +770,26 @@ impl Mail {
             });
         }
         self.names.insert(name.to_owned(), who.clone());
+        // The name moved: the earlier holder receives no more unless another name still labels it,
+        // and the messages QUEUED for the moved name are FAILED at the next check
+        // ([`Mail::fail_unnamed`]); none of them reaches the earlier holder meanwhile (D1.7). A
+        // HELD session's reply to that holder is then refused as to an agent no longer named; it
+        // never goes to the new holder of the name (§9 item 5 keeps that part).
+        if let Some(old) = &earlier
+            && !self.names.values().any(|h| h == old)
+        {
+            self.receivers.remove(&old.key());
+        }
         self.receivers.insert(who.key());
         Ok(earlier)
     }
 
     /// Takes `name` away, so its session receives no more messages unless another name still labels
-    /// it. Messages already QUEUED for it stay QUEUED. False when no session has that name. Called
-    /// by the `lunchroom unregister` command after the user's confirmation (A1.3), and by `join`
-    /// and `leave`, which the user typed in the session (I1.5).
+    /// it. The messages QUEUED for it become FAILED, and their senders are told, at the next check
+    /// ([`Mail::fail_unnamed`]); a caller that wants that at once calls it in the same update.
+    /// False when no session has that name. Called by the `lunchroom unregister` command after the
+    /// user's confirmation (A1.3), and by `join` and `leave`, which the user typed in the session
+    /// (I1.5).
     pub fn unregister(&mut self, name: &str) -> bool {
         let Some(who) = self.names.remove(name) else {
             return false;
@@ -659,10 +879,16 @@ impl Mail {
             );
             let notices = self.notices.entry(to.key()).or_default();
             if !notices.iter().any(|n| n.text == text) {
-                notices.push(Notice {
-                    message: String::new(),
-                    text,
-                });
+                push_notice(
+                    notices,
+                    Notice {
+                        message: String::new(),
+                        text,
+                        at: now,
+                        reason: false,
+                    },
+                    false,
+                );
             }
             return Err(SendRefusal::Denied(Reason::Leak));
         }
@@ -693,6 +919,8 @@ impl Mail {
                 failed_attempts: 0,
                 presented_at: None,
                 handed_over: false,
+                told: Told::default(),
+                extra: BTreeMap::new(),
             },
         );
         self.inboxes
@@ -748,6 +976,15 @@ impl Mail {
     /// error, and it establishes what its harness does with a copy when the guard process itself is
     /// killed. Displaying is the harness's; this core never displays.
     pub fn confirm(&mut self, to: &Identity, id: &str) -> Confirmation {
+        self.confirm_at(to, id, self.seen_at)
+    }
+
+    /// [`Mail::confirm`] at the time `now`, which the DELIVERED notice counts the message's age
+    /// to. A caller with a clock passes it: [`Mail::confirm`] has only the latest time any check
+    /// ran at, which can be long before the confirmation.
+    pub fn confirm_at(&mut self, to: &Identity, id: &str, now: u64) -> Confirmation {
+        self.saw(now);
+        let now = self.seen_at;
         let Some(message) = self.messages.get_mut(id).filter(|m| m.to == *to) else {
             return Confirmation::NotFound;
         };
@@ -758,14 +995,21 @@ impl Mail {
         }
         message.status = Status::Delivered;
         message.presented_at = None;
+        message.told.blocked = None;
+        message.told.unreachable = None;
         let hold = Hold {
             message: id.to_owned(),
             from: Some(message.from.clone()),
             from_name: message.from_name.clone(),
         };
+        // D1.8: a message the user and the sender were told of while it waited is told DELIVERED.
+        let told = message.told.any.then(|| Self::delivered_text(message, now));
         let holds = self.holds.entry(to.key()).or_default();
         if !holds.iter().any(|h| h.message == id) {
             holds.push(hold);
+        }
+        if let Some(text) = told {
+            self.tell(id, &text);
         }
         Confirmation::Show
     }
@@ -827,26 +1071,39 @@ impl Mail {
             .map(|m| format!("Not confirmed; still {}", m.status.state().word()))
     }
 
-    /// Every QUEUED message handed to a harness and still unconfirmed [`HANDOVER_SECS`] later
-    /// counts one failed attempt (D1.4): the hand-over mark goes and the message is offered again,
-    /// or is FAILED on its third. The hold taken before the hand-over stays, since the harness may
-    /// have shown the message without confirming it; the user typing clears it. A hand-over stamped
-    /// in the future (the clock stepped back) or not stamped at all has run out. This needs no live
-    /// recipient. A late confirmation of the old hand-over still shows the message once, and a
-    /// repeat of it is a duplicate (D1.2).
+    /// Every QUEUED message put in front of its recipient's harness and still unconfirmed counts
+    /// one failed attempt (D1.4): a message handed over (Codex, OpenClaw, Hermes), [`HANDOVER_SECS`]
+    /// later; one only offered (Claude Code), [`CONFIRM_SECS`] later, even when no listener ever
+    /// asks for it again. The mark goes and the message is offered again, or is FAILED on its
+    /// third. The hold taken before a hand-over stays, since the harness may have shown the message
+    /// without confirming it; the user typing clears it. A hand-over not stamped at all, or stamped
+    /// more than [`FUTURE_SLACK_SECS`] ahead of `now` (the clock stepped back; two processes read
+    /// the clock at different moments, so a smaller difference is not that), has run out. This needs
+    /// no live recipient. A late confirmation of the old hand-over still shows the message once,
+    /// and a repeat of it is a duplicate (D1.2).
     pub fn expire_handovers(&mut self, now: u64) {
+        self.saw(now);
         let expired: Vec<String> = self
             .messages
             .values()
-            .filter(|m| m.status == Status::Queued && m.handed_over)
-            .filter(|m| {
-                m.presented_at
-                    .is_none_or(|at| at > now || now - at >= HANDOVER_SECS)
+            .filter(|m| m.status == Status::Queued)
+            .filter(|m| match (m.presented_at, m.handed_over) {
+                (None, handed) => handed,
+                (Some(at), handed) => {
+                    let limit = if handed { HANDOVER_SECS } else { CONFIRM_SECS };
+                    at > now.saturating_add(FUTURE_SLACK_SECS) || now.saturating_sub(at) >= limit
+                }
             })
             .map(|m| m.id.clone())
             .collect();
         for id in expired {
-            self.count_failed(&id, "no confirmation from the recipient's harness", false);
+            self.count_failed(
+                &id,
+                "no confirmation from the recipient's harness",
+                false,
+                now,
+                false,
+            );
         }
     }
 
@@ -876,6 +1133,38 @@ impl Mail {
         only_from: Option<&Identity>,
         now: u64,
     ) -> Option<Message> {
+        self.present_matching(to, only_from, false, now)
+    }
+
+    /// D1.7: [`Mail::present`] for a check, which offers again at once, whatever session it runs
+    /// in, a message whose hand-over counted as failed (not sooner than [`RETRY_GAP_SECS`] after a
+    /// hand-over that failed at once), and a message that has waited [`RETRY_GAP_SECS`] and was
+    /// never handed over because its recipient could not take it then.
+    pub fn present_again(&mut self, to: &Identity, now: u64) -> Option<Message> {
+        self.present_again_from(to, None, now)
+    }
+
+    /// [`Mail::present_again`] for a check that runs in one sender's process (the check inside
+    /// `lunchroom send`): with `only_from`, the message offered is that sender's own, and another
+    /// sender's waiting message is passed over and left as it was (D1.1).
+    pub fn present_again_from(
+        &mut self,
+        to: &Identity,
+        only_from: Option<&Identity>,
+        now: u64,
+    ) -> Option<Message> {
+        self.present_matching(to, only_from, true, now)
+    }
+
+    /// [`Mail::present_from`], with `again`: only messages with a failed attempt, or never handed
+    /// over and waiting [`RETRY_GAP_SECS`] or more.
+    fn present_matching(
+        &mut self,
+        to: &Identity,
+        only_from: Option<&Identity>,
+        again: bool,
+        now: u64,
+    ) -> Option<Message> {
         // I1.5: only a session the user named receives anything.
         if !self.receivers.contains(&to.key()) {
             return None;
@@ -884,13 +1173,22 @@ impl Mail {
         let ids: Vec<String> = self
             .deliveries(to)
             .iter()
-            .filter(|m| !m.handed_over)
+            .filter(|m| {
+                !m.handed_over
+                    && (!again
+                        || m.failed_attempts > 0
+                        || now.saturating_sub(m.sent_at) >= RETRY_GAP_SECS)
+            })
             .map(|m| m.id.clone())
             .collect();
         for id in ids {
-            let presented = self.messages.get(&id).and_then(|m| m.presented_at);
-            // One attempt at a time, whoever's message it is.
-            if presented.is_some_and(|at| now < at.saturating_add(CONFIRM_SECS)) {
+            let (presented, retry_after) = self
+                .messages
+                .get(&id)
+                .map_or((None, None), |m| (m.presented_at, m.told.retry_after));
+            // One attempt at a time, whoever's message it is. What was in front of the harness
+            // longer than its time has been counted failed above, so what is left is within it.
+            if presented.is_some() {
                 return None;
             }
             // D1.1: another sender's message waits for its own sender or the recipient's listener,
@@ -898,12 +1196,10 @@ impl Mail {
             if only_from.is_some_and(|f| self.messages.get(&id).is_some_and(|m| m.from != *f)) {
                 continue;
             }
-            if presented.is_some() {
-                let outcome =
-                    self.attempt_failed(&id, "no confirmation from the recipient's harness");
-                if outcome == Some(AttemptOutcome::Failed) {
-                    continue;
-                }
+            // A failed attempt is not tried again within [`RETRY_GAP_SECS`]. A gap that stands
+            // further ahead than that was stamped by a clock that stepped back and is void.
+            if retry_after.is_some_and(|t| now < t && t <= now.saturating_add(RETRY_GAP_SECS)) {
+                return None;
             }
             let message = self.messages.get_mut(&id)?;
             message.presented_at = Some(now);
@@ -936,36 +1232,43 @@ impl Mail {
         true
     }
 
-    /// One delivery attempt failed for `reason`. The third makes the message FAILED and tells the
-    /// sender (D1.4). `None` when the message is not QUEUED.
-    pub fn attempt_failed(&mut self, id: &str, reason: &str) -> Option<AttemptOutcome> {
-        self.count_failed(id, reason, true)
+    /// One delivery attempt failed for `reason` at `now`. The third makes the message FAILED (D1.4);
+    /// each tells the user and the sender (D1.8). The message is not offered again for
+    /// [`RETRY_GAP_SECS`]. `None` when the message is not QUEUED.
+    pub fn attempt_failed(&mut self, id: &str, reason: &str, now: u64) -> Option<AttemptOutcome> {
+        self.count_failed(id, reason, true, now, true)
     }
 
-    /// [`Mail::attempt_failed`], keeping the hold taken for the attempt unless `release`.
-    fn count_failed(&mut self, id: &str, reason: &str, release: bool) -> Option<AttemptOutcome> {
+    /// [`Mail::attempt_failed`], keeping the hold taken for the attempt unless `release`, and with
+    /// `gap` the pause before the next offer.
+    fn count_failed(
+        &mut self,
+        id: &str,
+        reason: &str,
+        release: bool,
+        now: u64,
+        gap: bool,
+    ) -> Option<AttemptOutcome> {
         if !self.undo_hand_over(id, release) {
             return None;
         }
         let message = self.messages.get_mut(id)?;
         message.failed_attempts += 1;
-        if message.failed_attempts < MAX_ATTEMPTS {
-            return Some(AttemptOutcome::StillQueued {
+        message.told.last_failure = Some(reason.to_owned());
+        message.told.retry_after = gap.then(|| now.saturating_add(RETRY_GAP_SECS));
+        let outcome = if message.failed_attempts < MAX_ATTEMPTS {
+            AttemptOutcome::StillQueued {
                 failed_attempts: message.failed_attempts,
-            });
-        }
-        message.status = Status::Failed {
-            reason: reason.to_owned(),
+            }
+        } else {
+            message.status = Status::Failed {
+                reason: reason.to_owned(),
+            };
+            AttemptOutcome::Failed
         };
-        let notice = Notice {
-            message: id.to_owned(),
-            text: format!("{id} {}: {reason}", MessageState::Failed.word()),
-        };
-        self.notices
-            .entry(message.from.key())
-            .or_default()
-            .push(notice);
-        Some(AttemptOutcome::Failed)
+        let text = Self::attempt_text(message, reason, now);
+        self.tell(id, &text);
+        Some(outcome)
     }
 
     /// One message by id.
@@ -983,6 +1286,51 @@ impl Mail {
     /// Takes the notices waiting for `who`, to tell it now (D1.4, L1.4); each is told once.
     pub fn take_notices(&mut self, who: &Identity) -> Vec<Notice> {
         self.notices.remove(&who.key()).unwrap_or_default()
+    }
+
+    /// `told` were shown to `who`: they are not told again. Used after the output that carries
+    /// them is written, so a hook killed before that loses none (a notice leaves the store only
+    /// once it has been shown). A notice that arrived meanwhile stays.
+    pub fn mark_notices_told(&mut self, who: &Identity, told: &[Notice]) {
+        let key = who.key();
+        if let Some(list) = self.notices.get_mut(&key) {
+            drop_told(list, told);
+            if list.is_empty() {
+                self.notices.remove(&key);
+            }
+        }
+    }
+
+    /// `told` were shown to the user: they are not told again (see [`Mail::mark_notices_told`]).
+    pub fn mark_user_notices_told(&mut self, told: &[Notice]) {
+        drop_told(&mut self.user_notices, told);
+    }
+
+    /// How many calls wait for the user's approval, whoever asked (named or not): what `lunchroom
+    /// approve` lists.
+    #[must_use]
+    pub fn requests_total(&self) -> usize {
+        self.requests.len()
+    }
+
+    /// The [`SCHEMA`] of the program that last wrote this store; 0 for a store from before 1.0.2.
+    #[must_use]
+    pub const fn schema(&self) -> u32 {
+        self.schema
+    }
+
+    /// An older program wrote this store last: its fields may have been dropped, so what this
+    /// program finds missing is not proof of anything.
+    #[must_use]
+    pub const fn written_by_older_program(&self) -> bool {
+        self.schema < SCHEMA
+    }
+
+    /// A newer program wrote this store: this program keeps what it does not know ([`Mail`] carries
+    /// unknown fields through), but a caller that must not guess may refuse to write.
+    #[must_use]
+    pub const fn written_by_newer_program(&self) -> bool {
+        self.schema > SCHEMA
     }
 
     /// The messages that hold `who` (D1.5).
@@ -1021,5 +1369,11 @@ impl Mail {
     }
 }
 
+mod waiting;
+pub use waiting::{cannot_hand_over, clock, span, standing, waiting_for};
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_102;

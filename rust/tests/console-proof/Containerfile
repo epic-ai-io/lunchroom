@@ -1,0 +1,23 @@
+# The proof of the Lunchroom console (1.1) on Ubuntu 24.04: real users, a real sudo, real
+# pseudo-terminals. Build and run (the build context holds the static `lunchroom` binary, named
+# `lunchroom`, next to the files of this folder):
+#
+#   podman build -t lunchroom-console-proof -f Containerfile <context>
+#   podman run --rm lunchroom-console-proof | tee console-proof-<date>.txt
+#
+# `prove.sh` prints PASS or FAIL for each check and exits non-zero on any FAIL.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      sudo python3 procps psmisc util-linux gdb strace tmux screen ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY lunchroom /opt/proof/lunchroom
+COPY prove.sh ptyrun.py hook.py lastscreen.py /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/prove.sh /opt/proof/ptyrun.py \
+      /opt/proof/hook.py /opt/proof/lastscreen.py
+
+# The checks run as root; the script makes the user `dev` itself.
+CMD ["/opt/proof/prove.sh"]

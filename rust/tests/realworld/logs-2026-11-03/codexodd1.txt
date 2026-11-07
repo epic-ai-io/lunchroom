@@ -1,0 +1,126 @@
+MEASURED free space on /: 6838 MB
+== building lunchroom-realworld-codexodd from Containerfile
+MEASURED image lunchroom-realworld-codexodd: 1735 MB
+
+== facts of this system
+codex: codex-cli 0.166.0
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install codex finished
+MEASURED config.toml after the install (features): [features] unified_exec_tty = false 
+
+== configuration a
+MEASURED hooks.json for a: []
+---- config a, TUI: Codex gave the model back: unsupported call: exec_command
+     file /tmp/control-ran-a_tui exists: yes
+    no hook ran
+---- config a, exec: Codex gave the model back: Chunk ID: 2f8b86 Wall time: 0.0000 seconds Process exited with code 0 Original token count: 31 Output: codexmock.py hooksvar.py inner.sh lib.sh lunchroom plaintext.py ptyrun.py screen.py sessionpty.py tee-hook.sh tee-wrap.sh
+     file /tmp/control-ran-a_exec exists: yes
+    no hook ran
+    exec output: 
+    exec output: codex
+    exec output: done
+    exec output: tokens used
+    exec output: 4
+    exec output: done
+
+== configuration b
+MEASURED hooks.json for b: ['PreToolUse']
+---- config b, TUI: Codex gave the model back: unsupported call: exec_command
+     file /tmp/control-ran-b_tui exists: yes
+    hook capture: exit 0; stdout: ; stderr: 
+---- config b, exec: Codex gave the model back: Chunk ID: 866fe8 Wall time: 0.0000 seconds Process exited with code 0 Original token count: 31 Output: codexmock.py hooksvar.py inner.sh lib.sh lunchroom plaintext.py ptyrun.py screen.py sessionpty.py tee-hook.sh tee-wrap.sh
+     file /tmp/control-ran-b_exec exists: yes
+    hook capture: exit 0; stdout: ; stderr: 
+    exec output: 
+    exec output: codex
+    exec output: done
+    exec output: tokens used
+    exec output: 4
+    exec output: done
+
+== configuration c
+MEASURED hooks.json for c: ['PostToolUse', 'PreToolUse', 'SessionStart', 'Stop', 'UserPromptSubmit']
+    joined: cx	codex:01a1a252-51d2-7eb2-9fff-32f082a21ba9	STOPPED	QUEUED 0
+---- config c, TUI: Codex gave the model back: unsupported call: exec_command
+     file /tmp/control-ran-c_tui exists: yes
+    hook UserPromptSubmit: exit 0; stdout: ; stderr: 
+    hook PreToolUse: exit 0; stdout: ; stderr: 
+    hook PostToolUse: exit 0; stdout: ; stderr: 
+    hook Stop: exit 0; stdout: ; stderr: 
+---- config c, exec: Codex gave the model back: Chunk ID: fcd0be Wall time: 0.0000 seconds Process exited with code 0 Original token count: 31 Output: codexmock.py hooksvar.py inner.sh lib.sh lunchroom plaintext.py ptyrun.py screen.py sessionpty.py tee-hook.sh tee-wrap.sh
+     file /tmp/control-ran-c_exec exists: yes
+    hook SessionStart: exit 0; stdout: ; stderr: 
+    hook SessionStart: exit 0; stdout: {"hookSpecificOutput":{"hookEventName":"SessionStart"},"systemMessage":"Lunchroom: include this session? Type join, or join <name>. Anything else keeps it out."; stderr: 
+    hook UserPromptSubmit: exit 0; stdout: ; stderr: 
+    hook PreToolUse: exit 0; stdout: ; stderr: 
+    hook PostToolUse: exit 0; stdout: ; stderr: 
+    hook Stop: exit 0; stdout: ; stderr: 
+    exec output: done
+    exec output: hook: Stop
+    exec output: hook: Stop Completed
+    exec output: tokens used
+    exec output: 4
+    exec output: done
+
+== configuration d
+MEASURED hooks.json for d: ['PreToolUse']
+---- config d, TUI: Codex gave the model back: unsupported call: exec_command
+     file /tmp/control-ran-d_tui exists: yes
+    hook PreToolUse: exit 0; stdout: ; stderr: 
+---- config d, exec: Codex gave the model back: Chunk ID: 66886f Wall time: 0.0000 seconds Process exited with code 0 Original token count: 31 Output: codexmock.py hooksvar.py inner.sh lib.sh lunchroom plaintext.py ptyrun.py screen.py sessionpty.py tee-hook.sh tee-wrap.sh
+     file /tmp/control-ran-d_exec exists: yes
+    hook PreToolUse: exit 0; stdout: ; stderr: 
+    exec output: 
+    exec output: codex
+    exec output: done
+    exec output: tokens used
+    exec output: 4
+    exec output: done
+
+== configuration e
+MEASURED hooks.json for e: ['PostToolUse']
+---- config e, TUI: Codex gave the model back: unsupported call: exec_command
+     file /tmp/control-ran-e_tui exists: yes
+    hook PostToolUse: exit 0; stdout: ; stderr: 
+---- config e, exec: Codex gave the model back: Chunk ID: 2eaa0d Wall time: 0.0000 seconds Process exited with code 0 Original token count: 31 Output: codexmock.py hooksvar.py inner.sh lib.sh lunchroom plaintext.py ptyrun.py screen.py sessionpty.py tee-hook.sh tee-wrap.sh
+     file /tmp/control-ran-e_exec exists: yes
+    hook PostToolUse: exit 0; stdout: ; stderr: 
+    exec output: hook: PostToolUse Completed
+    exec output: codex
+    exec output: done
+    exec output: tokens used
+    exec output: 4
+    exec output: done
+
+== table
+config mode  file  what Codex gave the model                                              hooks that ran (exit)
+a      TUI   yes   unsupported call: exec_command                                          none
+a      exec  yes   Chunk ID: 2f8b86 Wall time: 0.0000 seconds Process exited with code 0   none
+b      TUI   yes   unsupported call: exec_command                                          capture=0
+b      exec  yes   Chunk ID: 866fe8 Wall time: 0.0000 seconds Process exited with code 0   capture=0
+c      TUI   yes   unsupported call: exec_command                                          UserPromptSubmit=0 PreToolUse=0 PostToolUse=0 Stop=0
+c      exec  yes   Chunk ID: fcd0be Wall time: 0.0000 seconds Process exited with code 0   SessionStart=0 SessionStart=0 UserPromptSubmit=0 PreToolUse=0 PostToolUse=0 Stop=0
+d      TUI   yes   unsupported call: exec_command                                          PreToolUse=0
+d      exec  yes   Chunk ID: 66886f Wall time: 0.0000 seconds Process exited with code 0   PreToolUse=0
+e      TUI   yes   unsupported call: exec_command                                          PostToolUse=0
+e      exec  yes   Chunk ID: 2eaa0d Wall time: 0.0000 seconds Process exited with code 0   PostToolUse=0
+RESULTS_RAW_BEGIN
+a|TUI|unsupported call: exec_command|yes| none
+a|exec|Chunk ID: 2f8b86 Wall time: 0.0000 seconds Process exited with code 0 |yes| none
+b|TUI|unsupported call: exec_command|yes| capture=0
+b|exec|Chunk ID: 866fe8 Wall time: 0.0000 seconds Process exited with code 0 |yes| capture=0
+c|TUI|unsupported call: exec_command|yes| UserPromptSubmit=0 PreToolUse=0 PostToolUse=0 Stop=0
+c|exec|Chunk ID: fcd0be Wall time: 0.0000 seconds Process exited with code 0 |yes| SessionStart=0 SessionStart=0 UserPromptSubmit=0 PreToolUse=0 PostToolUse=0 Stop=0
+d|TUI|unsupported call: exec_command|yes| PreToolUse=0
+d|exec|Chunk ID: 66886f Wall time: 0.0000 seconds Process exited with code 0 |yes| PreToolUse=0
+e|TUI|unsupported call: exec_command|yes| PostToolUse=0
+e|exec|Chunk ID: 2eaa0d Wall time: 0.0000 seconds Process exited with code 0 |yes| PostToolUse=0
+RESULTS_RAW_END
+PASS all five configurations were run in the TUI and in codex exec; the table above is the result (nothing is judged here)
+
+== result
+RESULT: 2 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-codexodd removed
+
+RESULT: 2 PASS, 0 FAIL

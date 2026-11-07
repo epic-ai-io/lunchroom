@@ -125,6 +125,34 @@ pub trait System {
     fn verifier_blocker(&self) -> Option<String> {
         None
     }
+    /// Why [`System::run_root`] cannot work here; `None` when it can. A system that cannot run a
+    /// command as root (the default, and every test system) has no console set-up to offer.
+    /// 1.1 only (feature `console`).
+    #[cfg(feature = "console")]
+    fn root_blocker(&self) -> Option<String> {
+        Some("this system cannot run a command as root".to_owned())
+    }
+    /// Runs `argv` (an absolute program and its arguments) as root through `sudo`, with `input`
+    /// on its standard input when there is some. `what` names the step in an error. 1.1 only
+    /// (feature `console`).
+    ///
+    /// # Errors
+    /// Why the command did not run or did not succeed.
+    #[cfg(feature = "console")]
+    fn run_root(&mut self, what: &str, argv: &[String], input: Option<&str>) -> Result<(), String> {
+        let _ = (argv, input);
+        Err(format!("{what}: this system cannot run a command as root"))
+    }
+    /// Runs `program` with `args` as the user, on the user's terminal; whether it succeeded. 1.1
+    /// only (feature `console`).
+    ///
+    /// # Errors
+    /// Why it could not be started.
+    #[cfg(feature = "console")]
+    fn run_user(&mut self, program: &Path, args: &[&str]) -> Result<bool, String> {
+        let _ = args;
+        Err(format!("{} cannot be run from here", program.display()))
+    }
 }
 
 /// Program names of the harnesses Lunchroom guards: a process under one of them is inside a
@@ -222,6 +250,19 @@ fn prove(sys: &mut dyn System, question: &str) -> Result<(), String> {
     }
 }
 
+const NOT_ACTING: u32 = u32::MAX;
+
+/// The user the console acts for. The console runs as the system user `lunchroom`, but its
+/// passphrase check is the developer's: `/etc/lunchroom/<developer uid>.verifier`.
+static ACTING_FOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(NOT_ACTING);
+
+/// Makes [`OsSystem`] answer `uid` (and look for `uid`'s verifier) instead of this process's own
+/// real user id; used by the console alone (1.1, feature `console`).
+#[cfg(feature = "console")]
+pub fn act_for(uid: u32) {
+    ACTING_FOR.store(uid, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The real system: `/proc` and `/dev/tty`.
 #[derive(Debug, Default)]
 pub struct OsSystem;
@@ -260,6 +301,10 @@ impl System for OsSystem {
     }
 
     fn uid(&self) -> Option<u32> {
+        let acting = ACTING_FOR.load(std::sync::atomic::Ordering::SeqCst);
+        if acting != NOT_ACTING {
+            return Some(acting);
+        }
         real_uid(&std::fs::read_to_string("/proc/self/status").ok()?)
     }
 
@@ -364,39 +409,7 @@ impl System for OsSystem {
         // there is no file of the user's own that another process of the account could swap while
         // the password is being typed.
         let sudo = |what: &str, args: &[&str], input: Option<&str>| -> Result<(), String> {
-            let tty = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/tty")
-                .map_err(|e| format!("the terminal cannot be opened: {e}"))?;
-            let own = |tty: &std::fs::File| {
-                tty.try_clone()
-                    .map_err(|e| format!("the terminal cannot be used: {e}"))
-            };
-            let mut command = std::process::Command::new(&sudo_program);
-            command
-                .args(args)
-                .stdin(match input {
-                    Some(_) => Stdio::piped(),
-                    None => Stdio::from(own(&tty)?),
-                })
-                .stdout(Stdio::from(own(&tty)?))
-                .stderr(Stdio::from(tty));
-            let mut child = command
-                .spawn()
-                .map_err(|e| format!("sudo cannot be started: {e}"))?;
-            if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
-                pipe.write_all(text.as_bytes())
-                    .map_err(|e| format!("{what}: sudo did not take the passphrase check: {e}"))?;
-            }
-            let status = child
-                .wait()
-                .map_err(|e| format!("{what}: sudo cannot be waited for: {e}"))?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(format!("{what} did not succeed ({status})"))
-            }
+            sudo_run(&sudo_program, what, args, input)
         };
         let text = format!("{line}\n");
         let install_program = install_program.display().to_string();
@@ -408,6 +421,82 @@ impl System for OsSystem {
     fn verifier_blocker(&self) -> Option<String> {
         system_programs(&verifier_shown(self)).err()
     }
+
+    #[cfg(feature = "console")]
+    fn root_blocker(&self) -> Option<String> {
+        system_program("sudo")
+            .is_none()
+            .then(|| "sudo was not found in the system folders; install sudo".to_owned())
+    }
+
+    #[cfg(feature = "console")]
+    fn run_root(&mut self, what: &str, argv: &[String], input: Option<&str>) -> Result<(), String> {
+        let sudo = system_program("sudo").ok_or("sudo was not found in the system folders")?;
+        let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+        sudo_run(&sudo, what, &words, input)
+    }
+
+    #[cfg(feature = "console")]
+    fn run_user(&mut self, program: &Path, args: &[&str]) -> Result<bool, String> {
+        // The program is the installed setgid program: it gets its group on exec.
+        std::process::Command::new(program)
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .map_err(|e| format!("{} cannot be started: {e}", program.display()))
+    }
+}
+
+/// Runs `sudo <args>` with the user's terminal for its questions and `input`, when there is some,
+/// on its standard input from a pipe; `what` names the step in the error. The one way Lunchroom
+/// runs anything as root. The child has no access to the store ([`lunchroom_core::setgid`]).
+fn sudo_run(
+    sudo_program: &Path,
+    what: &str,
+    args: &[&str],
+    input: Option<&str>,
+) -> Result<(), String> {
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("the terminal cannot be opened: {e}"))?;
+    let own = |tty: &std::fs::File| {
+        tty.try_clone()
+            .map_err(|e| format!("the terminal cannot be used: {e}"))
+    };
+    let mut command = std::process::Command::new(sudo_program);
+    command
+        .args(args)
+        .stdin(match input {
+            Some(_) => Stdio::piped(),
+            None => Stdio::from(own(&tty)?),
+        })
+        .stdout(Stdio::from(own(&tty)?))
+        .stderr(Stdio::from(tty));
+    lunchroom_core::setgid::drop_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("sudo cannot be started: {e}"))?;
+    if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
+        pipe.write_all(text.as_bytes())
+            .map_err(|e| format!("{what}: sudo did not take its input: {e}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("{what}: sudo cannot be waited for: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{what} did not succeed ({status})"))
+    }
+}
+
+/// `name` in a system folder, as an absolute path: the console set-up runs these as root.
+#[must_use]
+#[cfg(feature = "console")]
+pub fn system_path(name: &str) -> Option<PathBuf> {
+    system_program(name)
 }
 
 /// `sudo` and `install` as the system has them, or why the verifier cannot be put in place.
@@ -498,7 +587,7 @@ fn read_hidden(
 
 /// Runs `stty <arg>` on `tty`; whether it succeeded. Without an `stty` in a system folder it did
 /// not, so the passphrase is not read.
-fn stty(tty: &std::fs::File, arg: &str) -> bool {
+pub(crate) fn stty(tty: &std::fs::File, arg: &str) -> bool {
     let Some(program) = system_program("stty") else {
         return false;
     };

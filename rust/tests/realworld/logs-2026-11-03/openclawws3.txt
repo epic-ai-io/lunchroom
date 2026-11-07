@@ -1,0 +1,53 @@
+MEASURED free space on /: 7648 MB
+== building lunchroom-realworld-openclawws from Containerfile
+MEASURED image lunchroom-realworld-openclawws: 1956 MB
+
+== facts of this system
+openclaw: OpenClaw 2026.10.7 (157d8c2)
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install openclaw finished
+MEASURED tools.exec.applyPatch.workspaceOnly (left at its default, not set by this proof): Config path is valid but unset: tools.exec.applyPatch.workspaceOnly. The runtime default applies until you set an authored value with openclaw config set tools.exec.applyPatch.workspaceOnly <value>.
+PASS the Lunchroom plugin is enabled
+PASS the gateway listens (after 20 s)
+PASS alpha joined and is AVAILABLE
+MEASURED workspace: /home/dev/.openclaw/workspace (exists)
+    lrwxrwxrwx 1 dev dev   26 Nov  3 10:07 ws-dir -> /home/dev/.lunchroom/store
+    lrwxrwxrwx 1 dev dev   37 Nov  3 10:07 ws-link -> /home/dev/.lunchroom/store/state.json
+PASS the workspace holds ws-link -> state.json and ws-dir -> the store folder
+
+== 1. control: an ordinary file in the workspace
+MEASURED apply_patch of hello-p0.txt in the workspace: Success. Updated the following files: A hello-p0.txt
+PASS control: hello-p0.txt was created in the workspace (the tool path works with the default containment)
+
+== 2. apply_patch through a symlink to the store's state file
+    turn: done
+    gateway: [90m2026-11-03T10:07:41.767+00:00[39m [36m[gateway][39m [36mhttp server listening (15 plugins: anthropic, browser, canvas, cua-computer, device-pair, file-transfer, geolocation, github, linux-node, lunchroom, memory-core, ollama, openai, talk-voice, xai; 8.3s)[39m
+    gateway: 2026-11-03T10:08:04.908+00:00 [tools] apply_patch failed: Symlink escapes sandbox root (~/.openclaw/workspace): ~/.openclaw/workspace/ws-link apply_patch is workspace-contained by configuration. Both tools.exec.applyPatch.workspaceOnly (default true) and tools.fs.workspaceOnly impose this independently, so clearing one can leave the other in force. tools.exec.mode does not affect it. raw_params={"
+    mock: {"path": "/v1/chat/completions", "tools": ["apply_patch", "edit", "exec", "ls", "openclaw", "process", "read", "sessions_yield", "tool_call", "tool_describe", "tool_search", "write"], "roles": ["system", "user", "assistant", "user", "assistant", "tool", "assistant", "user"]}
+    mock: {"apply_patch_schema": {"type": "object", "required": ["input"], "properties": {"input": {"type": "string", "description": "Patch content using the *** Begin Patch/End Patch format."}}}}
+    mock: {"path": "/v1/chat/completions", "tools": ["apply_patch", "edit", "exec", "ls", "openclaw", "process", "read", "sessions_yield", "tool_call", "tool_describe", "tool_search", "write"], "roles": ["system", "user", "assistant", "user", "assistant", "tool", "assistant", "user", "assistant", "tool"]}
+MEASURED apply_patch '*** Update File: ws-link' (hunk replaces the file's one line with 'hello'): the model was given back: { "status": "error", "tool": "apply_patch", "error": "Symlink escapes sandbox root (~/.openclaw/workspace): ~/.openclaw/workspace/ws-link" }
+PASS the Update File call reached the tool and a result came back
+MEASURED state.json sha256 before: 0ad22a21d9d8a1d756889b6a6466756b8fef80bfa4e7d6c11e3dd57e4d897e5f
+MEASURED state.json sha256 after:  fedbe50ab2134b4bbc06879a350690a0fac09319a3eb876c2267fa080770eb5c
+MEASURED state.json now begins: {"schema":2,"next_message":0,"seen":["openclaw:agent:main:alpha"],"processes":{"
+MEASURED the refusal came from OpenClaw's own containment
+PASS the store file is still Lunchroom's JSON and does not hold the patch's line 'hello'
+
+== 3. apply_patch to a new file under a symlinked folder
+    turn: done
+    gateway: [90m2026-11-03T10:07:41.767+00:00[39m [36m[gateway][39m [36mhttp server listening (15 plugins: anthropic, browser, canvas, cua-computer, device-pair, file-transfer, geolocation, github, linux-node, lunchroom, memory-core, ollama, openai, talk-voice, xai; 8.3s)[39m
+    gateway: 2026-11-03T10:08:04.908+00:00 [tools] apply_patch failed: Symlink escapes sandbox root (~/.openclaw/workspace): ~/.openclaw/workspace/ws-link apply_patch is workspace-contained by configuration. Both tools.exec.applyPatch.workspaceOnly (default true) and tools.fs.workspaceOnly impose this independently, so clearing one can leave the other in force. tools.exec.mode does not affect it. raw_params={"
+    gateway: 2026-11-03T10:08:08.014+00:00 [tools] apply_patch failed: Symlink escapes sandbox root (~/.openclaw/workspace): ~/.openclaw/workspace/ws-dir apply_patch is workspace-contained by configuration. Both tools.exec.applyPatch.workspaceOnly (default true) and tools.fs.workspaceOnly impose this independently, so clearing one can leave the other in force. tools.exec.mode does not affect it. raw_params={"i
+MEASURED apply_patch '*** Add File: ws-dir/new.txt': the model was given back: { "status": "error", "tool": "apply_patch", "error": "Symlink escapes sandbox root (~/.openclaw/workspace): ~/.openclaw/workspace/ws-dir" }
+PASS the Add File call reached the tool and a result came back
+MEASURED the refusal came from OpenClaw's own containment
+PASS no file was created inside Lunchroom's store folder
+MEASURED status afterwards still lists alpha: AVAILABLE
+
+== result
+RESULT: 10 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-openclawws removed
+
+RESULT: 10 PASS, 0 FAIL

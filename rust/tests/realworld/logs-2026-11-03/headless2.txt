@@ -1,0 +1,57 @@
+MEASURED free space on /: 6210 MB
+== building lunchroom-realworld-headless from Containerfile
+MEASURED image lunchroom-realworld-headless: 417 MB
+
+== facts of this system
+claude: 2.1.311 (Claude Code)
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED claude --help:   --debug-file <path>                   Write debug logs to a specific file path
+MEASURED claude --help:                                         (implicitly enables debug mode)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code finished
+MEASURED installed hook: PreToolUse | ['bin', 'lunchroom guard pretool'] | {'timeout': 15}
+MEASURED installed hook: PostToolUse | ['bin', 'lunchroom guard posttool'] | {'timeout': 15}
+MEASURED installed hook: UserPromptSubmit | ['bin', 'lunchroom guard prompt'] | {'timeout': 15}
+MEASURED installed hook: SessionStart | ['bin', 'lunchroom guard start'] | {'timeout': 15}
+MEASURED installed hook: SessionStart | ['bin', 'lunchroom listen'] | {'asyncRewake': True, 'timeout': 86400}
+MEASURED installed hook: Stop | ['bin', 'lunchroom listen'] | {'asyncRewake': True, 'timeout': 86400}
+MEASURED installed hook: PostToolUseFailure | ['bin', 'lunchroom guard posttool'] | {'timeout': 15}
+
+== spelling 'p': claude -p say hi
+MEASURED control (no hooks): exit 0 after 1512 ms; stdout: 'ok '; stderr: ''
+PASS p control: without hooks it prints the mock's answer ('ok' in the output) and exits 0, in 1512 ms
+MEASURED Lunchroom's hooks: exit 124 after 120430 ms; stdout: ''; stderr: 'Error: No messages returned from query '
+---- debug log lines for the hooks of 'p':
+    | 2026-11-03T17:02:45.862Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom guard start] finished with status 0 (30ms)
+    | 2026-11-03T17:02:45.870Z [DEBUG] "Hook SessionStart:startup (SessionStart) success:\n{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\"},\"systemMessage\":\"Lunchroom: include this session? Type join, or join <name>. Anyt
+    | 2026-11-03T17:04:45.335Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom listen] finished with status 1 (119501ms)
+    | 2026-11-03T17:04:45.335Z [ERROR] Hook SessionStart:startup (SessionStart) error: status code 1
+FAIL p with Lunchroom's hooks did NOT finish: killed by the 120 s timeout (exit 124) after 120430 ms; stdout ''
+
+== spelling 'json': claude -p say hi --output-format json
+MEASURED control (no hooks): exit 0 after 1341 ms; stdout: '{"duration_api_ms":33,"stop_reason":"end_turn","session_id":"7f447662-aee3-4eb5-8da6-3925abf93c47","total_cost_usd":0.00010400000000000001,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"output_tokens_details":{"thinking_tokens":0},"server_too'; stderr: ''
+PASS json control: without hooks it prints the mock's answer ('ok' in the output) and exits 0, in 1341 ms
+MEASURED Lunchroom's hooks: exit 124 after 120399 ms; stdout: ''; stderr: 'Error: No messages returned from query '
+---- debug log lines for the hooks of 'json':
+    | 2026-11-03T17:04:47.748Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom guard start] finished with status 0 (37ms)
+    | 2026-11-03T17:04:47.754Z [DEBUG] "Hook SessionStart:startup (SessionStart) success:\n{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\"},\"systemMessage\":\"Lunchroom: include this session? Type join, or join <name>. Anyt
+    | 2026-11-03T17:06:47.151Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom listen] finished with status 1 (119438ms)
+    | 2026-11-03T17:06:47.152Z [ERROR] Hook SessionStart:startup (SessionStart) error: status code 1
+FAIL json with Lunchroom's hooks did NOT finish: killed by the 120 s timeout (exit 124) after 120399 ms; stdout ''
+
+== spelling 'print': claude --print say hi
+MEASURED control (no hooks): exit 0 after 1299 ms; stdout: 'ok '; stderr: ''
+PASS print control: without hooks it prints the mock's answer ('ok' in the output) and exits 0, in 1299 ms
+MEASURED Lunchroom's hooks: exit 124 after 120429 ms; stdout: ''; stderr: 'Error: No messages returned from query '
+---- debug log lines for the hooks of 'print':
+    | 2026-11-03T17:06:49.379Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom guard start] finished with status 0 (35ms)
+    | 2026-11-03T17:06:49.385Z [DEBUG] "Hook SessionStart:startup (SessionStart) success:\n{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\"},\"systemMessage\":\"Lunchroom: include this session? Type join, or join <name>. Anyt
+    | 2026-11-03T17:08:48.898Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom listen] finished with status 1 (119552ms)
+    | 2026-11-03T17:08:48.899Z [ERROR] Hook SessionStart:startup (SessionStart) error: status code 1
+FAIL print with Lunchroom's hooks did NOT finish: killed by the 120 s timeout (exit 124) after 120429 ms; stdout ''
+
+== result
+RESULT: 4 PASS, 3 FAIL
+MEASURED image lunchroom-realworld-headless removed
+
+RESULT: 4 PASS, 3 FAIL

@@ -1,0 +1,51 @@
+MEASURED free space on /: 8890 MB
+== building lunchroom-realworld-headless from Containerfile
+MEASURED image lunchroom-realworld-headless: 417 MB
+
+== facts of this system
+claude: 2.1.311 (Claude Code)
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED claude --help:   --debug-file <path>                   Write debug logs to a specific file path
+MEASURED claude --help:                                         (implicitly enables debug mode)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code finished
+MEASURED installed hook: PreToolUse | ['bin', 'lunchroom guard pretool'] | {'timeout': 15}
+MEASURED installed hook: PostToolUse | ['bin', 'lunchroom guard posttool'] | {'timeout': 15}
+MEASURED installed hook: UserPromptSubmit | ['bin', 'lunchroom guard prompt'] | {'timeout': 15}
+MEASURED installed hook: SessionStart | ['bin', 'lunchroom guard start'] | {'timeout': 15}
+MEASURED installed hook: SessionStart | ['bin', 'lunchroom listen'] | {'asyncRewake': True, 'timeout': 86400}
+MEASURED installed hook: Stop | ['bin', 'lunchroom listen'] | {'asyncRewake': True, 'timeout': 86400}
+MEASURED installed hook: PostToolUseFailure | ['bin', 'lunchroom guard posttool'] | {'timeout': 15}
+
+== spelling 'p': claude -p say hi
+MEASURED control (no hooks): exit 0 after 1316 ms; stdout: 'ok '; stderr: ''
+PASS p control: without hooks it prints the mock's answer ('ok' in the output) and exits 0, in 1316 ms
+MEASURED Lunchroom's hooks: exit 0 after 1262 ms; stdout: 'ok '; stderr: ''
+---- debug log lines for the hooks of 'p':
+    | 2026-11-04T03:13:36.782Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom guard start] finished with status 0 (41ms)
+    | 2026-11-04T03:13:36.784Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom listen] finished with status 0 (41ms)
+PASS p with Lunchroom's hooks printed the mock's answer and exited 0 in 1262 ms
+
+== spelling 'json': claude -p say hi --output-format json
+MEASURED control (no hooks): exit 0 after 1121 ms; stdout: '{"duration_api_ms":28,"stop_reason":"end_turn","session_id":"9af62694-4263-4b9e-bed1-14c5ec7c6eb8","total_cost_usd":0.00010400000000000001,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"output_tokens_details":{"thinking_tokens":0},"server_too'; stderr: ''
+PASS json control: without hooks it prints the mock's answer ('ok' in the output) and exits 0, in 1121 ms
+MEASURED Lunchroom's hooks: exit 0 after 1055 ms; stdout: '{"duration_api_ms":30,"stop_reason":"end_turn","session_id":"372de046-f9c7-46e0-8abb-46c6db3cc725","total_cost_usd":0.00010400000000000001,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"output_tokens_details":{"thinking_tokens":0},"server_too'; stderr: ''
+---- debug log lines for the hooks of 'json':
+    | 2026-11-04T03:13:39.144Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom listen] finished with status 0 (21ms)
+    | 2026-11-04T03:13:39.184Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom guard start] finished with status 0 (63ms)
+PASS json with Lunchroom's hooks printed the mock's answer and exited 0 in 1055 ms
+
+== spelling 'print': claude --print say hi
+MEASURED control (no hooks): exit 0 after 1221 ms; stdout: 'ok '; stderr: ''
+PASS print control: without hooks it prints the mock's answer ('ok' in the output) and exits 0, in 1221 ms
+MEASURED Lunchroom's hooks: exit 0 after 1231 ms; stdout: 'ok '; stderr: ''
+---- debug log lines for the hooks of 'print':
+    | 2026-11-04T03:13:41.527Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom listen] finished with status 0 (60ms)
+    | 2026-11-04T03:13:41.528Z [DEBUG] Hooks: SessionStart:startup [/home/dev/.lunchroom/bin/lunchroom guard start] finished with status 0 (63ms)
+PASS print with Lunchroom's hooks printed the mock's answer and exited 0 in 1231 ms
+
+== result
+RESULT: 7 PASS, 0 FAIL
+MEASURED image lunchroom-realworld-headless removed
+
+RESULT: 7 PASS, 0 FAIL

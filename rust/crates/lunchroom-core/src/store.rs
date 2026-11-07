@@ -14,6 +14,7 @@ use std::marker::PhantomData;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -27,15 +28,31 @@ const PREVIOUS_TEMP: &str = "state.json.prev.tmp";
 const GUARD_FILE: &str = "state.flock";
 /// How long a reader or writer waits for another to finish: past it, the store is reported busy,
 /// so no command, the user's own included, waits on a process that never lets go.
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 static STOPPED: AtomicBool = AtomicBool::new(false);
+
+/// H1.7: the step of waiting for another Lunchroom process to let go of the store.
+const WAITING_STEP: &str = "waiting for another Lunchroom process to release Lunchroom's store";
 
 /// From now on, no update in this process changes the state (H1.5: a guard past its deadline
 /// answers as one that could not decide, so nothing it is still doing may commit a different
 /// outcome). An update already under way finishes.
 pub fn stop_updates() {
     STOPPED.store(true, Ordering::SeqCst);
+}
+
+/// The time a caller with a limit of its own (a hook that must answer within its time) allows
+/// every wait for the store to end by; none unless [`limit_waits_until`] set one.
+static WAIT_END: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// From now on, no wait for the store in this process lasts past `end`: a wait that would is
+/// reported busy at `end`. Set by a program that must answer within a time of its own; the
+/// longest wait ([`LOCK_WAIT`]) still applies as well.
+pub fn limit_waits_until(end: std::time::Instant) {
+    if let Ok(mut set) = WAIT_END.lock() {
+        *set = Some(end);
+    }
 }
 
 /// The longest pause between tries for a lock held by another.
@@ -50,14 +67,24 @@ fn longer(pause: std::time::Duration) -> std::time::Duration {
 /// after 1 ms, so a lock held briefly costs little more than that wait, not a flat 20 ms.
 fn wait_for(try_lock: impl Fn() -> Result<(), fs::TryLockError>) -> io::Result<()> {
     let start = std::time::Instant::now();
+    let limit = WAIT_END.lock().ok().and_then(|set| *set);
     let mut pause = std::time::Duration::from_millis(1);
     loop {
         match try_lock() {
             Ok(()) => return Ok(()),
             Err(fs::TryLockError::Error(e)) => return Err(e),
-            Err(fs::TryLockError::WouldBlock) if start.elapsed() < LOCK_WAIT => {
+            Err(fs::TryLockError::WouldBlock)
+                if start.elapsed() < LOCK_WAIT && limit.is_none_or(|end| Instant::now() < end) =>
+            {
                 std::thread::sleep(pause);
                 pause = longer(pause);
+            }
+            Err(fs::TryLockError::WouldBlock) if start.elapsed() < LOCK_WAIT => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another Lunchroom process held the store for as long as this program waits \
+                     for it",
+                ));
             }
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(io::Error::new(
@@ -112,10 +139,28 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
+        crate::setgid::settle(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
             kind: PhantomData,
         })
+    }
+
+    /// The state in `dir` as last written, read without creating or locking anything (C1.4:
+    /// `lunchroom doctor` changes no file): the default state when there is no folder or no state
+    /// yet. Every write replaces the state file whole by a rename, so the file read is one whole
+    /// state.
+    ///
+    /// # Errors
+    /// When the state file cannot be read or does not parse, or it is missing beside a previous
+    /// state.
+    pub fn read_without_change(dir: &Path) -> io::Result<T> {
+        Self {
+            dir: dir.to_path_buf(),
+            kind: PhantomData,
+        }
+        .load()
+        .map(|(state, _)| state)
     }
 
     /// The state as last written; the default state before the first write.
@@ -123,8 +168,13 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
     /// # Errors
     /// When the state file cannot be read or does not parse.
     pub fn read(&self) -> io::Result<T> {
+        // H1.7: the steps named if the guard's time runs out here.
+        let _step = crate::steps::begin("reading Lunchroom's store");
         let guard = self.guard()?;
-        wait_for(|| guard.try_lock_shared())?;
+        {
+            let _wait = crate::steps::begin(WAITING_STEP);
+            wait_for(|| guard.try_lock_shared())?;
+        }
         let state = self.load().map(|(state, _)| state);
         guard.unlock()?;
         state
@@ -164,8 +214,13 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
         change: impl FnOnce(&mut T) -> R,
         crash: Option<Crash>,
     ) -> io::Result<R> {
+        // H1.7: the steps named if the guard's time runs out here.
+        let _step = crate::steps::begin("updating Lunchroom's store");
         let guard = self.guard()?;
-        wait_for(|| guard.try_lock())?;
+        {
+            let _wait = crate::steps::begin(WAITING_STEP);
+            wait_for(|| guard.try_lock())?;
+        }
         // Checked under the lock: an update that starts after `stop_updates` changes nothing.
         let result = if STOPPED.load(Ordering::SeqCst) {
             Err(io::Error::other(
@@ -197,6 +252,7 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
             .truncate(true)
             .mode(0o600)
             .open(&temp)?;
+        crate::setgid::settle(&temp);
         let half = bytes.len() / 2;
         file.write_all(&bytes[..half])?;
         if crash == Some(Crash::MidWrite) {
@@ -281,6 +337,7 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
             .truncate(true)
             .mode(0o600)
             .open(&temp)?;
+        crate::setgid::settle(&temp);
         file.write_all(previous.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -350,13 +407,16 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
     /// The file whose exclusive lock admits one writer at a time. It is never replaced, so every
     /// process locks the same file.
     fn guard(&self) -> io::Result<File> {
-        OpenOptions::new()
+        let path = self.dir.join(GUARD_FILE);
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(self.dir.join(GUARD_FILE))
+            .open(&path)?;
+        crate::setgid::settle(&path);
+        Ok(file)
     }
 }
 

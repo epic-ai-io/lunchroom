@@ -12,14 +12,16 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use lunchroom_core::identity::Identity;
-use lunchroom_core::mail::{Mail, Status};
+use lunchroom_core::mail::Mail;
 use lunchroom_core::store::Store;
 
+use crate::checks::clock_now;
 use crate::codex::{
-    CHILD_ENV, Delivered, UNREADABLE_ENV, failed, fits_one_argument, guarded, message_is,
-    recipient_env, recipient_program, update,
+    Again, CHILD_ENV, Delivered, FailedAs, UNREADABLE_ENV, failed, fits_one_argument, guarded,
+    recipient_env, recipient_program, settled, update,
 };
 use crate::delivery::envelope;
+use crate::evidence::evidence;
 use crate::home::Env;
 
 /// How long Lunchroom watches a started `openclaw agent` for an early failure.
@@ -106,16 +108,54 @@ pub fn deliver(
     to: &Identity,
     by: Option<&Identity>,
 ) -> Result<Delivered, String> {
+    hand_over(env, store, to, by, Again::No)
+}
+
+/// D1.7: offers `to` again, at once and with no wait, a message whose earlier hand-over counted as
+/// failed, through the recipient's own `openclaw agent` as [`deliver`] does, whatever session the
+/// check that calls this runs in; with `only_from`, only that sender's own message, since the check
+/// then runs in that sender's process (D1.1). No other message is offered.
+///
+/// # Errors
+/// When the store cannot be used.
+pub fn deliver_again(
+    env: &Env,
+    store: &Store<Mail>,
+    to: &Identity,
+    only_from: Option<&Identity>,
+) -> Result<Delivered, String> {
+    hand_over(env, store, to, None, Again::Of(only_from))
+}
+
+/// [`deliver`], or with [`Again::Of`] [`deliver_again`].
+fn hand_over(
+    env: &Env,
+    store: &Store<Mail>,
+    to: &Identity,
+    by: Option<&Identity>,
+    again: Again<'_>,
+) -> Result<Delivered, String> {
     let wait = by.is_some();
+    // What the evidence shows of the session is judged before the store's lock is taken: the
+    // judgment reads files and processes.
+    let judged = {
+        let mail = store.read().map_err(crate::cli::unread)?;
+        evidence(&mail, to, &env.home)
+    };
     // The hand-over mark is kept before `openclaw agent` starts: a crash after it can leave the
     // message not confirmed, never handed over twice (D1.2). No hold is needed first: the plugin
-    // holds the session when the turn's prompt reaches it, before the model sees it.
+    // holds the session when the turn's prompt reaches it, before the model sees it. The clock is
+    // read under the lock, not at the start of the process.
     let next = update(store, |m| {
-        if !guarded(m, env, to) {
+        let now = clock_now(env);
+        if !guarded(m, now, judged) {
             return None;
         }
         let record = m.session(to).cloned()?;
-        let message = m.present_from(to, by, env.now)?;
+        let message = match again {
+            Again::Of(only_from) => m.present_again_from(to, only_from, now)?,
+            Again::No => m.present_from(to, by, now)?,
+        };
         m.handed_over(&message.id);
         Some((
             message.id.clone(),
@@ -133,6 +173,7 @@ pub fn deliver(
             store,
             id,
             "the envelope does not fit one command argument".to_owned(),
+            clock_now(env),
         );
     }
     // A recipient's `openclaw` program that cannot be established says nothing about the
@@ -141,14 +182,19 @@ pub fn deliver(
         Ok(command) => command,
         Err(reason) => {
             update(store, |m| m.hand_over_undone(&id))?;
-            return Ok(Delivered::Failed(id, reason, false));
+            return Ok(Delivered::Failed(id, reason, FailedAs::NotAttempted));
         }
     };
     let Some(variables) = gateway_env(&process) else {
         update(store, |m| m.hand_over_undone(&id))?;
-        return Ok(Delivered::Failed(id, UNREADABLE_ENV.to_owned(), false));
+        return Ok(Delivered::Failed(
+            id,
+            UNREADABLE_ENV.to_owned(),
+            FailedAs::NotAttempted,
+        ));
     };
-    let started = Command::new(&program)
+    let mut command = Command::new(&program);
+    command
         .args(bin)
         .args(["agent", "--session-key", &to.session, "--message", &text])
         .env_clear()
@@ -156,37 +202,50 @@ pub fn deliver(
         .envs(variables)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    // 1.1: a child never inherits the group that opens the store.
+    lunchroom_core::setgid::drop_group(&mut command);
+    let started = command.spawn();
     let mut child = match started {
         Ok(child) => child,
-        Err(e) => return failed(store, id, format!("openclaw agent could not start: {e}")),
+        Err(e) => {
+            return failed(
+                store,
+                id,
+                format!("openclaw agent could not start: {e}"),
+                clock_now(env),
+            );
+        }
     };
-    let confirmed = || message_is(store, &id, |d| d.status == Status::Delivered);
+    // What the store says of the message: DELIVERED (the plugin confirmed it) or FAILED (it was
+    // made FAILED while the turn ran) end the wait, and are reported as they are, never one for
+    // the other; anything else is not confirmed.
+    let ended = || -> Result<Option<Delivered>, String> {
+        Ok(match settled(store, id.clone())? {
+            done @ (Delivered::Confirmed(_) | Delivered::Failed(..)) => Some(done),
+            _ => None,
+        })
+    };
     let start = Instant::now();
     let limit = if wait { CONFIRM_WAIT } else { START_CHECK };
     loop {
-        if confirmed() {
-            return Ok(Delivered::Confirmed(id));
+        if let Some(done) = ended()? {
+            return Ok(done);
         }
         match child.try_wait() {
             // The turn ran to its end; the plugin confirmed it if the prompt reached it.
-            Ok(Some(status)) if status.success() => {
-                return Ok(if confirmed() {
-                    Delivered::Confirmed(id)
-                } else {
-                    Delivered::Unconfirmed(id)
-                });
-            }
+            Ok(Some(status)) if status.success() => return settled(store, id),
             // An error before the plugin saw the prompt: the gateway did not take the message.
-            Ok(Some(status)) if !confirmed() => {
+            Ok(Some(status)) => {
+                if let Some(done) = ended()? {
+                    return Ok(done);
+                }
                 let reason = format!("openclaw agent exited {}", status.code().unwrap_or(-1));
-                return failed(store, id, reason);
+                return failed(store, id, reason, clock_now(env));
             }
-            Ok(Some(_)) => return Ok(Delivered::Confirmed(id)),
             Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(200)),
             // Still running: the turn goes on without Lunchroom waiting for it (D1.3).
-            Ok(None) | Err(_) => return Ok(Delivered::Unconfirmed(id)),
+            Ok(None) | Err(_) => return settled(store, id),
         }
     }
 }

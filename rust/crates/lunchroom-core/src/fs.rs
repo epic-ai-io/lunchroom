@@ -112,6 +112,17 @@ pub trait Fs {
     fn real(&self, p: &Path) -> PathBuf;
     /// What `p` is, not following it if it is a link.
     fn node(&self, p: &Path) -> Node;
+    /// The time this view allows for looking at the file system has run out (never, by default).
+    /// [`Fs::resolve`] looks at no further part once it has, and says so by returning incomplete.
+    fn out_of_time(&self) -> bool {
+        false
+    }
+    /// Process `pid` is process `root` or one of its descendants (1.1: the agent's own subtree).
+    /// A view that cannot tell says no.
+    fn descends_from(&self, pid: u32, root: u32) -> bool {
+        let _ = (pid, root);
+        false
+    }
     /// Resolves the absolute path `p` as the operating system does when it opens it: part by part
     /// from the root, a link replaced by its target (relative to the folder holding the link), and
     /// `..` leaving the folder reached so far, which is already real. A part that does not exist
@@ -130,6 +141,13 @@ pub trait Fs {
             }
             let next = out.join(&part);
             if !exists {
+                out = next;
+                continue;
+            }
+            // Out of time: no more looking. The rest stays as written and the result is
+            // incomplete, so the caller treats the file as possibly anywhere.
+            if self.out_of_time() {
+                (exists, complete) = (false, false);
                 out = next;
                 continue;
             }
@@ -230,6 +248,37 @@ impl Fs for OsFs {
         }
     }
 
+    fn out_of_time(&self) -> bool {
+        self.expired()
+    }
+
+    fn descends_from(&self, pid: u32, root: u32) -> bool {
+        // The parent of a process is field 4 of /proc/<pid>/stat, after the name (which may hold
+        // spaces and `)`).
+        let mut at = pid;
+        for _ in 0..64 {
+            if at == root {
+                return true;
+            }
+            if at <= 1 {
+                return false;
+            }
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{at}/stat")) else {
+                return false;
+            };
+            let Some(parent) = stat
+                .rfind(')')
+                .and_then(|i| stat.get(i + 2..))
+                .and_then(|rest| rest.split(' ').nth(1))
+                .and_then(|p| p.parse::<u32>().ok())
+            else {
+                return false;
+            };
+            at = parent;
+        }
+        false
+    }
+
     fn node(&self, p: &Path) -> Node {
         match std::fs::symlink_metadata(p) {
             Ok(m) if m.file_type().is_symlink() => {
@@ -282,7 +331,13 @@ impl Fs for OsFs {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            for e in entries.flatten() {
+            for (seen, e) in entries.flatten().enumerate() {
+                // A folder of many names, matched against a long pattern, must not keep the guard
+                // past its time: the clock is read every 64 names.
+                if seen % 64 == 63 && self.expired() {
+                    out.capped = true;
+                    return out;
+                }
                 let name = e.file_name().to_string_lossy().into_owned();
                 let path = e.path();
                 if part == "**" {
@@ -360,7 +415,12 @@ impl Fs for OsFs {
         let Ok(meta) = std::fs::metadata(p) else {
             return false;
         };
-        let executable = meta.is_file() && meta.permissions().mode() & 0o111 != 0;
+        // Only a regular file is opened: a terminal device (`/dev/pts/7`), a pipe or a socket
+        // named in a command blocks the open or the read, and runs as no script.
+        if !meta.is_file() {
+            return false;
+        }
+        let executable = meta.permissions().mode() & 0o111 != 0;
         let mut head = [0u8; 4];
         // An executable file the guard cannot open is judged as one: `script` then refuses it.
         let Ok(mut file) = std::fs::File::open(p) else {
@@ -391,19 +451,66 @@ pub fn fnmatch(pattern: &str, name: &str) -> bool {
     match_from(&p, &n)
 }
 
-fn match_from(p: &[char], n: &[char]) -> bool {
-    match p.first() {
-        None => n.is_empty(),
-        Some('*') => (0..=n.len()).any(|k| match_from(&p[1..], &n[k..])),
-        Some('?') => !n.is_empty() && match_from(&p[1..], &n[1..]),
-        Some('[') => match class(p) {
-            Some((len, set)) => n
-                .first()
-                .is_some_and(|c| set(*c) && match_from(&p[len..], &n[1..])),
-            None => n.first() == Some(&'[') && match_from(&p[1..], &n[1..]),
+/// What the pattern at one place does with one character of the name.
+enum Step {
+    /// A `*`: matches any run of characters, tried shortest first.
+    Star,
+    /// Matches this character; the pattern goes on at this place.
+    One(usize),
+    /// Does not match.
+    No,
+}
+
+fn step(p: &[char], at: usize, c: char) -> Step {
+    match p.get(at) {
+        Some('*') => Step::Star,
+        Some('?') => Step::One(at + 1),
+        Some('[') => match class(&p[at..]) {
+            Some((len, set)) if set(c) => Step::One(at + len),
+            None if c == '[' => Step::One(at + 1),
+            Some(_) | None => Step::No,
         },
-        Some(c) => n.first() == Some(c) && match_from(&p[1..], &n[1..]),
+        Some(lit) if *lit == c => Step::One(at + 1),
+        Some(_) | None => Step::No,
     }
+}
+
+/// Matches the whole of `n` against `p`, remembering only the last `*` to go back to, so the work
+/// is at most the product of the two lengths. (A match that tried every split at every `*` takes
+/// time exponential in the number of stars: `a*a*a*a*a*b` against a long run of `a`, or a patch
+/// text read as a wildcard, would keep the guard past its time.)
+fn match_from(p: &[char], n: &[char]) -> bool {
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // After the last `*` seen: the place in the pattern after it, and the place in the name it has
+    // matched up to.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        match step(p, pi, n[ni]) {
+            Step::Star => {
+                star = Some((pi + 1, ni));
+                pi += 1;
+                continue;
+            }
+            Step::One(next) => {
+                pi = next;
+                ni += 1;
+                continue;
+            }
+            Step::No => {}
+        }
+        match star {
+            Some((after, matched)) => {
+                star = Some((after, matched + 1));
+                pi = after;
+                ni = matched + 1;
+            }
+            None => return false,
+        }
+    }
+    while p.get(pi) == Some(&'*') {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// A `[...]` class at the start of `p`: its length and its test, or `None` if unterminated.
@@ -759,5 +866,43 @@ mod tests {
         assert!(fnmatch(".e*", ".env"));
         assert!(fnmatch("a[b", "a[b"));
         assert!(fnmatch("[]]x", "]x"));
+    }
+
+    // G1-1: a pattern with many stars against a name that nearly matches took time exponential in
+    // the stars when every split was tried; it is decided at once, with the right answer, and
+    // the cases where backing up to the last `*` matters still match.
+    #[test]
+    fn fnmatch_with_many_stars_is_decided_at_once() {
+        let started = std::time::Instant::now();
+        let pattern = format!("{}b", "a*".repeat(40));
+        let name = "a".repeat(200);
+        assert!(!fnmatch(&pattern, &name));
+        assert!(fnmatch(&pattern, &format!("{name}b")));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(fnmatch("*a*b*c", "xxabxxbxcxxc"));
+        assert!(fnmatch("*.rs", "main.rs"));
+        assert!(!fnmatch("*.rs", "main.rsx"));
+        assert!(fnmatch("a**b", "ab"));
+        assert!(fnmatch("**", "anything"));
+        assert!(fnmatch("*", ""));
+        assert!(!fnmatch("?", ""));
+    }
+
+    // G1-1: a view whose time has run out looks at no more parts of a path; the result is
+    // incomplete (the file may be anywhere) and keeps the rest as written.
+    #[test]
+    fn resolve_out_of_time_is_incomplete() {
+        let t = Tmp::new();
+        t.put("a/b/c.txt");
+        let fs = OsFs::new(Duration::ZERO);
+        let r = fs.resolve(&t.0.join("a/b/c.txt"));
+        assert!(!r.complete);
+        assert_eq!(r.path, t.0.join("a/b/c.txt"));
+        let fresh = OsFs::new(BUDGET);
+        assert!(fresh.resolve(&t.0.join("a/b/c.txt")).complete);
     }
 }

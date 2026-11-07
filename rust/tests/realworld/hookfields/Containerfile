@@ -1,0 +1,29 @@
+# Proof 10 (hookfields): which output field of a PreToolUse hook Claude Code 2.1.311 shows on its default
+# screen, and which it folds, for the same refusal said three ways.
+#
+# Claude Code from Anthropic's apt repository, as in ../hooktext/Containerfile.
+#
+# Build context: made by ../prove.sh.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISTRO=apt
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      curl gnupg ca-certificates sudo python3 python3-pyte procps util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /etc/apt/keyrings/claude-code.asc \
+ && gpg --show-keys --with-colons /etc/apt/keyrings/claude-code.asc | grep -q '^fpr:::::::::31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE:' \
+ && echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
+      > /etc/apt/sources.list.d/claude-code.list \
+ && apt-get update \
+ && apt-get install -y claude-code \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY lunchroom lib.sh ptyrun.py sessionpty.py plaintext.py hang.py mockapi.py screen.py variant-hook.sh inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/sessionpty.py \
+      /opt/proof/plaintext.py /opt/proof/hang.py /opt/proof/mockapi.py /opt/proof/screen.py /opt/proof/variant-hook.sh
+
+CMD ["/opt/proof/inner.sh"]

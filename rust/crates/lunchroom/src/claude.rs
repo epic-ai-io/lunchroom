@@ -13,17 +13,18 @@ use serde_json::{Value, json};
 use lunchroom_core::approvals::Request;
 use lunchroom_core::cards;
 use lunchroom_core::classify::Guard;
+use lunchroom_core::denial::{self, Denial};
 use lunchroom_core::fs::{BUDGET, OsFs};
 use lunchroom_core::identity::{Harness, Identity};
-use lunchroom_core::mail::{Confirmation, Mail, Origin, RegisterRefusal, Status};
+use lunchroom_core::mail::{Confirmation, Mail, Notice, Origin, RegisterRefusal, Status};
 use lunchroom_core::policy::{
-    CallClass, Decision, DenyReason, ProtectedKind, Situation, YoloSource, decide,
+    CallClass, Decision, DenyReason, HoldMode, ProtectedKind, Situation, YoloSource, decide,
 };
 use lunchroom_core::store::Store;
 use lunchroom_core::vocab::{AgentState, Verdict, Word};
 
 use crate::delivery;
-use crate::evidence::evidence;
+use crate::evidence::Why;
 use crate::home::Env;
 use crate::process;
 
@@ -54,6 +55,10 @@ pub enum HookOut {
     },
 }
 
+/// What HELD means, in the words every message uses the first time it says HELD (the standard
+/// vocabulary's HELD row; one text for every message, `lunchroom_core::vocab`).
+const HELD_MEANS: &str = lunchroom_core::vocab::HELD_MEANING;
+
 /// H1.5: what the guard answers when it cannot decide (its own error, a store it cannot use, or
 /// its deadline passed), given the hook's raw input. Never a lockout: a call goes to the user, or
 /// is DENIED alone where nobody can answer (A1.2); a prompt or a result goes on and the user is
@@ -61,7 +66,6 @@ pub enum HookOut {
 /// could not hold the session it reaches.
 #[must_use]
 pub fn failed(mode: Option<&str>, reason: &str, raw: &str, channel: bool) -> HookOut {
-    let why = format!("Lunchroom could not check this: {reason}.");
     // The prompt's own text; the whole input only when it is not JSON at all.
     let parsed: Option<Value> = serde_json::from_str(raw).ok();
     let prompt = match &parsed {
@@ -99,21 +103,268 @@ pub fn failed(mode: Option<&str>, reason: &str, raw: &str, channel: bool) -> Hoo
         }
         let _ = std::fs::write(marker, b"");
     }
+    // T1.7, H1.5: the time ran out while the transcript of a session seen for the first time was
+    // being read. That read is not repeated, and the text left unread may carry another agent's
+    // message, so the session's next hook that can use the store holds it.
+    if cut_off_in_transcript(reason)
+        && let (Ok(input), Ok(env)) = (HookInput::parse(raw), Env::from_process())
+    {
+        let marker = unjudged_marker(&env, &input.me());
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(marker, UNREAD_TRANSCRIPT.as_bytes());
+    }
+    // H1.7: the call, the cause and the ways forward, as V1.4 explains a DENIED call. A call that
+    // nobody can be asked about is kept for `lunchroom approve` when the store can still hold it.
+    let kept = mode == Some("pretool")
+        && !channel
+        && matches!(Cause::of(reason), Cause::Own(_))
+        && keep_for_approval(raw, reason);
+    let text = undecided_details(mode, reason, raw, channel, agent_text, kept);
     match mode {
-        Some("pretool") if channel => HookOut::Ask(format!(
-            "Lunchroom: could not check this: {reason}. Any script this call runs was not read. \
-             The call goes to you."
-        )),
-        Some("prompt") if agent_text => HookOut::Block(why),
+        Some("pretool") if channel => HookOut::Ask(text),
+        Some("prompt") if agent_text => HookOut::Block(text),
         // I1.5: a session's start still shows the user how to include it.
-        Some("start") => HookOut::Notice(format!("{INCLUDE_LINE} {why}")),
-        Some("prompt" | "posttool") => HookOut::Notice(why),
-        _ => HookOut::Block(why),
+        Some("start") => HookOut::Notice(format!("{INCLUDE_LINE} {text}")),
+        Some("prompt" | "posttool") => HookOut::Notice(text),
+        _ => HookOut::Block(text),
     }
 }
 
+/// H1.7: keeps the call in `raw`, a tool call the guard could not decide, for `lunchroom approve`,
+/// when the guard's own error left the store usable. `false` when it could not be kept (the input
+/// has no tool call, the store cannot be used or its writes have stopped).
+fn keep_for_approval(raw: &str, reason: &str) -> bool {
+    let (Ok(input), Ok(env)) = (HookInput::parse(raw), Env::from_process()) else {
+        return false;
+    };
+    let Ok(store) = store(&env) else {
+        return false;
+    };
+    keep_call(&store, &input, env.now, reason)
+}
+
+/// [`keep_for_approval`] in `store`, for the call `input` carries, at the time `now`.
+fn keep_call(store: &Store<Mail>, input: &HookInput, now: u64, reason: &str) -> bool {
+    let (Some(tool), Some(tool_input)) = (input.tool_name.as_deref(), input.tool_input.as_ref())
+    else {
+        return false;
+    };
+    let me = input.me();
+    let dir = execution_dir(input.harness, tool, tool_input, &input.cwd)
+        .to_string_lossy()
+        .into_owned();
+    store
+        .update(|m| {
+            let agent = m.name_of(&me).unwrap_or(&me.session).to_owned();
+            m.request(Request {
+                session: me.clone(),
+                agent,
+                tool: tool.to_owned(),
+                input: tool_input.clone(),
+                cwd: dir,
+                rule: format!(
+                    "This call is one Lunchroom could not check ({}), so it needs your yes.",
+                    Cause::of(reason).short()
+                ),
+                at: now,
+            });
+        })
+        .is_ok()
+}
+
+/// Why the guard could not decide a call, read from the reason it gave (H1.7): no answer in time
+/// (the reason names the step still running), a store it cannot use (the store's own error names
+/// what is wrong), or its own error (named).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cause<'a> {
+    TimedOut {
+        seconds: &'a str,
+        step: Option<&'a str>,
+    },
+    Store(&'a str),
+    Own(&'a str),
+}
+
+impl<'a> Cause<'a> {
+    /// The cause behind `reason`: `no answer within <n> seconds[, while the guard was <step>]`
+    /// (main.rs), an error naming Lunchroom's store, or anything else, the guard's own error.
+    pub(crate) fn of(reason: &'a str) -> Self {
+        if let Some(rest) = reason.strip_prefix("no answer within ") {
+            let (seconds, tail) = rest.split_once(" seconds").unwrap_or((rest, ""));
+            let step = tail
+                .strip_prefix(", while the guard was ")
+                .filter(|s| !s.is_empty());
+            Self::TimedOut { seconds, step }
+        } else if reason.starts_with("Lunchroom's store") || reason.contains("the store") {
+            Self::Store(reason)
+        } else {
+            Self::Own(reason)
+        }
+    }
+
+    /// The cause in a few words, for a message's first line.
+    pub(crate) fn short(&self) -> String {
+        match self {
+            Self::TimedOut { seconds, .. } => {
+                format!("Lunchroom did not finish within {seconds} seconds")
+            }
+            Self::Store(_) => "Lunchroom's store could not be used".to_owned(),
+            Self::Own(_) => "Lunchroom hit an error of its own".to_owned(),
+        }
+    }
+
+    /// The cause in full, naming what went wrong (the step, the store's error, the error).
+    pub(crate) fn long(&self) -> String {
+        match self {
+            Self::TimedOut {
+                seconds,
+                step: Some(step),
+            } => format!("Lunchroom did not finish within {seconds} seconds; it was still {step}"),
+            Self::TimedOut {
+                seconds,
+                step: None,
+            } => format!(
+                "Lunchroom did not finish within {seconds} seconds; which step it was in is not \
+                 known"
+            ),
+            Self::Store(reason) => format!(
+                "Lunchroom's store, the folder where it keeps its records, could not be used \
+                 ({reason})"
+            ),
+            Self::Own(reason) => format!("Lunchroom hit an error of its own ({reason})"),
+        }
+    }
+}
+
+/// H1.7 (docs/spec/lunchroom-spec.md §13 item 7): "A call the guard cannot decide (item 5) is
+/// explained as V1.4 explains a DENIED call: the call; the cause, which is the guard's own error
+/// (naming it), a store it cannot use (naming what is wrong with it), or no answer within 10
+/// seconds (naming the step that was still running when the time ran out); and the ways forward:
+/// `lunchroom approve` for that exact call where it is kept for the user, running it in a terminal
+/// of their own, and `lunchroom doctor`."
+///
+/// The first line carries the whole short answer (what could not be checked, why, and what
+/// happens next), so a display that shows one line is enough. The lines after it: what could not
+/// be checked, the cause and the rule, and each way forward. `kept` is whether the call was kept
+/// for `lunchroom approve`; that way is offered only then.
+pub(crate) fn undecided_details(
+    mode: Option<&str>,
+    reason: &str,
+    raw: &str,
+    channel: bool,
+    agent_text: bool,
+    kept: bool,
+) -> String {
+    let user = Word::TheUser.text();
+    let held = AgentState::Held.word();
+    let what = if mode == Some("prompt") && agent_text {
+        "a prompt carrying another agent's text".to_owned()
+    } else {
+        hook_call(mode, raw)
+    };
+    let cause = Cause::of(reason);
+    let short = cause.short();
+    let first = match mode {
+        Some("pretool") if channel => format!(
+            "Lunchroom could not check {what}: {short}. It needs your yes: answer this permission \
+             prompt (yes runs the call once, no stops it). Lunchroom did not read any script the \
+             call runs."
+        ),
+        Some("pretool") => format!(
+            "Lunchroom could not check {what}: {short}, and nobody can be asked in this session, so \
+             this one call is DENIED. The agent can try it once more; {user} can run it in a \
+             terminal of their own."
+        ),
+        Some("prompt") if agent_text => format!(
+            "Lunchroom blocked {what}: {short}, so it could not check the text. {} can send the \
+             prompt again once `lunchroom doctor` shows Lunchroom works.",
+            sentence(user)
+        ),
+        Some("prompt") => format!(
+            "Lunchroom could not check {what}: {short}. It went to the agent unchecked; Lunchroom \
+             never blocks what {user} types."
+        ),
+        Some("posttool") => format!(
+            "Lunchroom could not check {what}: {short}. The result went to the agent unchecked."
+        ),
+        // A session's start, and any other hook.
+        _ => format!("Lunchroom could not check {what}: {short}."),
+    };
+    let rule = match mode {
+        Some("pretool") if channel => format!(
+            "a call Lunchroom cannot check goes to {user}, so {user} is never shut out, and \
+             Lunchroom did not read any script the call runs"
+        ),
+        Some("pretool") => format!(
+            "a call Lunchroom cannot check goes to {user}, and this session has no permission \
+             prompt to ask in, so that one call is DENIED"
+        ),
+        Some("prompt") if agent_text => format!(
+            "a prompt carrying another agent's text is blocked when Lunchroom cannot check it, \
+             because Lunchroom could not then mark the session {held} ({held}: {HELD_MEANS})"
+        ),
+        Some("prompt") => format!(
+            "Lunchroom never blocks a prompt {user} types: this one went on to the agent unchecked"
+        ),
+        Some("posttool") => format!(
+            "the result went on to the agent unchecked; if it holds another agent's text, the \
+             session becomes {held} ({held}: {HELD_MEANS}) at its next call or prompt that \
+             Lunchroom can check"
+        ),
+        Some("start") => "the session went on; Lunchroom could not note its start".to_owned(),
+        _ => format!("a check Lunchroom cannot make never blocks {user}"),
+    };
+    let mut ways: Vec<String> = Vec::new();
+    match mode {
+        Some("pretool") if channel => ways.push(format!(
+            "{}: answer this permission prompt: yes runs this call once, no stops it.",
+            sentence(user)
+        )),
+        Some("pretool") => {
+            if kept {
+                ways.push(format!(
+                    "{}: `lunchroom approve` lists this exact call; approving it lets it run once \
+                     when the agent tries it again.",
+                    sentence(user)
+                ));
+            }
+            ways.push(
+                "The agent: try the call once more. If Lunchroom still cannot check it, stop and \
+                 tell the user what the call was for."
+                    .to_owned(),
+            );
+            ways.push(format!(
+                "{}: run it in a terminal of their own, outside every agent session.",
+                sentence(user)
+            ));
+        }
+        _ => {}
+    }
+    ways.push(format!(
+        "{}: run `lunchroom doctor` in a terminal of their own: it checks Lunchroom's setup and \
+         lists the calls Lunchroom could not check in the last 24 hours.",
+        sentence(user)
+    ));
+    let mut out = format!(
+        "{first}\nWhat could not be checked: {what}.\nWhy: {}; {rule}.\nWays forward:",
+        cause.long()
+    );
+    for way in ways {
+        let _ = write!(out, "\n- {way}");
+    }
+    out
+}
+
+/// H1.7: the cause of a call the guard could not decide, in plain words, from the reason the
+/// guard gave (see [`Cause`]).
+pub(crate) fn undecided_cause(reason: &str) -> String {
+    Cause::of(reason).long()
+}
+
 /// A1.1, A1.2: whether a person can answer this session's permission prompt.
-fn channel_of(input: &HookInput, env: &Env) -> bool {
+pub(crate) fn channel_of(input: &HookInput, env: &Env) -> bool {
     // The harness's own YOLO does not remove the channel: an interactive Claude Code shows a hook's
     // "ask" in every mode, `bypassPermissions` included (A1.1; measured in
     // docs/host-facts/claude-code-and-codex-2026-10-24.md section 1). A1.2 lists the no-channel cases for
@@ -143,12 +394,35 @@ fn unjudged_marker(env: &Env, who: &Identity) -> std::path::PathBuf {
     env.store_dir().join(format!("unjudged-{hex}"))
 }
 
+/// What `marker` (an [`unjudged_marker`]) says the guard did not judge, when it exists: the text
+/// in it, or "tool output" when it holds none (a tool output the guard could not judge leaves it
+/// empty).
+fn unjudged_source(marker: &Path) -> Option<String> {
+    if !marker.exists() {
+        return None;
+    }
+    let text = std::fs::read_to_string(marker).unwrap_or_default();
+    Some(if text.is_empty() {
+        "tool output".to_owned()
+    } else {
+        text
+    })
+}
+
+/// Whether the guard's `reason` for not answering says its time ran out while it was reading the
+/// session's transcript (H1.7 names the step still running).
+fn cut_off_in_transcript(reason: &str) -> bool {
+    reason.starts_with("no answer within ")
+        && reason.contains("while the guard was reading the session's transcript")
+}
+
 /// H1.5: a call the guard could not decide because of its store or an internal error is still
 /// judged by the rules that need no record, as if the agent were HELD: a call inside the shipped
 /// slip runs, a DENIED call is DENIED. `None` means those rules do not settle it (it goes to the
-/// user, or is DENIED where nobody can answer).
+/// user, or is DENIED where nobody can answer). `reason` is why the guard could not decide; the
+/// message names it (H1.7).
 #[must_use]
-pub fn failed_call(raw: &str) -> Option<HookOut> {
+pub fn failed_call(raw: &str, reason: &str) -> Option<HookOut> {
     let input = HookInput::parse(raw).ok()?;
     let env = Env::from_process().ok()?;
     let tool = input.tool_name.as_deref()?;
@@ -160,21 +434,41 @@ pub fn failed_call(raw: &str) -> Option<HookOut> {
         fs: &fs,
         held: true,
     };
-    match classify(&guard, tool, tool_input, &input.cwd) {
-        CallClass::InSlip => Some(HookOut::Silent),
-        CallClass::Denied(reason) => Some(HookOut::Block(denied(reason))),
+    let (judged_tool, judged_input) = as_claude_call(input.harness, tool, tool_input);
+    let run_dir = execution_dir(input.harness, tool, tool_input, &input.cwd);
+    match classify(&guard, &judged_tool, &judged_input, &run_dir) {
+        (CallClass::InSlip, _) => Some(HookOut::Silent),
+        (CallClass::Denied(denied), fault) => Some(HookOut::Block(explain(&DeniedCall {
+            reason: denied,
+            tool,
+            judged_tool: &judged_tool,
+            judged_input: &judged_input,
+            fault,
+            agent: input.me().session,
+            held_by: Vec::new(),
+            call: CallClass::Denied(denied),
+            mode: HoldMode::default(),
+            undecided: Some(Cause::of(reason).long()),
+        }))),
         _ => None,
     }
 }
 
-/// What the classifier says of a call, except that a HELD agent's `SendMessage` is PROTECTED: it
-/// puts a turn into another session without `lunchroom send`, so Lunchroom cannot judge the text,
-/// bind the reply to the sender (I1.4) or hold the receiver. The hold mode decides (P1.6).
-fn classify(guard: &Guard<'_>, tool: &str, input: &Value, cwd: &Path) -> CallClass {
+/// What the classifier says of a call, with what a DENIED rule found at fault (V1.4), except that
+/// a HELD agent's `SendMessage` is PROTECTED: it puts a turn into another session without
+/// `lunchroom send`, so Lunchroom cannot judge the text, bind the reply to the sender (I1.4) or
+/// hold the receiver. The hold mode decides (P1.6).
+fn classify(
+    guard: &Guard<'_>,
+    tool: &str,
+    input: &Value,
+    cwd: &Path,
+) -> (CallClass, Option<String>) {
     if guard.held && tool == "SendMessage" {
-        return CallClass::Protected(ProtectedKind::OtherSession);
+        return (CallClass::Protected(ProtectedKind::OtherSession), None);
     }
-    guard.classify(tool, input, cwd)
+    let (call, fault) = guard.classify_explained(tool, input, cwd);
+    (call.folded(), fault)
 }
 
 /// A single-quoted shell word.
@@ -205,6 +499,12 @@ fn as_claude_call(harness: Harness, tool: &str, input: &Value) -> (String, Value
             command.push_str(field("command"));
             ("Bash".to_owned(), json!({ "command": command }))
         }
+        // P1.4: OpenClaw's `apply_patch` carries its patch in `input` (OpenClaw 2026.10.7's own tool
+        // schema, {"required":["input"]}); the classifier reads a patch from `command`, as Codex's.
+        (Harness::OpenClaw, "apply_patch") => (
+            "apply_patch".to_owned(),
+            json!({ "command": input.get("input").and_then(Value::as_str).unwrap_or_default() }),
+        ),
         (Harness::OpenClaw, "read") | (Harness::Hermes, "read_file") => file("Read", "file_path"),
         (Harness::OpenClaw, "ls") => file("LS", "path"),
         (Harness::OpenClaw, "edit") | (Harness::Hermes, "patch") => file("Edit", "file_path"),
@@ -304,7 +604,31 @@ pub fn process_channel() -> bool {
 // protocol-words:begin (Claude Code's own `permissionDecision` values; never shown to a person)
 const DECISION_RUN: &str = "allow";
 const DECISION_ASK: &str = "ask";
+const DECISION_BLOCK: &str = "deny";
 // protocol-words:end
+
+/// Whether a hook's raw input is Claude Code's (not Codex's, not a plugin's).
+#[must_use]
+pub fn is_claude_code_input(raw: &str) -> bool {
+    HookInput::parse(raw).is_ok_and(|i| i.harness == Harness::ClaudeCode)
+}
+
+/// V1.4 (2026-11-03): a DENIED tool call as Claude Code shows it to both readers. Claude Code folds
+/// a hook's block reason and its error text behind one line ("Ran 1 shell command") and shows a
+/// `systemMessage` in full (measured on Claude Code 2.1.311, hookfields1.txt), so the reason goes
+/// to the agent as the block reason and to the user as the `systemMessage`.
+#[must_use]
+pub fn claude_code_block(reason: &str) -> String {
+    json!({
+        "systemMessage": reason,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": DECISION_BLOCK,
+            "permissionDecisionReason": reason,
+        },
+    })
+    .to_string()
+}
 
 impl HookOut {
     /// What to print and the exit code.
@@ -388,6 +712,17 @@ pub struct HookInput {
     pub user_typed: Option<bool>,
     /// From Lunchroom's OpenClaw or Hermes plugin: whether its harness's own YOLO is on (R2.1).
     pub harness_yolo: Option<bool>,
+    /// From Lunchroom's OpenClaw or Hermes plugin: whether the plugin can show the user text on a
+    /// prompt that goes on. `false` for both (OpenClaw's `before_agent_run` and Hermes's
+    /// `pre_llm_call` have no such channel; see docs/host-facts/openclaw-and-hermes.md), so the
+    /// guard takes no notice meant for the user and leaves it for `lunchroom status`. Absent
+    /// (Claude Code, Codex): the hook can.
+    pub can_show_user: Option<bool>,
+    /// From Lunchroom's OpenClaw plugin: whether the plugin can add text to the agent's context on
+    /// a prompt that goes on. `false` for OpenClaw (its `before_agent_run` drops everything but
+    /// a block), so the guard takes no notice or context meant for the agent. Absent: the hook
+    /// can.
+    pub can_tell_agent: Option<bool>,
     /// From Lunchroom's OpenClaw or Hermes plugin: the plugin's own file, which its harness loaded
     /// (R3.1).
     pub plugin_file: Option<PathBuf>,
@@ -449,6 +784,8 @@ impl HookInput {
             approval_channel: v.get("approval_channel").and_then(Value::as_bool),
             user_typed: v.get("user_typed").and_then(Value::as_bool),
             harness_yolo: v.get("harness_yolo").and_then(Value::as_bool),
+            can_show_user: v.get("can_show_user").and_then(Value::as_bool),
+            can_tell_agent: v.get("can_tell_agent").and_then(Value::as_bool),
             plugin_file: s("plugin_file")
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute()),
@@ -501,15 +838,33 @@ pub fn approval_channel(
     let Some(args) = cmdline else {
         return false;
     };
-    let headless = args.iter().skip(1).any(|a| {
+    !args.is_empty() && !print_run(args) && attended == Some("1") && entrypoint == Some("cli")
+}
+
+/// A Claude Code command line that runs one prompt and ends: `-p`, `--print` or
+/// `--permission-prompt-tool` (A1.2).
+#[must_use]
+pub fn print_run(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| {
         a == "-p"
             || a == "--print"
             || a.starts_with("--print=")
             || a == "--permission-prompt-tool"
             || a.starts_with("--permission-prompt-tool=")
             || (a.starts_with('-') && !a.starts_with("--") && a.len() > 2 && a[1..].contains('p'))
-    });
-    !args.is_empty() && !headless && attended == Some("1") && entrypoint == Some("cli")
+    })
+}
+
+/// I1.5 (2026-11-03): a Claude Code session run as one prompt (`claude -p`, `--print`,
+/// `--permission-prompt-tool`), read from the session process's own command line. Claude Code runs
+/// such a prompt only after its start hooks finish, so its listener returns at once and its start
+/// hook asks nothing. An IDE or desktop session, or one whose command line cannot be read, is not.
+pub(crate) fn one_prompt_run(input: &HookInput, env: &Env) -> bool {
+    input.harness == Harness::ClaudeCode
+        && env
+            .claude_pid
+            .and_then(cmdline)
+            .is_some_and(|args| print_run(&args))
 }
 
 /// The command line of a process, from `/proc`.
@@ -536,8 +891,12 @@ pub(crate) fn store(env: &Env) -> Result<Store<Mail>, String> {
 /// agent's commands run under that same process).
 pub(crate) fn harness_process(env: &Env, harness: Harness) -> Option<String> {
     let pid = match harness {
-        Harness::Codex => process::parent(std::process::id())
-            .filter(|p| process::name(*p).as_deref() == Some("codex"))?,
+        // R3.1 (2026-11-03): the nearest `codex` process above the hook, so a hook run through a
+        // wrapper (`sh -c`, a script) still finds its session's process.
+        Harness::Codex => process::ancestors(std::process::id())
+            .into_iter()
+            .skip(1)
+            .find(|p| process::name(*p).as_deref() == Some("codex"))?,
         // Lunchroom's plugin runs inside the harness process and starts the guard itself.
         Harness::OpenClaw | Harness::Hermes => process::parent(std::process::id())?,
         Harness::ClaudeCode => env.claude_pid?,
@@ -549,23 +908,22 @@ pub(crate) fn harness_process(env: &Env, harness: Harness) -> Option<String> {
 }
 
 /// Records that a hook saw `me`, in the harness process it runs under and its working folder when
-/// that process is known.
+/// that process is known. Returns whether this session's transcript is still to be searched
+/// ([`search_transcript`]): that is the first time a hook sees the session, and it is marked
+/// searched at once, so a search that is cut off by the deadline is not repeated by every later
+/// call (T1.7). The search itself reads a file, so it runs outside the store's lock.
+#[must_use]
 pub(crate) fn observe(
     m: &mut Mail,
     me: &Identity,
     input: &HookInput,
     harness: Option<&str>,
     home: &Path,
-) {
+) -> bool {
     let cwd = &input.cwd;
     // T1.7: a forked or branched session is a new id with the old context. Each session's
     // transcript is searched once, so a hold the user cleared does not come back.
-    if let Some(path) = &input.transcript_path
-        && m.first_transcript_read(me)
-        && let Some(id) = labelled_ids(&transcript_text(path)).find(|id| m.message(id).is_some())
-    {
-        m.hold_unrecorded(me, "transcript", id);
-    }
+    let search = input.transcript_path.is_some() && m.first_transcript_read(me);
     match harness {
         Some(process) => {
             m.observe_process(process, cwd, me);
@@ -599,20 +957,319 @@ pub(crate) fn observe(
         }
         None => m.observe(me),
     }
+    search
 }
 
-/// The DENIED line a blocked call shows: the reason, then what it means and what to do next.
-fn denied(reason: DenyReason) -> String {
-    format!(
-        "Lunchroom: {} · {}: {}",
-        Verdict::Denied.word(),
-        reason.word(),
-        reason.next_step()
-    )
+/// T1.7: searches the transcript of a session a hook saw for the first time, outside the store's
+/// lock, and holds the session when it names a message Lunchroom sent. Returns whether the session
+/// is now HELD by it. The search was marked done by [`observe`] before this runs, so a read that
+/// the deadline cuts off is not repeated by every later call.
+pub(crate) fn search_transcript(
+    store: &Store<Mail>,
+    me: &Identity,
+    input: &HookInput,
+) -> Result<bool, String> {
+    search_transcript_to(store, me, input, TRANSCRIPT_CAP, TRANSCRIPT_IDS)
 }
 
-/// The rule a call that goes to the user is outside of (A1.4).
-fn rule_of(call: CallClass) -> String {
+/// What the hold of a session whose transcript was not read to the end is called (T1.7): the
+/// source "unjudged", as for a tool output the guard did not judge, with this as its mark.
+const UNREAD_TRANSCRIPT: &str = "transcript (not read to the end)";
+
+/// [`search_transcript`], reading at most `cap` bytes and `id_limit` ids. A transcript that names a
+/// message Lunchroom sent holds the session; so does one the read did not reach the end of (the
+/// cap, the id limit), since the text left unread may carry another agent's message (T1.7).
+fn search_transcript_to(
+    store: &Store<Mail>,
+    me: &Identity,
+    input: &HookInput,
+    cap: u64,
+    id_limit: usize,
+) -> Result<bool, String> {
+    let Some(path) = &input.transcript_path else {
+        return Ok(false);
+    };
+    let read = read_transcript(path, cap, id_limit);
+    if read.ids.is_empty() && read.whole {
+        return Ok(false);
+    }
+    store
+        .update(|m| {
+            if let Some(id) = read.ids.iter().find(|id| m.message(id).is_some()) {
+                m.hold_unrecorded(me, "transcript", id);
+                true
+            } else if !read.whole {
+                m.hold_unrecorded(me, "unjudged", UNREAD_TRANSCRIPT);
+                true
+            } else {
+                false
+            }
+        })
+        .map_err(crate::cli::unwritten)
+}
+
+/// What a DENIED call's message is built from, passed from where the call was judged (V1.4).
+pub(crate) struct DeniedCall<'a> {
+    pub reason: DenyReason,
+    /// The tool as the harness named it (`Bash`, `exec`, `terminal`, `Read`, …).
+    pub tool: &'a str,
+    /// The call as the classifier judged it ([`as_claude_call`]).
+    pub judged_tool: &'a str,
+    pub judged_input: &'a Value,
+    /// What the rule found at fault, from the classifier.
+    pub fault: Option<String>,
+    /// The agent's name, or its session id.
+    pub agent: String,
+    /// What holds the session, each `<agent> (<message id>)`; empty when it is not HELD.
+    pub held_by: Vec<String>,
+    /// The class of the call, for a call that needed the user (A1.2).
+    pub call: CallClass,
+    pub mode: HoldMode,
+    /// Why the guard could not finish its check ([`Cause::long`]), when it could not, so the call
+    /// was judged as for a HELD session by the rules that need no record (H1.5).
+    pub undecided: Option<String>,
+}
+
+/// What was DENIED, as the guard read the call: a command (cut around the part at fault when it
+/// is long), the path a file tool names, or the tool and its input.
+fn what_was_denied(d: &DeniedCall<'_>) -> String {
+    describe_call(d.tool, d.judged_tool, d.judged_input, d.fault.as_deref())
+}
+
+/// A call as V1.4 shows it (H1.7, H1.8 use it too): the harness's tool `tool`, judged as
+/// `judged_tool` with `judged_input`, cut around `fault` when long.
+pub(crate) fn describe_call(
+    tool: &str,
+    judged_tool: &str,
+    judged_input: &Value,
+    fault: Option<&str>,
+) -> String {
+    let field = |k: &str| judged_input.get(k).and_then(Value::as_str);
+    match judged_tool {
+        "Bash" => {
+            let command = field("command").unwrap_or_default();
+            let shown = denial::shown(command, fault);
+            if tool == "Bash" {
+                format!("the command `{shown}`")
+            } else {
+                format!("the {tool} command `{shown}`")
+            }
+        }
+        "Glob" => format!(
+            "the {tool} of `{}` in {}",
+            field("pattern").unwrap_or_default(),
+            field("path").unwrap_or("the working folder")
+        ),
+        "Read" | "LS" | "Grep" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit"
+        | "NotebookRead" => {
+            let path = ["file_path", "notebook_path", "path"]
+                .iter()
+                .find_map(|k| field(k))
+                .unwrap_or("the working folder");
+            format!("the {tool} of {path}")
+        }
+        // Codex's `apply_patch`: the files the patch writes, not the whole patch (G1-1).
+        "apply_patch" => {
+            let files = lunchroom_core::classify::patch_files(field("command").unwrap_or_default());
+            if files.is_empty() {
+                format!("the {tool} call")
+            } else {
+                format!("the {tool} of {}", files.join(", "))
+            }
+        }
+        _ => format!(
+            "the {tool} call `{}`",
+            denial::shown(&judged_input.to_string(), fault)
+        ),
+    }
+}
+
+/// H1.7, H1.8: the call a hook's raw input `raw` carries, as V1.4 shows it, for the hook `mode`:
+/// a tool call as [`describe_call`] shows it (as the harness's guard judges it), the prompt, the
+/// result of a call, or the session's start.
+pub(crate) fn hook_call(mode: Option<&str>, raw: &str) -> String {
+    let parsed: Option<Value> = serde_json::from_str(raw).ok();
+    let field = |k: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let harness = parsed
+        .as_ref()
+        .and_then(|v| v.get("harness"))
+        .and_then(|h| serde_json::from_value::<Harness>(h.clone()).ok())
+        .unwrap_or(Harness::ClaudeCode);
+    match mode {
+        Some("pretool") => match (
+            field("tool_name"),
+            parsed.as_ref().and_then(|v| v.get("tool_input")),
+        ) {
+            (Some(tool), Some(input)) => {
+                let (judged_tool, judged_input) = as_claude_call(harness, &tool, input);
+                describe_call(&tool, &judged_tool, &judged_input, None)
+            }
+            _ => "a tool call whose input could not be read".to_owned(),
+        },
+        Some("prompt") => "the prompt sent to this session".to_owned(),
+        Some("posttool") => format!(
+            "the result of the {} call",
+            field("tool_name").unwrap_or_else(|| "tool".to_owned())
+        ),
+        Some("start") => "the start of this session".to_owned(),
+        _ => "this hook's call".to_owned(),
+    }
+}
+
+/// The ways forward that exist for a DENIED call (V1.4), the agent's first, then the user's.
+fn ways_forward(d: &DeniedCall<'_>) -> Vec<String> {
+    let user = Word::TheUser.text();
+    let held = AgentState::Held.word();
+    let in_own_terminal = format!(
+        "{}: run it in a terminal of their own, outside every agent session.",
+        sentence(user)
+    );
+    let clear_hold = format!(
+        "{}: type a message in this session. That ends {held}, and the call is then judged as \
+         for a session that is not {held}.",
+        sentence(user)
+    );
+    // The exact commands that loosen Lunchroom are not printed where a HELD agent reads them
+    // (G1-7): the way says only that the user can; the commands are in `lunchroom help` and the
+    // README.
+    let change_strictness = denial::strictness_way();
+    let mut ways = Vec::new();
+    match d.reason {
+        DenyReason::Fence => {
+            ways.push(
+                "The agent: to reach another agent, use `lunchroom send <name> <text>` instead, \
+                 and leave the variables Lunchroom reads an agent's identity from as they are."
+                    .to_owned(),
+            );
+            ways.push(in_own_terminal);
+        }
+        DenyReason::Unparsed => {
+            ways.push(
+                "The agent: split it into plain commands Lunchroom can read, and run only \
+                 programs and scripts that exist and can be read in full."
+                    .to_owned(),
+            );
+            ways.push(in_own_terminal);
+        }
+        DenyReason::DeniedPath => {
+            // A path the call named; or a search, whose fault reads `a search of <folder>`.
+            let target = match d.fault.as_deref() {
+                Some(f) if f.starts_with('/') => f,
+                Some(f) if f.starts_with("a search of ") => "that folder",
+                _ => "that path",
+            };
+            ways.push(format!(
+                "The agent: leave {target} out of the call; read or search only folders that hold \
+                 neither Lunchroom's records nor another session's transcripts."
+            ));
+            ways.push(format!(
+                "{}: read it in a terminal of their own.",
+                sentence(user)
+            ));
+            if !d.held_by.is_empty() && d.undecided.is_none() {
+                ways.push(clear_hold);
+            }
+        }
+        DenyReason::Configuration => {
+            // The one list of the commands an agent may run is main.rs's (G3-18).
+            let agent_commands = crate::agent_commands_text();
+            ways.push(format!(
+                "The agent: ask {user} for the change; of Lunchroom's commands an agent runs only \
+                 {agent_commands}."
+            ));
+            ways.push(in_own_terminal);
+        }
+        DenyReason::NoApprovalChannel => {
+            ways.push(format!(
+                "The agent: tell {user} what this call is for, and meanwhile keep to what a \
+                 {held} agent may do without {user}'s yes (its permission slip): read files \
+                 outside the paths Lunchroom DENIES, and reply with `lunchroom send`."
+            ));
+            ways.push(format!(
+                "{}: `lunchroom approve` lists this exact call; approving it lets it run once when \
+                 the agent tries it again.",
+                sentence(user)
+            ));
+            if !d.held_by.is_empty() {
+                ways.push(clear_hold);
+            }
+            if a_looser_mode_would_let_it_run(d) {
+                ways.push(change_strictness);
+            }
+            ways.push(in_own_terminal);
+        }
+        // The reasons `lunchroom send` gives (cli.rs); a tool call is never DENIED for them.
+        DenyReason::Leak | DenyReason::Halted | DenyReason::Loop | DenyReason::RateLimit => {}
+    }
+    ways
+}
+
+/// Whether the user changing how strict Lunchroom is would let this call run (G1-7): an ordinary
+/// call in Strict, a PROTECTED call (except a change to Lunchroom's program or the guard's
+/// configuration) in a mode short of Relaxed. The way forward that says so is given to the agent
+/// without a command.
+fn a_looser_mode_would_let_it_run(d: &DeniedCall<'_>) -> bool {
+    if d.reason != DenyReason::NoApprovalChannel {
+        return false;
+    }
+    match d.call {
+        CallClass::Ordinary => d.mode == HoldMode::Strict,
+        CallClass::Protected(kind) => {
+            kind != ProtectedKind::GuardConfig && d.mode != HoldMode::Relaxed
+        }
+        _ => false,
+    }
+}
+
+/// The DENIED message a blocked call shows (V1.4): the reason and its next step, what was DENIED,
+/// why (with what holds the session), and each way forward.
+pub(crate) fn explain(d: &DeniedCall<'_>) -> String {
+    let mut denial = Denial::new(d.reason, what_was_denied(d));
+    denial.fault.clone_from(&d.fault);
+    if d.reason == DenyReason::NoApprovalChannel {
+        let held = AgentState::Held.word();
+        denial.rule = format!(
+            "{} {held}: {HELD_MEANS}. {}, so it needs {}'s yes, and this session has no \
+             permission prompt to ask for it",
+            cards::held(&d.agent),
+            call_class_text(d.call),
+            Word::TheUser.text()
+        );
+    }
+    if let Some(cause) = &d.undecided {
+        let held = AgentState::Held.word();
+        let _ = write!(
+            denial.rule,
+            "; {cause}, so Lunchroom judged this call as it does for a session that is {held}"
+        );
+    }
+    denial.held_by.clone_from(&d.held_by);
+    denial.ways = ways_forward(d);
+    // The agent reads every message its session shows, so no message names the commands that
+    // loosen Lunchroom.
+    format!("Lunchroom: {}", denial.render())
+}
+
+/// What holds `who`, each as `<agent> (<message id>)` (V1.4).
+pub(crate) fn holders(m: &Mail, who: &Identity) -> Vec<String> {
+    m.holding(who)
+        .iter()
+        .map(|h| denial::holder(&h.from_name, &h.message, m.message(&h.message).is_some()))
+        .collect()
+}
+
+/// Why a call goes to the user, as a sentence that stands alone and has no ending (A1.4): a
+/// PROTECTED call is PROTECTED, not "outside" anything; any other call is outside the permission
+/// slip, which is explained where it is named.
+fn call_class_text(call: CallClass) -> String {
+    let user = Word::TheUser.text();
+    let held = AgentState::Held.word();
     match call {
         CallClass::Protected(kind) => {
             let what = match kind {
@@ -621,21 +1278,31 @@ fn rule_of(call: CallClass) -> String {
                 ProtectedKind::Network => "sending data out of this computer",
                 ProtectedKind::Credential => "credentials",
                 ProtectedKind::GuardConfig => "Lunchroom's program or the guard's configuration",
-                ProtectedKind::Unparsed => "a command the guard cannot read",
-                ProtectedKind::UnknownTool => "a tool the guard does not know",
+                ProtectedKind::Unparsed => "a command Lunchroom cannot read",
+                ProtectedKind::UnknownTool => "a tool Lunchroom does not know",
                 ProtectedKind::OtherSession => "text sent to another agent's session",
             };
             // F1.2: where the spec names a reason (`unparsed`), the user is shown it.
             match kind.reason() {
-                Some(reason) => format!("{} ({what}) · {}", Word::Protected.text(), reason.word()),
-                None => format!("{} ({what})", Word::Protected.text()),
+                Some(reason) => format!(
+                    "This call is {} ({what} · {})",
+                    Word::Protected.text(),
+                    reason.word()
+                ),
+                None => format!("This call is {} ({what})", Word::Protected.text()),
             }
         }
         _ => format!(
-            "the permission slip of a {} session",
-            lunchroom_core::vocab::AgentState::Held.word()
+            "This call is outside the permission slip of a {held} session (the short list of \
+             calls a {held} agent may make without {user}'s yes)"
         ),
     }
+}
+
+/// The same sentence for the person at the prompt, ended: what `lunchroom approve` shows beside a
+/// kept call.
+fn call_rule_sentence(call: CallClass) -> String {
+    format!("{}, so it needs your yes.", call_class_text(call))
 }
 
 /// `PreToolUse`: what this call does.
@@ -652,6 +1319,7 @@ pub fn pretool(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     })
 }
 
+#[allow(clippy::too_many_lines)] // one decision: read the call, judge it, ask or answer, in order
 fn pretool_decide(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     let tool = input
         .tool_name
@@ -668,19 +1336,29 @@ fn pretool_decide(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     let harness_yolo = input.permission_mode.as_deref() == Some("bypassPermissions")
         || input.harness_yolo == Some(true);
     let marker = unjudged_marker(env, &me);
-    let unjudged = marker.exists();
-    let (held, lunchroom_yolo, mode) = store
+    let unjudged = unjudged_source(&marker);
+    let (mut held, lunchroom_yolo, mode, search) = store
         .update(|m| {
-            observe(m, &me, input, harness.as_deref(), &env.home);
-            if unjudged {
-                m.hold_unrecorded(&me, "unjudged", "tool output");
+            let search = observe(m, &me, input, harness.as_deref(), &env.home);
+            if let Some(source) = &unjudged {
+                m.hold_unrecorded(&me, "unjudged", source);
             }
             m.report_harness_yolo(&me, harness_yolo);
-            (m.is_held(&me), m.yolo_until(&me, env.now), m.hold_mode())
+            (
+                m.is_held(&me),
+                m.yolo_until(&me, env.now),
+                m.hold_mode(),
+                search,
+            )
         })
         .map_err(crate::cli::unwritten)?;
-    if unjudged {
+    if unjudged.is_some() {
         let _ = std::fs::remove_file(&marker);
+    }
+    // T1.7: a session seen for the first time may carry another agent's text from its transcript;
+    // the file is read here, outside the store's lock.
+    if search && search_transcript(&store, &me, input)? {
+        held = true;
     }
     let layout = env.layout();
     let fs = OsFs::new(BUDGET);
@@ -691,24 +1369,14 @@ fn pretool_decide(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     };
     let (judged_tool, judged_input) = as_claude_call(input.harness, tool, tool_input);
     let run_dir = execution_dir(input.harness, tool, tool_input, &input.cwd);
-    let call = classify(&guard, &judged_tool, &judged_input, &run_dir);
+    let (call, fault) = classify(&guard, &judged_tool, &judged_input, &run_dir);
     let call = in_a_folder_the_plugin_could_not_read(call, held, input.harness, tool, tool_input);
     // A2.1: an approval is bound to the folder the call runs in, as well as to the call.
     let dir = run_dir.to_string_lossy();
-    // R2.1, R2.2: a `lunchroom yolo` the user set turns this session's harness YOLO on until its end
-    // time; the harness's own switch alone is `HarnessOnly` (R2.4).
-    let yolo = if lunchroom_yolo.is_some() {
-        YoloSource::Lunchroom
-    } else if harness_yolo {
-        YoloSource::HarnessOnly
-    } else {
-        YoloSource::Off
-    };
-    let channel = channel_of(input, env);
     let situation = Situation {
         held,
-        yolo,
-        approval_channel: channel,
+        yolo: yolo_source(lunchroom_yolo.is_some(), harness_yolo),
+        approval_channel: channel_of(input, env),
         mode,
     };
     let decision = decide(call, situation);
@@ -728,6 +1396,13 @@ fn pretool_decide(input: &HookInput, env: &Env) -> Result<HookOut, String> {
             )));
         }
     }
+    let judged = Judged {
+        me: &me,
+        tool,
+        tool_input,
+        dir: &dir,
+        call,
+    };
     Ok(match decision {
         // R2.2: under a `lunchroom yolo`, Lunchroom turns Claude Code's YOLO on by answering
         // "allow", which skips the harness's permission prompt; at the end time this stops.
@@ -735,67 +1410,117 @@ fn pretool_decide(input: &HookInput, env: &Env) -> Result<HookOut, String> {
             Some(end) => HookOut::Allow(format!("Lunchroom: {}", cards::yolo_until(end))),
             None => HookOut::Silent,
         },
-        Decision::AskUser => {
-            let request = store
-                .update(|m| {
-                    let agent = m.name_of(&me).unwrap_or(&me.session).to_owned();
-                    // Card 4 follows when this call runs, which it does only on the user's yes.
-                    let line = cards::granted(&agent, &cards::action_of(tool, tool_input));
-                    m.asked(&me, &input.mark, &line);
-                    // Card 1: "Claude is HELD." (a call goes to the user only from a HELD session).
-                    format!(
-                        "Lunchroom: {} This call is outside {}.\n{}",
-                        cards::held(&agent),
-                        rule_of(call),
-                        m.approval_prompt(&me, &agent, tool, tool_input, &dir)
-                    )
-                })
-                .map_err(crate::cli::unwritten)?;
-            HookOut::Ask(request)
+        Decision::AskUser => ask_user(&store, &judged, &input.mark)?,
+        Decision::Deny(reason) => {
+            // 1.1: each DENIED decision is kept in the guard records (time, session, reason word,
+            // no command text) for the console to count. A call that only waits for the user
+            // (no approval channel) is not a denial of a rule.
+            // 1.1 only (feature `console`): H1.8 keeps 200 records of undecided and slow calls.
+            #[cfg(feature = "console")]
+            if reason != DenyReason::NoApprovalChannel {
+                let _ = crate::records::add_denied(
+                    &env.lunchroom_home,
+                    env.now,
+                    &me.session,
+                    reason.word(),
+                );
+            }
+            let (agent, held_by) = denial_context(&store, &judged, reason, held, env.now)?;
+            HookOut::Block(explain(&DeniedCall {
+                reason,
+                tool,
+                judged_tool: &judged_tool,
+                judged_input: &judged_input,
+                fault,
+                agent,
+                held_by,
+                call,
+                mode,
+                undecided: None,
+            }))
         }
-        Decision::Deny(DenyReason::NoApprovalChannel) => {
-            no_channel(&store, &me, (tool, tool_input, &dir), call, env.now)?
-        }
-        Decision::Deny(reason) => HookOut::Block(denied(reason)),
     })
 }
 
-/// A call that must go to the user, in a session with nobody to ask (A1.2): DENIED, and kept so the
-/// user can approve that exact call with `lunchroom approve` before it is tried again.
-fn no_channel(
-    store: &Store<Mail>,
-    me: &Identity,
-    (tool, tool_input, dir): (&str, &Value, &str),
+/// R2.1, R2.2: a `lunchroom yolo` the user set turns this session's harness YOLO on until its end
+/// time; the harness's own switch alone is `HarnessOnly` (R2.4).
+const fn yolo_source(lunchroom_yolo: bool, harness_yolo: bool) -> YoloSource {
+    if lunchroom_yolo {
+        YoloSource::Lunchroom
+    } else if harness_yolo {
+        YoloSource::HarnessOnly
+    } else {
+        YoloSource::Off
+    }
+}
+
+/// One call as the pretool hook judged it: the session, the call as the harness gave it, the
+/// folder it runs in, and its class.
+struct Judged<'a> {
+    me: &'a Identity,
+    tool: &'a str,
+    tool_input: &'a Value,
+    dir: &'a str,
     call: CallClass,
-    now: u64,
-) -> Result<HookOut, String> {
-    let agent = store
+}
+
+/// A call that goes to the user's permission prompt, with card 1's line and the approval request.
+fn ask_user(store: &Store<Mail>, j: &Judged<'_>, mark: &str) -> Result<HookOut, String> {
+    let request = store
         .update(|m| {
-            let agent = m.name_of(me).unwrap_or(&me.session).to_owned();
-            m.request(Request {
-                session: me.clone(),
-                agent: agent.clone(),
-                tool: tool.to_owned(),
-                input: tool_input.clone(),
-                cwd: dir.to_owned(),
-                rule: rule_of(call),
-                at: now,
-            });
-            agent
+            let agent = m.name_of(j.me).unwrap_or(&j.me.session).to_owned();
+            // Card 4 follows when this call runs, which it does only on the user's yes.
+            let line = cards::granted(&agent, &cards::action_of(j.tool, j.tool_input));
+            m.asked(j.me, mark, &line);
+            // Card 1: "Claude is HELD." (a call goes to the user only from a HELD session). The
+            // first line carries the whole short answer: who, which kind of call, what to do.
+            let held = AgentState::Held.word();
+            format!(
+                "Lunchroom: {} {} Answer this permission prompt: yes runs the call once, no stops \
+                 it.\n{held}: {HELD_MEANS}.\n{}",
+                cards::held(&agent),
+                call_rule_sentence(j.call),
+                m.approval_prompt(j.me, &agent, j.tool, j.tool_input, j.dir)
+            )
         })
         .map_err(crate::cli::unwritten)?;
-    Ok(HookOut::Block(format!(
-        "{} {} This call is outside {}.",
-        denied(DenyReason::NoApprovalChannel),
-        cards::held(&agent),
-        rule_of(call),
-    )))
+    Ok(HookOut::Ask(request))
+}
+
+/// V1.4: the agent's name and what holds the session, read from the store as they are now, for a
+/// DENIED call's message; a call that needed the user is kept for `lunchroom approve` (A1.2).
+fn denial_context(
+    store: &Store<Mail>,
+    j: &Judged<'_>,
+    reason: DenyReason,
+    held: bool,
+    now: u64,
+) -> Result<(String, Vec<String>), String> {
+    store
+        .update(|m| {
+            let agent = m.name_of(j.me).unwrap_or(&j.me.session).to_owned();
+            if reason == DenyReason::NoApprovalChannel {
+                m.request(Request {
+                    session: j.me.clone(),
+                    agent: agent.clone(),
+                    tool: j.tool.to_owned(),
+                    input: j.tool_input.clone(),
+                    cwd: j.dir.to_owned(),
+                    rule: call_rule_sentence(j.call),
+                    at: now,
+                });
+            }
+            let held_by = if held { holders(m, j.me) } else { Vec::new() };
+            (agent, held_by)
+        })
+        .map_err(crate::cli::unwritten)
 }
 
 /// `UserPromptSubmit`: another agent's text arriving holds the session; the user typing clears it.
 ///
 /// # Errors
 /// When the input lacks a prompt or the store cannot be used; the hook then blocks the prompt.
+#[allow(clippy::too_many_lines)] // one prompt: judge the text, hold or clear, then tell what waits
 pub fn prompt(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     let text = input
         .prompt
@@ -811,14 +1536,27 @@ pub fn prompt(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     // clearing HELD, and F1 fences the commands that put a turn into a Codex session.
     let person_at_prompt = match input.harness {
         Harness::ClaudeCode => channel_of(input, env),
-        Harness::Codex => true,
+        // A `codex exec` or `codex review` run is a program's prompt, not a person's (G4-6); a
+        // Codex whose command line cannot be read counts as a person, as before.
+        Harness::Codex => !codex_process()
+            .and_then(cmdline)
+            .is_some_and(|a| codex_headless(&a)),
         Harness::OpenClaw | Harness::Hermes => input.user_typed == Some(true),
     };
+    // What the plugin can show on a prompt that goes on (OpenClaw and Hermes have no way to show
+    // the user text there; OpenClaw has none for the agent either): what has no way to be shown is
+    // not taken, so it stays for `lunchroom status` instead of being lost.
+    let shows = Shows {
+        user: input.can_show_user != Some(false),
+        agent: input.can_tell_agent != Some(false),
+    };
     let marker = unjudged_marker(env, &me);
-    let unjudged = marker.exists();
+    let unjudged = unjudged_source(&marker);
+    let mut search = false;
+    let mut notices_shown = NoticesShown::default();
     let out = store
         .update(|m| {
-            observe(m, &me, input, harness.as_deref(), &env.home);
+            search = observe(m, &me, input, harness.as_deref(), &env.home);
             // I1.5: a custom title seen on any prompt ends the record of Lunchroom's own.
             custom_title(m, &me, input.session_title.as_deref(), &[]);
             // Once a turn, what can no longer matter is forgotten.
@@ -830,8 +1568,8 @@ pub fn prompt(input: &HookInput, env: &Env) -> Result<HookOut, String> {
                     .as_deref()
                     == Some(k)
             });
-            if unjudged {
-                m.hold_unrecorded(&me, "unjudged", "tool output");
+            if let Some(source) = &unjudged {
+                m.hold_unrecorded(&me, "unjudged", source);
             }
             if !ids.is_empty() {
                 return confirm_delivery(m, &me, &ids, env.now);
@@ -851,35 +1589,186 @@ pub fn prompt(input: &HookInput, env: &Env) -> Result<HookOut, String> {
                 match typed_command(text).filter(|_| person_at_prompt) {
                     Some(Typed::Join(wanted)) => {
                         let current = input.session_title.as_deref();
-                        return join(m, &me, wanted, &input.cwd, current);
+                        return join(m, &me, wanted, &input.cwd, current, env.now);
                     }
-                    Some(Typed::Leave) => return leave(m, &me),
+                    Some(Typed::Leave) => return leave(m, &me, env.now),
                     None => {}
                 }
-                // R3.4: the user, typing here, is told once of each agent that became UNGUARDED.
-                let unguarded: Vec<Identity> = m
-                    .names()
-                    .filter(|(_, who)| {
-                        m.agent_state(who, evidence(m, who, &env.home)) == AgentState::Unguarded
-                    })
-                    .map(|(_, who)| who.clone())
-                    .collect();
-                let told: Vec<String> = m
-                    .newly_unguarded(&unguarded)
-                    .iter()
-                    .map(|who| cards::unguarded(m.name_of(who).unwrap_or(&who.session)))
-                    .collect();
-                if !told.is_empty() {
-                    return HookOut::Notice(format!("Lunchroom: {}", told.join(" ")));
+                // G4-6: a prompt no person typed (`claude -p`, `codex exec`) is not somewhere to
+                // tell the user anything: the notices stay for the next prompt a person types.
+                if !person_at_prompt {
+                    return HookOut::Silent;
                 }
+                // R3.4: the user, typing here, is told once of each agent that became UNGUARDED,
+                // and why ("Lunchroom tells the user when an agent becomes UNGUARDED, and why"):
+                // the reason comes from the same judgment that makes it UNGUARDED. This prompt
+                // hook serves every harness (Claude Code, Codex, OpenClaw, Hermes), so this is the
+                // notice for each.
+                #[cfg_attr(not(feature = "console"), allow(unused_mut))]
+                let mut told: Vec<String> = if shows.user {
+                    let unguarded: Vec<(Identity, Why)> = m
+                        .names()
+                        .filter_map(|(_, who)| {
+                            crate::evidence::unguarded_reason(m, who, &env.home)
+                                .map(|why| (who.clone(), why))
+                        })
+                        .collect();
+                    let who_now: Vec<Identity> =
+                        unguarded.iter().map(|(who, _)| who.clone()).collect();
+                    m.newly_unguarded(&who_now)
+                        .iter()
+                        .map(|who| {
+                            let card = cards::unguarded(m.name_of(who).unwrap_or(&who.session));
+                            unguarded.iter().find(|(w, _)| w == who).map_or_else(
+                                || card.clone(),
+                                |(_, why)| format!("{card} {}", why.text()),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // 1.1 only (feature `console`): a user who has the console set up and none running
+                // is told once a day.
+                #[cfg(feature = "console")]
+                if shows.user
+                    && let Some(notice) = crate::console::missing_notice(env)
+                {
+                    told.push(notice);
+                }
+                // D1.8: what waits or ended is told here, the user's notices to the user and this
+                // session's own (as a sender) to its agent, each once.
+                let (answer, taken) = waiting_notices(m, &me, &told, shows);
+                notices_shown = taken;
+                return answer;
             }
             HookOut::Silent
         })
         .map_err(crate::cli::unwritten);
-    if unjudged && out.is_ok() {
+    // G2-14: the notices the answer carries are marked told now that it is produced; one update
+    // of their own, so a notice that arrived in between stays, and a hook killed before this
+    // tells them again at the next prompt.
+    if out.is_ok() && !notices_shown.is_empty() {
+        let _ = store.update(|m| notices_shown.mark_told(m, &me));
+    }
+    if unjudged.is_some() && out.is_ok() {
         let _ = std::fs::remove_file(&marker);
     }
+    // T1.7: the transcript of a session seen for the first time is read outside the lock.
+    if search {
+        search_transcript(&store, &me, input)?;
+    }
     out
+}
+
+/// What a prompt hook can show for the harness that runs it: text for the user, and text for the
+/// agent (Claude Code and Codex: both; see [`HookInput::can_show_user`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shows {
+    pub user: bool,
+    pub agent: bool,
+}
+
+#[cfg(test)]
+impl Shows {
+    /// Both can be shown.
+    pub(crate) const BOTH: Self = Self {
+        user: true,
+        agent: true,
+    };
+}
+
+/// The Codex process this hook runs under: its parent, when that is a `codex` process (as
+/// [`harness_process`] reads it).
+fn codex_process() -> Option<u32> {
+    process::parent(std::process::id()).filter(|p| process::name(*p).as_deref() == Some("codex"))
+}
+
+/// Whether a Codex command line is a run no person types into: its first argument that is not an
+/// option is `exec` (alias `e`) or `review`. Codex's own command table: `Exec` has
+/// `visible_alias = "e"` and `Review` is "Run a code review non-interactively"
+/// (openai/codex tag rust-v0.163.0, codex-rs/cli/src/main.rs:154-159).
+fn codex_headless(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|a| matches!(a.as_str(), "exec" | "e" | "review"))
+}
+
+/// The prompt hook's answer to the user's own typing (R3.4, D1.8): `unguarded`, the R3.4 lines of
+/// agents that became UNGUARDED, and the notices of messages that wait or ended: the user's, shown
+/// to the user, and this session's own as a sender, added to its agent's context. Each notice is
+/// taken, so it is told once. Nothing to tell: no output.
+fn waiting_notices(
+    m: &Mail,
+    me: &Identity,
+    unguarded: &[String],
+    shows: Shows,
+) -> (HookOut, NoticesShown) {
+    // A notice is read only where it can be shown (G4-2, G4-3): otherwise it stays for the next
+    // prompt of a harness that can show it, and for `lunchroom status`. It is not removed here
+    // (G2-14): the caller marks the notices told once the answer is produced, so a hook killed
+    // before that loses none, and a notice that arrives meanwhile stays.
+    let user_notices: Vec<Notice> = if shows.user {
+        m.user_notices().to_vec()
+    } else {
+        Vec::new()
+    };
+    let agent_notices: Vec<Notice> = if shows.agent {
+        m.notices(me).to_vec()
+    } else {
+        Vec::new()
+    };
+    let to_user: Vec<String> = user_notices
+        .iter()
+        .map(|n| format!("Lunchroom: {}", n.text))
+        .collect();
+    let to_agent: Vec<String> = agent_notices
+        .iter()
+        .map(|n| format!("Lunchroom: {}", n.text))
+        .collect();
+    let mut lines = Vec::new();
+    if !unguarded.is_empty() {
+        lines.push(format!("Lunchroom: {}", unguarded.join(" ")));
+    }
+    lines.extend(to_user);
+    let out = match (lines.is_empty(), to_agent.is_empty()) {
+        (true, true) => HookOut::Silent,
+        (false, true) => HookOut::Notice(lines.join("\n")),
+        (_, false) => HookOut::Event {
+            event: "UserPromptSubmit",
+            notice: (!lines.is_empty()).then(|| lines.join("\n")),
+            context: Some(to_agent.join("\n")),
+            title: None,
+        },
+    };
+    (
+        out,
+        NoticesShown {
+            user: user_notices,
+            agent: agent_notices,
+        },
+    )
+}
+
+/// The notices an answer carries, to be marked told once the answer is produced (G2-14).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct NoticesShown {
+    pub user: Vec<Notice>,
+    pub agent: Vec<Notice>,
+}
+
+impl NoticesShown {
+    /// Marks them told in the store: they are not told again. A notice that arrived since they
+    /// were read stays.
+    pub(crate) fn mark_told(&self, m: &mut Mail, me: &Identity) {
+        m.mark_user_notices_told(&self.user);
+        m.mark_notices_told(me, &self.agent);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.user.is_empty() && self.agent.is_empty()
+    }
 }
 
 /// What the user typed as a Lunchroom command in a session (I1.5): the whole prompt is `join`,
@@ -979,6 +1868,7 @@ fn join(
     wanted: Option<&str>,
     cwd: &Path,
     current: Option<&str>,
+    now: u64,
 ) -> HookOut {
     let name = match wanted {
         Some(n) => n.to_owned(),
@@ -1010,6 +1900,9 @@ fn join(
     for n in &earlier {
         m.unregister(n);
     }
+    // G2-7: what was QUEUED for a name given up is FAILED at once, and its sender is told, as
+    // `lunchroom unregister` does.
+    m.fail_unnamed(now);
     let title = if custom { None } else { title_for(me, &name) };
     if let Some(t) = &title {
         m.record_title(me, t);
@@ -1028,7 +1921,7 @@ fn join(
 }
 
 /// I1.5: the user typed `leave`: every name of this session goes, so it receives nothing more.
-fn leave(m: &mut Mail, me: &Identity) -> HookOut {
+fn leave(m: &mut Mail, me: &Identity, now: u64) -> HookOut {
     let names: Vec<String> = m
         .names()
         .filter(|(_, h)| *h == me)
@@ -1037,6 +1930,8 @@ fn leave(m: &mut Mail, me: &Identity) -> HookOut {
     for n in &names {
         m.unregister(n);
     }
+    // G2-7: what was QUEUED for the names given up is FAILED at once, and its sender is told.
+    m.fail_unnamed(now);
     let user = Word::TheUser.text();
     let context = if names.is_empty() {
         format!(
@@ -1077,10 +1972,11 @@ fn sentence(text: &str) -> String {
 pub fn start(input: &HookInput, env: &Env) -> HookOut {
     let me = input.me();
     let harness = harness_process(env, input.harness);
+    let mut search = false;
     let named = store(env).and_then(|store| {
-        store
+        let named = store
             .update(|m| {
-                observe(m, &me, input, harness.as_deref(), &env.home);
+                search = observe(m, &me, input, harness.as_deref(), &env.home);
                 let name = m.name_of(&me).map(str::to_owned);
                 let custom = custom_title(m, &me, input.session_title.as_deref(), &[]);
                 // Claude Code applies a title only on these starts, so none is sent or recorded
@@ -1096,11 +1992,21 @@ pub fn start(input: &HookInput, env: &Env) -> HookOut {
                 }
                 (name, title)
             })
-            .map_err(crate::cli::unwritten)
+            .map_err(crate::cli::unwritten)?;
+        // T1.7: the transcript of a session seen for the first time is read outside the lock.
+        if search {
+            search_transcript(&store, &me, input)?;
+        }
+        Ok(named)
     });
+    // I1.5: a Claude Code session with no person at it (`-p`, `--print`, a prompt tool, or not
+    // attended and interactive) cannot join by typing, so it is asked nothing.
+    let nobody = one_prompt_run(input, env);
     match named {
+        Err(_) | Ok((None, _)) if nobody => HookOut::Silent,
         Err(reason) => HookOut::Notice(format!(
-            "{INCLUDE_LINE} Lunchroom could not check this: {reason}."
+            "{INCLUDE_LINE} Lunchroom could not check this session's start: {}.",
+            Cause::of(&reason).long()
         )),
         Ok((Some(name), title)) => HookOut::Event {
             event: "SessionStart",
@@ -1131,24 +2037,42 @@ fn confirm_delivery(m: &mut Mail, me: &Identity, ids: &[String], now: u64) -> Ho
     if ids.iter().all(|id| m.approval_live(me, id, now)) {
         return HookOut::Silent;
     }
-    let spent: Vec<&String> = ids
+    let spent: Vec<(&String, &Status)> = ids
         .iter()
-        .filter(|id| {
+        .filter_map(|id| {
             m.message(id)
-                .is_some_and(|d| d.to == *me && d.status != Status::Queued)
+                .filter(|d| d.to == *me && d.status != Status::Queued)
+                .map(|d| (id, &d.status))
         })
         .collect();
-    if let Some(id) = spent.first() {
-        return HookOut::Block(format!(
-            "Lunchroom: message {id} reached this session before; it is not shown again."
-        ));
+    if let Some((id, status)) = spent.first() {
+        return HookOut::Block(repeat_block_text(id, status));
     }
     for id in ids {
-        if m.confirm(me, id) == Confirmation::NotFound {
+        // D1.8: the DELIVERED notice counts the message's age to this moment (G2-9).
+        if m.confirm_at(me, id, now) == Confirmation::NotFound {
             m.hold_unrecorded(me, "unknown-message", id);
         }
     }
     HookOut::Silent
+}
+
+/// Why a prompt that carries a message already settled is blocked (D1.2, D1.4): a DELIVERED
+/// message reached this session before; a FAILED one did not, and its sender was told, so what the
+/// prompt carries is a late copy of text this session never received.
+pub(crate) fn repeat_block_text(id: &str, status: &Status) -> String {
+    match status {
+        Status::Failed { .. } => format!(
+            "Lunchroom: message {id} is {}: Lunchroom could not hand it to this session in time, \
+             and its sender was told. This late copy is not shown. The sender can send it again \
+             with `lunchroom send`.",
+            Word::Failed.text()
+        ),
+        _ => format!(
+            "Lunchroom: message {id} was {} to this session before, so it is not shown again.",
+            Word::Delivered.text()
+        ),
+    }
 }
 
 /// The message ids named by the envelope labels in `text` (`[lr:<id>]>`, `[END LUNCHROOM MESSAGE
@@ -1160,12 +2084,79 @@ fn labelled_ids(text: &str) -> impl Iterator<Item = &str> {
         .filter_map(move |start| text[start..].split_once(']').map(|(id, _)| id))
 }
 
-/// A transcript's whole text, empty when it cannot be read. Read once, when a hook first sees a
-/// session (T1.7): a label anywhere in it holds the session.
-fn transcript_text(path: &Path) -> String {
-    std::fs::read(path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+/// The most of a transcript the search reads, from its start: 32 MiB.
+const TRANSCRIPT_CAP: u64 = 32 * 1024 * 1024;
+/// The bytes kept between two reads, so a label cut by the end of one read is whole in the next.
+const LABEL_CARRY: usize = 128;
+/// The most message ids one transcript gives.
+const TRANSCRIPT_IDS: usize = 10_000;
+
+/// What a read of a transcript found (T1.7).
+#[derive(Debug)]
+struct TranscriptRead {
+    /// The message ids named by Lunchroom's labels in what was read.
+    ids: Vec<String>,
+    /// The read reached the end of the file. `false` when the size cap or the id limit stopped it
+    /// (a read that reaches the limit is not known to be whole), or the file could not be read to
+    /// the end; a file that cannot be opened has nothing left unread.
+    whole: bool,
+}
+
+/// The message ids named by Lunchroom's labels in a transcript, and whether the read reached its
+/// end. Read once, when a hook first sees a session (T1.7): a label anywhere in it holds the
+/// session. The file is read in blocks and at most `cap` bytes of it, so a large transcript
+/// neither fills memory nor takes the guard's time.
+fn read_transcript(path: &Path, cap: u64, id_limit: usize) -> TranscriptRead {
+    use std::io::Read as _;
+    // H1.7: the step named if the guard's time runs out here.
+    let _step = lunchroom_core::steps::begin(format!(
+        "reading the session's transcript {}",
+        path.display()
+    ));
+    let Ok(file) = std::fs::File::open(path) else {
+        return TranscriptRead {
+            ids: Vec::new(),
+            whole: true,
+        };
+    };
+    let mut reader = file.take(cap);
+    let mut found: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut carry: Vec<u8> = Vec::new();
+    let mut block = vec![0_u8; 64 * 1024];
+    loop {
+        let n = match reader.read(&mut block) {
+            Ok(0) => break,
+            Err(_) => {
+                return TranscriptRead {
+                    ids: found,
+                    whole: false,
+                };
+            }
+            Ok(n) => n,
+        };
+        carry.extend_from_slice(&block[..n]);
+        let text = String::from_utf8_lossy(&carry).into_owned();
+        for id in labelled_ids(&text) {
+            if seen.insert(id.to_owned()) {
+                found.push(id.to_owned());
+                if found.len() >= id_limit {
+                    return TranscriptRead {
+                        ids: found,
+                        whole: false,
+                    };
+                }
+            }
+        }
+        let drop_to = carry.len().saturating_sub(LABEL_CARRY);
+        carry.drain(..drop_to);
+    }
+    // The file ended, or the cap did: one more byte from the file says which.
+    let whole = reader
+        .into_inner()
+        .read(&mut [0_u8; 1])
+        .is_ok_and(|n| n == 0);
+    TranscriptRead { ids: found, whole }
 }
 
 /// `PostToolUse` and `PostToolUseFailure` (its `error`): a tool's output carrying another agent's
@@ -1184,26 +2175,370 @@ pub fn posttool(input: &HookInput, env: &Env) -> Result<HookOut, String> {
     let me = input.me();
     let store = store(env)?;
     let harness = harness_process(env, input.harness);
+    // G4-14: the output is scanned for labels before the lock is taken; inside it, only the ids
+    // found are looked up.
+    let named: Vec<&str> = labelled_ids(&output).collect();
+    let mut search = false;
     let granted = store
         .update(|m| {
-            observe(m, &me, input, harness.as_deref(), &env.home);
+            search = observe(m, &me, input, harness.as_deref(), &env.home);
             // A cross-session marker means another agent only in a turn (prompt); in a tool's
             // output it is a quote, as in this file.
-            if labelled_ids(&output).any(|id| m.message(id).is_some()) {
+            if named.iter().any(|id| m.message(id).is_some()) {
                 m.hold_unrecorded(&me, "tool-output", &input.mark);
             }
             m.ran(&me, &input.mark)
         })
         .map_err(crate::cli::unwritten)?;
+    // T1.7: the transcript of a session seen for the first time is read outside the lock.
+    if search {
+        search_transcript(&store, &me, input)?;
+    }
     // Card 4: a call the guard sent to the user ran, so the user said yes.
     Ok(granted.map_or(HookOut::Silent, |line| {
         HookOut::Context(format!("Lunchroom: {line}"))
     }))
 }
 
+// The tests for the messages, the transcript search and the notices (findings G4-1 to G4-14).
+#[cfg(test)]
+mod tests_g4;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // §10 D1.8, D1.10 (a sender in each harness): the next prompt of any of the
+    // sender's guarded sessions tells its agent the sender's notices, and the user the user's;
+    // each is told once; with R3.4 lines the user is told both; nothing to tell, no output.
+    #[test]
+    fn waiting_notices_reach_the_sender_and_the_user_in_each_harness() {
+        for harness in [
+            Harness::ClaudeCode,
+            Harness::Codex,
+            Harness::OpenClaw,
+            Harness::Hermes,
+        ] {
+            let sender = Identity::new(harness, "s1");
+            let other = Identity::new(Harness::ClaudeCode, "o1");
+            let mut m = Mail::default();
+            for (name, who) in [("sender", &sender), ("other", &other)] {
+                m.observe(who);
+                assert!(m.register(name, who, Origin::User, None).is_ok());
+            }
+            let sent = m.send(&sender, "sender", "other", "hi", 0);
+            let id = sent.map(|a| a.id).unwrap_or_default();
+            m.note_unreachable(&id, Some("other is STOPPED.".to_owned()));
+            m.tell_waiting(lunchroom_core::mail::WAITING_TOLD_SECS);
+            // What the notices say is the delivery code's (mail/waiting.rs); what is tested here
+            // is who is told, in what order and how often.
+            let to_agent: Vec<String> = m
+                .notices(&sender)
+                .iter()
+                .map(|n| format!("Lunchroom: {}", n.text))
+                .collect();
+            let to_user: Vec<String> = m
+                .user_notices()
+                .iter()
+                .map(|n| format!("Lunchroom: {}", n.text))
+                .collect();
+            assert!(!to_agent.is_empty() && !to_user.is_empty(), "{harness:?}");
+            let (answer, carried) =
+                waiting_notices(&m, &sender, &["Old is UNGUARDED.".to_owned()], Shows::BOTH);
+            match answer {
+                HookOut::Event {
+                    event: "UserPromptSubmit",
+                    notice: Some(shown),
+                    context: Some(agent),
+                    title: None,
+                } => {
+                    assert_eq!(agent, to_agent.join("\n"), "{harness:?}");
+                    assert_eq!(
+                        shown,
+                        format!("Lunchroom: Old is UNGUARDED.\n{}", to_user.join("\n")),
+                        "{harness:?}"
+                    );
+                    assert!(agent.contains(&id), "{harness:?}: {agent}");
+                }
+                unexpected => {
+                    assert_eq!(format!("{unexpected:?}"), "an Event", "{harness:?}");
+                }
+            }
+            // G2-14: the answer alone removes nothing (a hook killed before it wrote its output
+            // tells them again) ...
+            assert_eq!(
+                waiting_notices(&m, &sender, &[], Shows::BOTH).1,
+                carried,
+                "{harness:?}"
+            );
+            // ... and once they are marked told, a notice is shown once.
+            carried.mark_told(&mut m, &sender);
+            assert_eq!(
+                waiting_notices(&m, &sender, &[], Shows::BOTH).0,
+                HookOut::Silent,
+                "{harness:?}"
+            );
+        }
+    }
+
+    /// A DENIED call of `reason` on the command `command`, `fault` at fault, HELD by `held_by`.
+    fn denied_call<'a>(
+        reason: DenyReason,
+        input: &'a Value,
+        fault: Option<&str>,
+        held_by: &[&str],
+        call: CallClass,
+    ) -> DeniedCall<'a> {
+        DeniedCall {
+            reason,
+            tool: "Bash",
+            judged_tool: "Bash",
+            judged_input: input,
+            fault: fault.map(str::to_owned),
+            agent: "builder".to_owned(),
+            held_by: held_by.iter().map(|h| (*h).to_owned()).collect(),
+            call,
+            mode: HoldMode::Strict,
+            undecided: None,
+        }
+    }
+
+    // §1 V1.4, V1.5 (each reason a tool call is DENIED for): the message keeps the
+    // table's label and next step, names what was DENIED (the command, and the part at fault),
+    // the rule, for a HELD session the holding agent and message id, and each way forward that
+    // exists for it, and no way that does not.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one case per reason, each with its own ways forward
+    fn each_denied_reason_explains_what_why_who_holds_and_the_ways_forward() {
+        struct Case {
+            reason: DenyReason,
+            command: &'static str,
+            fault: &'static str,
+            holders: &'static [&'static str],
+            call: CallClass,
+            ways: &'static [&'static str],
+            not_ways: &'static [&'static str],
+        }
+        const HELD: &[&str] = &["alice (lr-00000045)"];
+        let held = HELD;
+        let cases = [
+            Case {
+                reason: DenyReason::Fence,
+                command: "codex queue --thread t1 'hi'",
+                fault: "codex queue --thread t1 hi",
+                holders: &[],
+                call: CallClass::Denied(DenyReason::Fence),
+                ways: &[
+                    "`lunchroom send <name> <text>`",
+                    "run it in a terminal of their own",
+                ],
+                not_ways: &["type a message in this session", "lunchroom approve"],
+            },
+            Case {
+                reason: DenyReason::Unparsed,
+                command: "./missing.sh | tee out",
+                fault: "./missing.sh (a program that does not exist)",
+                holders: &[],
+                call: CallClass::Denied(DenyReason::Unparsed),
+                ways: &[
+                    "split it into plain commands",
+                    "run it in a terminal of their own",
+                ],
+                not_ways: &["type a message in this session", "lunchroom approve"],
+            },
+            Case {
+                reason: DenyReason::DeniedPath,
+                command: "cat /home/u/.claude/projects/p/t.jsonl",
+                fault: "/home/u/.claude/projects/p/t.jsonl",
+                holders: HELD,
+                call: CallClass::Denied(DenyReason::DeniedPath),
+                ways: &[
+                    "leave /home/u/.claude/projects/p/t.jsonl out of the call",
+                    "read it in a terminal of their own",
+                    "type a message in this session. That ends HELD",
+                ],
+                not_ways: &["lunchroom approve"],
+            },
+            Case {
+                reason: DenyReason::Configuration,
+                command: "lunchroom mode relaxed",
+                fault: "lunchroom mode relaxed",
+                holders: &[],
+                call: CallClass::Denied(DenyReason::Configuration),
+                ways: &[
+                    "ask the user for the change",
+                    "run it in a terminal of their own",
+                ],
+                not_ways: &["type a message in this session", "lunchroom approve"],
+            },
+            Case {
+                reason: DenyReason::NoApprovalChannel,
+                command: "touch a.txt",
+                fault: "",
+                holders: HELD,
+                call: CallClass::Ordinary,
+                ways: &[
+                    "`lunchroom approve` lists this exact call",
+                    "type a message in this session. That ends HELD",
+                    "change how strict Lunchroom is for this session",
+                    "run it in a terminal of their own",
+                ],
+                not_ways: &["lunchroom mode relaxed", "lunchroom yolo"],
+            },
+        ];
+        for Case {
+            reason,
+            command,
+            fault,
+            holders,
+            call,
+            ways,
+            not_ways,
+        } in cases
+        {
+            let input = json!({ "command": command });
+            let fault = (!fault.is_empty()).then_some(fault);
+            let text = explain(&denied_call(reason, &input, fault, holders, call));
+            let lines: Vec<&str> = text.lines().collect();
+            // The first line names the path at fault for a DENIED path (V1.2), else the reason.
+            let subject = match (reason, fault) {
+                (DenyReason::DeniedPath, Some(f)) => f.to_owned(),
+                _ => reason.word().to_owned(),
+            };
+            assert_eq!(
+                lines[0],
+                format!("Lunchroom: DENIED · {subject}: {}", reason.next_step()),
+                "{text}"
+            );
+            assert!(
+                lines[1].starts_with(&format!("What was DENIED: the command `{command}`")),
+                "{text}"
+            );
+            if let Some(f) = fault {
+                assert!(
+                    lines[1].contains(&format!("(the part at fault: {f})")),
+                    "{text}"
+                );
+            }
+            assert!(lines[2].starts_with("Why: "), "{text}");
+            if reason == DenyReason::NoApprovalChannel {
+                assert!(lines[2].contains("builder is HELD."), "{text}");
+                assert!(lines[2].contains("needs the user's yes"), "{text}");
+            } else {
+                assert!(lines[2].contains(&reason.rule()), "{text}");
+            }
+            if holders.is_empty() {
+                assert!(!lines[2].contains("This session is HELD by"), "{text}");
+            } else {
+                assert!(
+                    lines[2].ends_with("This session is HELD by alice (lr-00000045)."),
+                    "{text}"
+                );
+            }
+            assert_eq!(lines[3], "Ways forward:", "{text}");
+            for way in ways {
+                assert!(
+                    lines[4..]
+                        .iter()
+                        .any(|l| l.starts_with("- ") && l.contains(way)),
+                    "{reason:?} lacks {way}: {text}"
+                );
+            }
+            for way in not_ways {
+                assert!(!text.contains(way), "{reason:?} offers {way}: {text}");
+            }
+            assert_eq!(
+                lunchroom_core::vocab::find_retired_word(&text),
+                None,
+                "{text}"
+            );
+        }
+        // A PROTECTED call in Balanced: the hold mode that lets it run is named; a change to the
+        // guard's configuration has no such mode.
+        let input = json!({ "command": "git push origin main" });
+        let mut d = denied_call(
+            DenyReason::NoApprovalChannel,
+            &input,
+            None,
+            held,
+            CallClass::Protected(ProtectedKind::PushOrPublish),
+        );
+        d.mode = HoldMode::Balanced;
+        // G1-7: the way that loosens Lunchroom is named without the commands that do it.
+        let loosen = "The user: change how strict Lunchroom is for this session, in a terminal of their own.";
+        assert!(explain(&d).contains(loosen), "{}", explain(&d));
+        d.call = CallClass::Protected(ProtectedKind::GuardConfig);
+        assert!(!explain(&d).contains("how strict"));
+        // An ordinary call in Strict has the same way, and no command that loosens Lunchroom is
+        // printed for the HELD agent to read.
+        d.call = CallClass::Ordinary;
+        d.mode = HoldMode::Strict;
+        assert!(explain(&d).contains(loosen));
+        for text in [
+            explain(&d),
+            explain(&denied_call(
+                DenyReason::NoApprovalChannel,
+                &input,
+                None,
+                held,
+                CallClass::Protected(ProtectedKind::PushOrPublish),
+            )),
+        ] {
+            for command in [
+                "lunchroom mode",
+                "lunchroom yolo",
+                "mode relaxed",
+                "mode balanced",
+            ] {
+                assert!(!text.contains(command), "{command}: {text}");
+            }
+        }
+        // A file tool names its path; a long command is cut around the part at fault.
+        let read = json!({ "file_path": "/home/u/.lunchroom/store/state.json" });
+        let mut d = denied_call(
+            DenyReason::DeniedPath,
+            &read,
+            None,
+            held,
+            CallClass::Ordinary,
+        );
+        d.tool = "read_file";
+        d.judged_tool = "Read";
+        assert!(
+            explain(&d)
+                .contains("What was DENIED: the read_file of /home/u/.lunchroom/store/state.json."),
+            "{}",
+            explain(&d)
+        );
+        let long = json!({ "command": format!("{} && cat /x/.codex/sessions/s.jsonl", "echo a ".repeat(80)) });
+        let d = denied_call(
+            DenyReason::DeniedPath,
+            &long,
+            Some("/x/.codex/sessions/s.jsonl"),
+            held,
+            CallClass::Ordinary,
+        );
+        let text = explain(&d);
+        let what = text.lines().nth(1).unwrap_or_default();
+        assert!(
+            what.contains("cat /x/.codex/sessions/s.jsonl") && what.contains('…'),
+            "{text}"
+        );
+        // The store could not be used: no hold is named, and no clearing it is offered.
+        let mut d = denied_call(
+            DenyReason::DeniedPath,
+            &read,
+            None,
+            &[],
+            CallClass::Ordinary,
+        );
+        d.undecided = Some(Cause::Store("Lunchroom's store cannot be opened: x").long());
+        let text = explain(&d);
+        assert!(
+            text.contains("could not be used") && !text.contains("type a message in this session"),
+            "{text}"
+        );
+    }
 
     // §9 I1.5: a suffix takes its room from the base, so a name never passes 32 characters.
     #[test]

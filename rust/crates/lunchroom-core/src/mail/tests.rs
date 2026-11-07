@@ -175,6 +175,17 @@ fn held_reply_only_to_holding_identities_from_message_record() {
         m.register("codex", &codex("x2"), Origin::User, Some(&codex("x1")))
             .is_ok()
     );
+    // D1.7 (1.0.2): the holder's name moved, so the holder is no longer named and the reply is
+    // refused as to an agent no longer named. It is never routed to the new holder of the name.
+    assert_eq!(
+        send(&mut m, &claude("c1"), "claude", "codex", "Again.").map(|a| a.to),
+        Err(SendRefusal::NotNamed)
+    );
+    // Named again, the holder is reached by the reply as before.
+    assert!(
+        m.register("codex-x1", &codex("x1"), Origin::User, None)
+            .is_ok()
+    );
     assert_eq!(
         send(&mut m, &claude("c1"), "claude", "codex", "Again.").map(|a| a.to),
         Ok(codex("x1"))
@@ -452,7 +463,17 @@ fn attempts_wait_for_confirmation_then_count_as_failed() {
         m.message(&first).map(|d| d.status.state()),
         Some(MessageState::Failed)
     );
-    assert_eq!(m.notices(&claude("c1")).len(), 1);
+    // D1.8: the sender is told of each failed attempt, then of FAILED, each naming the message.
+    let told: Vec<&str> = m
+        .notices(&claude("c1"))
+        .iter()
+        .map(|n| n.text.as_str())
+        .collect();
+    assert_eq!(told.len(), 3, "{told:?}");
+    assert!(told[0].contains("attempt 1 of 3"), "{told:?}");
+    assert!(told[1].contains("attempt 2 of 3"), "{told:?}");
+    assert!(told[2].contains("FAILED"), "{told:?}");
+    assert!(told.iter().all(|t| t.contains(first.as_str())), "{told:?}");
     // Confirmed in time: DELIVERED, and the next one is offered at once.
     assert_eq!(m.confirm(&x1, &second), Confirmation::Show);
     assert_eq!(m.message(&second).and_then(|d| d.presented_at), None);
@@ -531,7 +552,7 @@ fn a_failed_hand_over_leaves_no_hold() {
         m.hold_before_delivery(&codex("x1"), &id);
         m.handed_over(&id);
         assert!(m.is_held(&codex("x1")));
-        assert!(m.attempt_failed(&id, "codex queue failed").is_some());
+        assert!(m.attempt_failed(&id, "codex queue failed", 1000).is_some());
         assert!(!m.is_held(&codex("x1")));
     }
 }
@@ -567,7 +588,9 @@ fn an_unconfirmed_hand_over_expires_as_one_failed_attempt() {
             .map(|d| (d.status.clone(), d.failed_attempts, d.presented_at)),
         Some((Status::Queued, 1, None))
     );
-    assert_eq!(m.notices(&claude("c1")).len(), 0);
+    // D1.8: the failed attempt is told to the sender and the user.
+    assert_eq!(m.notices(&claude("c1")).len(), 1);
+    assert_eq!(m.user_notices().len(), 1);
     assert_eq!(
         hand_over(&mut m, 1000 + HANDOVER_SECS),
         Some(id),
@@ -605,7 +628,8 @@ fn a_dead_recipients_hand_over_is_released_by_send_present_and_prune() {
 }
 
 // §10::4 (Codex) — three expired hand-overs make the message FAILED and tell the sender;
-// the recipient stays HELD until the user types, and a late copy is not let in.
+// the recipient stays HELD until the user types, and a late copy is not let in. D1.8: each failed
+// attempt is told too, the FAILED last.
 #[test]
 fn three_expired_hand_overs_fail_the_message_and_tell_the_sender() {
     let mut m = pair();
@@ -617,9 +641,9 @@ fn three_expired_hand_overs_fail_the_message_and_tell_the_sender() {
     for n in 1..=MAX_ATTEMPTS {
         assert_eq!(hand_over(&mut m, at), Some(id.clone()), "{n}");
         at += HANDOVER_SECS;
-        assert_eq!(m.notices(&claude("c1")).len(), 0, "{n}");
         m.expire_handovers(at);
         assert_eq!(m.message(&id).map(|d| d.failed_attempts), Some(n));
+        assert_eq!(m.notices(&claude("c1")).len(), n as usize, "{n}");
     }
     assert_eq!(
         m.message(&id).map(|d| d.status.state()),
@@ -630,9 +654,15 @@ fn three_expired_hand_overs_fail_the_message_and_tell_the_sender() {
         .iter()
         .map(|n| n.text.as_str())
         .collect();
-    assert_eq!(
-        told,
-        [format!("{id} FAILED: no confirmation from the recipient's harness").as_str()]
+    assert!(
+        told[0].starts_with(&format!("{id} to codex: attempt 1 of 3 failed")),
+        "{told:?}"
+    );
+    assert!(
+        told[2].starts_with(&format!(
+            "{id} FAILED: no confirmation from the recipient's harness (to codex, sent "
+        )),
+        "{told:?}"
     );
     assert!(m.is_held(&x1));
     assert_eq!(m.confirm(&x1, &id), Confirmation::Failed);
@@ -686,8 +716,11 @@ fn an_undone_hand_over_is_not_counted() {
     assert!(!m.hand_over_undone(&id));
 }
 
-// §10::4 (Codex) — a hand-over stamped after the present time (the clock stepped back)
-// has run out rather than waiting for the clock to catch up.
+// §10::4 (Codex) — a hand-over stamped further ahead of the present time than two
+// processes' clocks can differ (the clock stepped back) has run out rather than waiting for the
+// clock to catch up; a stamp a few seconds ahead is another process's later clock reading, and
+// stands (G2-3: a check that waited for the store's lock reads an older time than the hand-over it
+// finds, and must not count it failed).
 #[test]
 fn a_hand_over_stamped_in_the_future_has_expired() {
     let mut m = pair();
@@ -695,13 +728,23 @@ fn a_hand_over_stamped_in_the_future_has_expired() {
         .map(|a| a.id)
         .unwrap_or_default();
     assert_eq!(hand_over(&mut m, 5000), Some(id.clone()));
-    m.expire_handovers(4999);
+    // Two processes' clocks, a few seconds apart: the older one finds the hand-over of the newer.
+    for skew in 0..=FUTURE_SLACK_SECS {
+        m.expire_handovers(5000 - skew);
+        assert_eq!(
+            m.message(&id).map(|d| (d.failed_attempts, d.handed_over)),
+            Some((0, true)),
+            "{skew} s behind"
+        );
+    }
+    // A clock that stepped back by more than that has made the stamp void.
+    m.expire_handovers(5000 - FUTURE_SLACK_SECS - 1);
     assert_eq!(m.message(&id).map(|d| d.failed_attempts), Some(1));
     assert!(m.is_held(&codex("x1")));
 }
 
-// §10::4 — after 2 failed attempts the message is still QUEUED and the sender is told
-// nothing; the 3rd makes it FAILED with the reason, and the sender is told.
+// §10::4 — after 2 failed attempts the message is still QUEUED; the 3rd makes it FAILED
+// with the reason, and the sender is told. D1.8: each failed attempt is told as it happens.
 #[test]
 fn third_failed_attempt_marks_failed_and_tells_sender() {
     let mut m = pair();
@@ -710,13 +753,13 @@ fn third_failed_attempt_marks_failed_and_tells_sender() {
         .unwrap_or_default();
     for n in 1..=2 {
         assert_eq!(
-            m.attempt_failed(&id, "no session"),
+            m.attempt_failed(&id, "no session", 1000),
             Some(AttemptOutcome::StillQueued { failed_attempts: n })
         );
-        assert_eq!(m.notices(&claude("c1")).len(), 0);
+        assert_eq!(m.take_notices(&claude("c1")).len(), 1);
     }
     assert_eq!(
-        m.attempt_failed(&id, "no session"),
+        m.attempt_failed(&id, "no session", 1000),
         Some(AttemptOutcome::Failed)
     );
     assert_eq!(
@@ -730,8 +773,12 @@ fn third_failed_attempt_marks_failed_and_tells_sender() {
         .iter()
         .map(|n| n.text.as_str())
         .collect();
-    assert_eq!(told, [format!("{id} FAILED: no session").as_str()]);
-    assert_eq!(m.attempt_failed(&id, "no session"), None);
+    assert_eq!(told.len(), 1);
+    assert!(
+        told[0].starts_with(&format!("{id} FAILED: no session (to codex, sent ")),
+        "{told:?}"
+    );
+    assert_eq!(m.attempt_failed(&id, "no session", 1000), None);
     assert_eq!(m.deliveries(&codex("x1")).len(), 0);
     // A late copy of the FAILED message is not let in: it stays FAILED and holds nobody.
     assert_eq!(m.confirm(&codex("x1"), &id), Confirmation::Failed);
@@ -779,7 +826,7 @@ fn held_recipient_delivery_stopped_only_by_denied_rules() {
             .map(|a| a.id)
             .unwrap_or_default();
         for _ in 0..MAX_ATTEMPTS {
-            m.attempt_failed(&failing, "no session");
+            m.attempt_failed(&failing, "no session", 1000);
         }
         assert!(
             m.deliveries(&codex("x1")).iter().all(|d| d.id != failing),
@@ -1352,15 +1399,20 @@ fn a_senders_hand_over_keeps_one_attempt_and_counts_nothing_against_another_send
     );
     // Theirs is out and not yet past its time: nothing else goes.
     assert_eq!(m.present_from(&x1, Some(&claude("c1")), 1), None);
-    // Past its time, c1's send offers c1's own and leaves theirs as it was.
+    // Past its time, c1's send offers c1's own. D1.7 (1.0.2): every program's run checks the time
+    // limits, whatever session it runs in, so the offer of theirs that ran past its time is counted
+    // as one failed attempt here too, and theirs waits to be offered again; nothing else about it
+    // changes.
     let later = CONFIRM_SECS + 1;
-    let before = m.message(&theirs).cloned();
     assert_eq!(
         m.present_from(&x1, Some(&claude("c1")), later)
             .map(|d| d.id),
         Some(mine)
     );
-    assert_eq!(m.message(&theirs).cloned(), before);
+    let after = m.message(&theirs);
+    assert_eq!(after.map(|d| d.failed_attempts), Some(1));
+    assert_eq!(after.map(|d| d.presented_at), Some(None));
+    assert_eq!(after.map(|d| &d.status), Some(&Status::Queued));
 }
 
 // §10::1 (D1.1) — with no sender given (the recipient's own hook), the oldest message
@@ -1417,4 +1469,185 @@ fn a_message_whose_envelope_would_not_fit_one_argument_is_refused() {
         &"n".repeat(32),
         &"a\n".repeat(most - 1)
     ));
+}
+
+// §10 D1.7, D1.10: a message to an agent that left (its name taken away) is FAILED at
+// once, with that reason, and the user and the sender are told; a message to a named agent is not
+// touched.
+#[test]
+fn a_message_to_an_agent_that_left_is_failed_with_that_reason() {
+    let mut m = pair();
+    let id = send(&mut m, &claude("c1"), "claude", "codex", "hi")
+        .map(|a| a.id)
+        .unwrap_or_default();
+    assert_eq!(m.fail_unnamed(10), Vec::<String>::new());
+    assert!(m.unregister("codex"));
+    assert_eq!(m.fail_unnamed(70), vec![id.clone()]);
+    assert_eq!(
+        m.message(&id).map(|d| d.status.clone()),
+        Some(Status::Failed {
+            reason: "codex no longer takes messages: it left with `leave`, or its name was taken \
+                     away"
+                .to_owned()
+        })
+    );
+    let sender: Vec<String> = m
+        .take_notices(&claude("c1"))
+        .into_iter()
+        .map(|n| n.text)
+        .collect();
+    let user: Vec<String> = m.take_user_notices().into_iter().map(|n| n.text).collect();
+    assert_eq!(sender, user);
+    assert_eq!(sender.len(), 1);
+    assert!(
+        sender[0].starts_with(&format!("{id} FAILED: codex no longer takes messages"))
+            && sender[0].contains("(to codex, sent 1 min ago by claude)"),
+        "{sender:?}"
+    );
+    assert_eq!(m.fail_unnamed(80), Vec::<String>::new());
+}
+
+// §10 D1.8, D1.9: where a QUEUED message stands names its id, recipient, age, the
+// attempt (n of 3), its stage, what Lunchroom waits for (for Codex: the id in the session's record,
+// or its next prompt), and when it is offered again.
+#[test]
+fn a_waiting_message_says_where_it_stands() {
+    let mut m = pair();
+    let id = send(&mut m, &claude("c1"), "claude", "codex", "hi")
+        .map(|a| a.id)
+        .unwrap_or_default();
+    let line = |m: &Mail, now: u64| m.message(&id).map(|d| standing(d, now)).unwrap_or_default();
+    let waiting = line(&m, 30);
+    assert!(
+        waiting.starts_with(&format!(
+            "{id} to codex (codex:x1), sent 30 s ago by claude, attempt 1 of 3: waiting to be \
+             handed over; Lunchroom waits for the message id in that session's record, or its next \
+             prompt; it is offered at claude's next `lunchroom send` to it"
+        )),
+        "{waiting}"
+    );
+    assert_eq!(hand_over(&mut m, 60), Some(id.clone()));
+    let handed = line(&m, 180);
+    assert!(
+        handed.contains("attempt 1 of 3: handed over 2 min ago, at 00:01 UTC, not yet confirmed")
+            && handed.ends_with("it is offered again at 00:11 UTC if not confirmed by then"),
+        "{handed}"
+    );
+    m.expire_handovers(60 + HANDOVER_SECS);
+    let again = line(&m, 60 + HANDOVER_SECS);
+    assert!(
+        again.contains("attempt 2 of 3: waiting to be handed over")
+            && again.contains("offered again at the next Lunchroom check"),
+        "{again}"
+    );
+    m.note_blocked(&id, Some("codex is STOPPED.".to_owned()));
+    let blocked = line(&m, 700);
+    assert!(
+        blocked.contains("it cannot be handed over: codex is STOPPED.")
+            && blocked.ends_with("it is offered once it can be handed over"),
+        "{blocked}"
+    );
+}
+
+// §10 D1.8: a hand-over with no confirmation for 2 minutes is told once; a message that
+// cannot be handed over is told as soon as that is found, again only when the reason changes;
+// a message told of is told DELIVERED. The sender and the user get the same notices.
+#[test]
+fn waiting_blocked_and_delivered_are_each_told_once() {
+    let mut m = pair();
+    let id = send(&mut m, &claude("c1"), "claude", "codex", "hi")
+        .map(|a| a.id)
+        .unwrap_or_default();
+    let x1 = codex("x1");
+    // Cannot be handed over: told as soon as it is found (D1.8, the owner's decision of
+    // 2026-11-02: no wait), and once.
+    m.note_blocked(&id, Some("codex is STOPPED.".to_owned()));
+    m.tell_waiting(1);
+    m.tell_waiting(5);
+    let told = m.take_user_notices();
+    assert_eq!(told.len(), 1);
+    assert!(
+        told[0].text.starts_with(&format!(
+            "{id} to codex cannot be handed over: codex is STOPPED."
+        )),
+        "{told:?}"
+    );
+    // The same reason is not told again; a new one is.
+    m.note_blocked(&id, Some("codex is STOPPED.".to_owned()));
+    m.tell_waiting(300);
+    assert_eq!(m.user_notices(), &[] as &[Notice]);
+    // G2-5: once the reason clears, the user and the sender are told it has, in full.
+    m.note_blocked(&id, None);
+    let cleared = m.take_user_notices();
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert_eq!(
+        cleared[0].text,
+        format!(
+            "{id} to codex can be handed over again: what stopped it no longer applies, so \
+             Lunchroom offers it now (sent 5 min ago by claude)."
+        )
+    );
+    // Handed over at 400; no confirmation for 2 minutes is told once.
+    assert_eq!(hand_over(&mut m, 400), Some(id.clone()));
+    m.tell_waiting(400 + WAITING_TOLD_SECS - 1);
+    assert_eq!(m.user_notices(), &[] as &[Notice]);
+    m.tell_waiting(400 + WAITING_TOLD_SECS);
+    m.tell_waiting(400 + WAITING_TOLD_SECS + 30);
+    let told = m.take_user_notices();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].text.starts_with(&format!(
+            "{id} to codex: no confirmation 2 min after its hand-over."
+        )) && told[0].text.contains("`lunchroom unregister codex`"),
+        "{told:?}"
+    );
+    // DELIVERED after being told of: told.
+    assert_eq!(m.confirm(&x1, &id), Confirmation::Show);
+    let told = m.take_user_notices();
+    assert_eq!(told.len(), 1);
+    assert!(
+        told[0]
+            .text
+            .starts_with(&format!("{id} to codex is DELIVERED, ")),
+        "{told:?}"
+    );
+    let sender = m.take_notices(&claude("c1"));
+    assert_eq!(sender.len(), 3);
+    // A message nothing was told of is DELIVERED without a notice.
+    let quiet = send(&mut m, &claude("c1"), "claude", "codex", "quiet")
+        .map(|a| a.id)
+        .unwrap_or_default();
+    assert_eq!(m.confirm(&x1, &quiet), Confirmation::Show);
+    assert_eq!(m.user_notices(), &[] as &[Notice]);
+}
+
+// §10 D1.7: a check offers again only a message whose hand-over counted as failed, to a
+// recipient a harness program hands over to; a first hand-over is left to its own sender or the
+// recipient's listener (D1.1).
+#[test]
+fn a_check_offers_again_only_what_failed_before() {
+    let mut m = pair();
+    let first = send(&mut m, &claude("c1"), "claude", "codex", "first")
+        .map(|a| a.id)
+        .unwrap_or_default();
+    let x1 = codex("x1");
+    // A message just sent is left to its own sender's send and the recipient's listener.
+    assert_eq!(m.to_offer_again(RETRY_GAP_SECS - 1), Vec::<Identity>::new());
+    assert_eq!(m.present_again(&x1, RETRY_GAP_SECS - 1), None);
+    // G2-5: one that has waited that long without ever being handed over (its recipient was not
+    // guarded when it was sent) is offered by a check once the recipient is.
+    assert_eq!(m.to_offer_again(RETRY_GAP_SECS), vec![x1.clone()]);
+    assert_eq!(hand_over(&mut m, 10), Some(first.clone()));
+    m.expire_handovers(10 + HANDOVER_SECS);
+    assert_eq!(m.to_offer_again(10 + HANDOVER_SECS), vec![x1.clone()]);
+    assert_eq!(
+        m.present_again(&x1, 10 + HANDOVER_SECS).map(|d| d.id),
+        Some(first)
+    );
+    // A Claude Code recipient is offered by its own listener, not by a check.
+    let id = send(&mut m, &codex("x1"), "codex", "claude", "to claude")
+        .map(|a| a.id)
+        .unwrap_or_default();
+    assert!(m.attempt_failed(&id, "no confirmation", 20).is_some());
+    assert!(!m.to_offer_again(1_000_000).contains(&claude("c1")));
 }

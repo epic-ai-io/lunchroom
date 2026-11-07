@@ -22,6 +22,9 @@ use serde_json::{Map, Value, json};
 use lunchroom_core::mail::Mail;
 use lunchroom_core::store::Store;
 
+#[cfg(feature = "console")]
+mod console_setup;
+
 use crate::cli::Outcome;
 use crate::evidence::{CODEX_TTY, codex_tty_setting};
 use crate::home::Env;
@@ -78,6 +81,7 @@ impl Transaction {
             .truncate(false)
             .mode(0o600)
             .open(&path)?;
+        lunchroom_core::setgid::settle(&path);
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::other(format!(
                 "{} is not a plain file; remove it and run the command again",
@@ -514,7 +518,7 @@ fn with_lunchroom_hooks(
 /// the install offers to name again; nothing else of that installation is read.
 fn earlier_names(env: &Env) -> Vec<(String, lunchroom_core::identity::Identity)> {
     use lunchroom_core::identity::{Harness, Identity};
-    let Some(registry) = fs::read_to_string(env.lunchroom_home.join("registry.json"))
+    let Some(registry) = fs::read_to_string(user_folder(env).join("registry.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
     else {
@@ -627,8 +631,8 @@ fn link_line(link: Option<&PathBuf>) -> String {
 /// `lunchroom install openclaw` or `lunchroom install hermes`: the program, and the plugin's files
 /// with the program's path in them, each old file kept beside as a backup.
 #[allow(clippy::too_many_lines)] // one transaction: plan, lock, re-plan, write, report
-fn install_plugin(openclaw: bool, env: &Env, sys: &mut dyn System) -> Outcome {
-    let program = env.lunchroom_home.join("bin").join("lunchroom");
+fn install_plugin(openclaw: bool, env: &Env, sys: &mut dyn System, program: &Path) -> Outcome {
+    let program = program.to_path_buf();
     let shown = program.display().to_string();
     // The path is written inside a quoted string in JavaScript and Python.
     if shown.contains(['"', '\\', '\n']) {
@@ -639,7 +643,7 @@ fn install_plugin(openclaw: bool, env: &Env, sys: &mut dyn System) -> Outcome {
     }
     let (dir, files): (PathBuf, &[(&str, &str)]) = if openclaw {
         (
-            env.lunchroom_home.join("plugins").join("openclaw"),
+            user_folder(env).join("plugins").join("openclaw"),
             &OPENCLAW_PLUGIN,
         )
     } else {
@@ -674,10 +678,9 @@ fn install_plugin(openclaw: bool, env: &Env, sys: &mut dyn System) -> Outcome {
         Err(e) => return Outcome::failed(&format!("the install did not start: {e}"), 1),
     };
     let written = (|| -> std::io::Result<String> {
-        let exe = fs::read(std::env::current_exe()?)?;
         let mut report = String::new();
         let earlier = earlier_stamp(&program);
-        let program_backup = replace(&program, &exe, 0o755, env.now)?;
+        let program_backup = write_program(&program, env.now)?;
         let _ = writeln!(report, "installed {shown}: {}", crate::cli::VERSION);
         if let Some(b) = program_backup {
             let _ = writeln!(
@@ -734,12 +737,19 @@ fn install_plugin(openclaw: bool, env: &Env, sys: &mut dyn System) -> Outcome {
 
 /// The supported harnesses whose folder exists for this user (H1.4): the word `install` takes, and
 /// the harness's name.
-fn found_harnesses(env: &Env) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn found_harnesses(env: &Env) -> Vec<(&'static str, &'static str)> {
+    found_harnesses_in(env, &env.claude_home)
+}
+
+/// [`found_harnesses`] with Claude Code's user settings folder `claude` (G3-5): `lunchroom doctor`
+/// passes the folder Claude Code reads, `CLAUDE_CONFIG_DIR` when it is set, so a setup whose
+/// `~/.claude` does not exist is still checked.
+pub(crate) fn found_harnesses_in(env: &Env, claude: &Path) -> Vec<(&'static str, &'static str)> {
     let openclaw = std::env::var_os("OPENCLAW_STATE_DIR")
         .filter(|d| !d.is_empty())
         .map_or_else(|| env.home.join(".openclaw"), PathBuf::from);
     [
-        ("claude-code", "Claude Code", env.home.join(".claude")),
+        ("claude-code", "Claude Code", claude.to_path_buf()),
         ("codex", "Codex", env.codex_home.clone()),
         ("openclaw", "OpenClaw", openclaw),
         ("hermes", "Hermes", env.hermes_home.clone()),
@@ -856,11 +866,38 @@ impl System for Preface<'_> {
     fn verifier_blocker(&self) -> Option<String> {
         self.sys.verifier_blocker()
     }
+    #[cfg(feature = "console")]
+    fn root_blocker(&self) -> Option<String> {
+        self.sys.root_blocker()
+    }
+    #[cfg(feature = "console")]
+    fn run_root(&mut self, what: &str, argv: &[String], input: Option<&str>) -> Result<(), String> {
+        self.sys.run_root(what, argv, input)
+    }
+    #[cfg(feature = "console")]
+    fn run_user(&mut self, program: &Path, args: &[&str]) -> Result<bool, String> {
+        self.sys.run_user(program, args)
+    }
 }
 
-/// `lunchroom install [claude-code|codex|openclaw|hermes]`.
+/// `lunchroom install [claude-code|codex|openclaw|hermes]`, or `lunchroom install console`.
 #[must_use]
 pub fn install(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
+    if args.first().map(String::as_str) == Some("console") {
+        // The console is part of 1.1; a build without it says so and changes nothing.
+        #[cfg(not(feature = "console"))]
+        return Outcome::failed(
+            "lunchroom install console: the Lunchroom console comes in release 1.1; this \
+             release does not include it, so nothing was changed.",
+            2,
+        );
+        #[cfg(feature = "console")]
+        return if args.len() == 1 {
+            console_setup::install_console(env, sys)
+        } else {
+            Outcome::failed("usage: lunchroom install console", 2)
+        };
+    }
     // With no passphrase set yet there is nothing to check one against: this install is confirmed
     // with a typed yes, and sets the first passphrase once the hooks are written.
     let first = sys.verifier().is_err_and(|reason| reason == NO_VERIFIER);
@@ -967,10 +1004,7 @@ fn plan_removal(
 fn remaining_users(env: &Env, program: &Path) -> Vec<String> {
     let mut users = Vec::new();
     for (harness, path) in [
-        (
-            "Claude Code",
-            env.home.join(".claude").join("settings.json"),
-        ),
+        ("Claude Code", env.claude_home.join("settings.json")),
         ("Codex", env.codex_home.join("hooks.json")),
     ] {
         match plan_removal(&path, program, &env.home) {
@@ -993,7 +1027,7 @@ fn remaining_users(env: &Env, program: &Path) -> Vec<String> {
     for (harness, plugin, disable) in [
         (
             "OpenClaw",
-            env.lunchroom_home.join("plugins/openclaw/index.mjs"),
+            user_folder(env).join("plugins/openclaw/index.mjs"),
             "openclaw plugins disable lunchroom",
         ),
         (
@@ -1019,10 +1053,7 @@ fn remaining_users(env: &Env, program: &Path) -> Vec<String> {
 #[allow(clippy::too_many_lines)] // one transaction: plan, lock, re-plan, write, report
 pub fn uninstall(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     let (harness, settings_path) = match args.first().map(String::as_str) {
-        Some("claude-code") => (
-            "Claude Code",
-            env.home.join(".claude").join("settings.json"),
-        ),
+        Some("claude-code") => ("Claude Code", env.claude_home.join("settings.json")),
         Some("codex") => ("Codex", env.codex_home.join("hooks.json")),
         Some("openclaw") => {
             return Outcome::ok(
@@ -1045,7 +1076,7 @@ pub fn uninstall(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             );
         }
     };
-    let program = env.lunchroom_home.join("bin").join("lunchroom");
+    let program = installed_program(env);
     match plan_removal(&settings_path, &program, &env.home) {
         Err(out) => return out,
         Ok((_, false)) => {
@@ -1154,14 +1185,53 @@ fn plan(
 }
 
 fn install_target(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
+    install_target_with(args, env, sys, &installed_program(env))
+}
+
+/// Where the program lives once installed for this process: the setgid program (1.1) when this
+/// process runs as it, else `<LUNCHROOM_HOME>/bin/lunchroom` as in 1.0.x.
+pub(crate) fn installed_program(env: &Env) -> PathBuf {
+    if lunchroom_core::setgid::active() {
+        PathBuf::from(lunchroom_core::setgid::PROGRAM)
+    } else {
+        env.lunchroom_home.join("bin").join("lunchroom")
+    }
+}
+
+/// The user's own Lunchroom folder, which the user's processes can read (the OpenClaw plugin, the
+/// old registry): `~/.lunchroom`. In setgid mode (1.1) Lunchroom's folder is the store, which they
+/// cannot, so this is the home's folder; otherwise it is Lunchroom's folder, as in 1.0.x.
+pub(crate) fn user_folder(env: &Env) -> PathBuf {
+    if lunchroom_core::setgid::active() {
+        env.home.join(".lunchroom")
+    } else {
+        env.lunchroom_home.clone()
+    }
+}
+
+/// Writes the running program to `program`, keeping an earlier one beside it. The setgid program
+/// at [`lunchroom_core::setgid::PROGRAM`] is root's and is put in place by the console set-up, so
+/// it is never written here.
+fn write_program(program: &Path, now: u64) -> std::io::Result<Option<PathBuf>> {
+    if program.starts_with(lunchroom_core::setgid::PROGRAM_DIR) {
+        return Ok(None);
+    }
+    let exe = fs::read(std::env::current_exe()?)?;
+    replace(program, &exe, 0o755, now)
+}
+
+/// [`install_target`] with the program the hooks run named by the caller.
+pub(crate) fn install_target_with(
+    args: &[String],
+    env: &Env,
+    sys: &mut dyn System,
+    program: &Path,
+) -> Outcome {
     let (target, settings_path) = match args.first().map(String::as_str) {
-        Some("claude-code") => (
-            Target::ClaudeCode,
-            env.home.join(".claude").join("settings.json"),
-        ),
+        Some("claude-code") => (Target::ClaudeCode, env.claude_home.join("settings.json")),
         Some("codex") => (Target::Codex, env.codex_home.join("hooks.json")),
-        Some("openclaw") => return install_plugin(true, env, sys),
-        Some("hermes") => return install_plugin(false, env, sys),
+        Some("openclaw") => return install_plugin(true, env, sys, program),
+        Some("hermes") => return install_plugin(false, env, sys, program),
         _ => {
             return Outcome::failed(
                 "usage: lunchroom install claude-code|codex|openclaw|hermes",
@@ -1169,7 +1239,7 @@ fn install_target(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             );
         }
     };
-    let program = env.lunchroom_home.join("bin").join("lunchroom");
+    let program = program.to_path_buf();
     // The path is written into shell commands, quoted with single quotes.
     if program
         .to_str()
@@ -1365,9 +1435,8 @@ fn install_files(
     target: Target,
     hooks_changed: bool,
 ) -> std::io::Result<String> {
-    let exe = fs::read(std::env::current_exe()?)?;
     let earlier = earlier_stamp(program);
-    let program_backup = replace(program, &exe, 0o755, now)?;
+    let program_backup = write_program(program, now)?;
     let mut text =
         serde_json::to_string_pretty(&Value::Object(new.clone())).map_err(std::io::Error::other)?;
     text.push('\n');
@@ -2091,6 +2160,7 @@ mod tests {
             let _ = fs::write(home.join(".claude/settings.json"), OLD_SETTINGS);
             let env = Env {
                 lunchroom_home: home.join(".lunchroom"),
+                claude_home: home.join(".claude"),
                 codex_home: home.join(".codex"),
                 hermes_home: home.join(".hermes"),
                 home,
@@ -2979,6 +3049,7 @@ mod tests {
         let _ = fs::create_dir_all(home.join(".claude"));
         let _ = fs::write(home.join(".claude/settings.json"), OLD_SETTINGS);
         s.env.lunchroom_home = home.join(".lunchroom");
+        s.env.claude_home = home.join(".claude");
         s.env.codex_home = home.join(".codex");
         s.env.hermes_home = home.join(".hermes");
         s.env.home = home;
@@ -3793,5 +3864,75 @@ mod tests {
             "{}",
             out.stdout
         );
+    }
+
+    // G3-5: Claude Code is found where Claude Code reads its settings: a folder other than
+    // `~/.claude` (`CLAUDE_CONFIG_DIR`) counts, and `~/.claude` alone no longer decides. Today's
+    // code looked only at `~/.claude`, so a setup with the settings folder elsewhere was skipped.
+    #[test]
+    fn claude_code_is_found_in_the_folder_it_reads() {
+        let s = Scratch::new();
+        let names = |found: Vec<(&str, &str)>| -> Vec<String> {
+            found.into_iter().map(|(word, _)| word.to_owned()).collect()
+        };
+        assert!(names(found_harnesses(&s.env)).contains(&"claude-code".to_owned()));
+        let _ = fs::remove_dir_all(s.env.home.join(".claude"));
+        assert!(!names(found_harnesses(&s.env)).contains(&"claude-code".to_owned()));
+        let elsewhere = s.root.join("claude-config");
+        let _ = fs::create_dir_all(&elsewhere);
+        assert!(names(found_harnesses_in(&s.env, &elsewhere)).contains(&"claude-code".to_owned()));
+        assert!(
+            !names(found_harnesses_in(&s.env, &s.root.join("missing")))
+                .contains(&"claude-code".to_owned())
+        );
+    }
+
+    // DV-16 (H1.4, C1.4): install finds and writes Claude Code's folder as `CLAUDE_CONFIG_DIR`
+    // names it, else `~/.claude`; uninstall removes from the same one. Before the fix `install`
+    // wrote `~/.claude` whatever the variable said, a folder Claude Code did not read, so the fix
+    // doctor named never closed the loop.
+    #[test]
+    fn install_writes_the_folder_claude_code_reads() {
+        let mut s = Scratch::new();
+        let elsewhere = s.root.join("claude-config");
+        let _ = fs::create_dir_all(&elsewhere);
+        let _ = fs::remove_dir_all(s.env.home.join(".claude"));
+        // `CLAUDE_CONFIG_DIR` set: that folder is found and written; `~/.claude` is not made.
+        s.env.claude_home = elsewhere.clone();
+        assert!(
+            found_harnesses(&s.env)
+                .iter()
+                .any(|(word, _)| *word == "claude-code")
+        );
+        let out = install(&["claude-code".to_owned()], &s.env, &mut UserAt("yes\n"));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(elsewhere.join("settings.json").is_file(), "{}", out.stdout);
+        assert!(!s.env.home.join(".claude/settings.json").exists());
+        let out = uninstall(&["claude-code".to_owned()], &s.env, &mut UserAt("yes\n"));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let left = fs::read_to_string(elsewhere.join("settings.json")).unwrap_or_default();
+        assert!(!left.contains("guard"), "{left}");
+        // Not set: `~/.claude`.
+        s.env.claude_home = s.env.home.join(".claude");
+        let _ = fs::create_dir_all(s.env.home.join(".claude"));
+        let out = install(&["claude-code".to_owned()], &s.env, &mut UserAt("yes\n"));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(s.env.home.join(".claude/settings.json").is_file());
+    }
+
+    // DV-16: the variable names the folder only when it is set and not empty.
+    #[test]
+    fn the_claude_folder_is_the_variable_when_set_and_not_empty() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            crate::home::claude_home(Some("/srv/claude".to_owned()), home),
+            PathBuf::from("/srv/claude")
+        );
+        for unset in [None, Some(String::new())] {
+            assert_eq!(
+                crate::home::claude_home(unset, home),
+                PathBuf::from("/home/u/.claude")
+            );
+        }
     }
 }

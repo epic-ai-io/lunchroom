@@ -11,7 +11,7 @@ binding on the product.
 | Agent | AVAILABLE | Its guard is running and no other agent's text is in its context; it works normally. |
 | Agent | HELD | Another agent's text is in its context. What it may still do depends on the hold mode (`lunchroom mode`): in Strict, only what its permission slip allows, or, while a `lunchroom yolo` covers it, any call that is not PROTECTED; in Balanced, any call that is not PROTECTED; in Relaxed, any call except a change to Lunchroom's program or the guard's configuration. DENIED and HALTED rules always apply. |
 | Agent | YOLO | The agent's harness is set to stop asking the user: by its own switch, or by the user's `lunchroom yolo` until a stated time. Under a `lunchroom yolo` a HELD agent acts without asking; the harness's own switch alone does not free a HELD agent in Strict. In Strict and Balanced, PROTECTED calls still come to the user; DENIED and HALTED rules always apply. |
-| Agent | UNGUARDED | It is running, but its guard is not, so nothing it does is checked. |
+| Agent | UNGUARDED | It is running, but Lunchroom has no evidence that its guard runs, so it delivers nothing to it. |
 | Agent | STOPPED | It is not running, or Lunchroom cannot reach it. |
 | Conversation | HALTED | Lunchroom stopped the conversation between two agents (reason: loop, rate limit). |
 | Message | QUEUED | Accepted and waiting for the recipient. |

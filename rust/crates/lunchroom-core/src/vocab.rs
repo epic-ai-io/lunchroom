@@ -95,6 +95,12 @@ pub enum Verdict {
 /// The party at the terminal, from the table.
 pub const THE_USER: &str = Word::TheUser.text();
 
+/// What HELD means, for a message to say the first time it uses the word. It follows the word,
+/// as in "HELD means a message from another agent is in this session, so Lunchroom restricts what
+/// it may do."
+pub const HELD_MEANING: &str =
+    "a message from another agent is in this session, so Lunchroom restricts what it may do";
+
 /// The reason printed beside a verdict or HALTED, as `DENIED · <reason>` (vocabulary file: "A reason
 /// is a small label beside the word, never a different word").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,31 +188,96 @@ impl Reason {
     pub fn next_step(self) -> String {
         let user = Word::TheUser.text();
         match self {
-            Self::Fence => {
-                "this would put a turn into another session; use `lunchroom send`.".into()
-            }
-            Self::Unparsed => {
-                "the guard could not read this command; split it, or run it yourself.".into()
-            }
+            // F1.1.
+            Self::Fence => "this would start work in another agent's session; to message an \
+                            agent, use `lunchroom send <name> <text>`."
+                .into(),
+            // F1.2: the agent splits the command; only the user runs it as it is.
+            Self::Unparsed => format!(
+                "Lunchroom could not read this command in full; split it into simple commands and \
+                 run them one at a time. Only {user} can run it as it is, in a terminal of their \
+                 own."
+            ),
+            // L1.1: names no path; the part at fault is the caller's (`Denial::fault`).
             Self::DeniedPath => format!(
-                "this path holds Lunchroom's records or another session's transcript; {user} can \
-                 read it in a terminal of their own."
+                "this path is, or leads to, Lunchroom's records or another session's \
+                 transcripts; leave it out of the call, and {user} can read it in a terminal of \
+                 their own."
             ),
             Self::Configuration => format!(
                 "changes to Lunchroom and its settings are for {user} alone, in a terminal of \
                  their own."
             ),
             Self::NoApprovalChannel => format!(
-                "this session has no permission prompt; {user} can approve this exact call with \
-                 `lunchroom approve`, and then it can run."
+                "this session has no permission prompt to ask {user}; {user} can approve this \
+                 exact call with `lunchroom approve`, and then it can run."
             ),
             Self::Leak => "the text carries or asks for a secret; remove it and send again.".into(),
             Self::Halted => format!(
-                "this pair is {}; {user} typing in either session clears it.",
+                "this pair is {}: Lunchroom stopped their conversation, and {user} typing in \
+                 either session clears it.",
                 Word::Halted.text()
             ),
             Self::Loop => "this pair repeated itself; send something new.".into(),
             Self::RateLimit => "this pair passed the rate limit; wait, then send again.".into(),
+        }
+    }
+}
+
+impl Reason {
+    /// The rule behind this reason, in plain words (V1.4: "why (the rule …)"); a DENIED call's
+    /// message gives it after what was DENIED ([`crate::denial::Denial`]).
+    #[must_use]
+    pub fn rule(self) -> String {
+        let user = Word::TheUser.text();
+        let held = Word::Held.text();
+        let halted = Word::Halted.text();
+        // The clause behind each rule is in the comment above its text, never in the text a person
+        // reads.
+        match self {
+            // F1.1, I1.2.
+            Self::Fence => "a call that starts work in another agent's session by any way but \
+                            `lunchroom send`, calls a local session chat API, or changes the \
+                            variables Lunchroom reads an agent's identity from is DENIED in \
+                            every session"
+                .into(),
+            // F1.2.
+            Self::Unparsed => "Lunchroom could not read this call in full, and what it could read \
+                               names a way into another session or an identity variable, or runs \
+                               a program or script that Lunchroom cannot find or read in full; \
+                               such a call is DENIED in every session"
+                .into(),
+            // L1.1. HELD is defined here, where a message first uses it (V1.4).
+            Self::DeniedPath => format!(
+                "a {held} session may not read Lunchroom's records or another session's \
+                 transcript, nor search a folder that holds one; {held} means {HELD_MEANING}"
+            ),
+            // A1.3.
+            Self::Configuration => format!(
+                "Lunchroom's records, its settings and the commands only {user} may run are \
+                 changed by {user} alone, in a terminal of their own"
+            ),
+            // A1.2.
+            Self::NoApprovalChannel => format!(
+                "this call needs {user}'s yes, and this session has no permission prompt to ask \
+                 it"
+            ),
+            // L1.2, L1.4.
+            Self::Leak => "a message that carries a secret, or asks for one, is DENIED".into(),
+            // R1.4.
+            Self::Halted => format!(
+                "a conversation between these two agents is {halted}: no message passes between \
+                 them until {user} types in either session"
+            ),
+            // R1.3.
+            Self::Loop => {
+                "these two agents repeated themselves; a repeat stops their conversation".into()
+            }
+            // R1.6.
+            Self::RateLimit => format!(
+                "these two agents passed the rate limit {user} set for messages between two \
+                 agents"
+            ),
         }
     }
 }
@@ -498,6 +569,96 @@ mod tests {
         assert_eq!(find_retired_word("Waiting for the human."), Some("human"));
         assert_eq!(find_retired_word("Session locked."), Some("locked"));
         assert_eq!(find_retired_word("Claude is HELD."), None);
+    }
+
+    // G1-5, G1-6, G1-7: the whole text of every reason's next step and rule, as a person reads it:
+    // plain words, no clause code, HELD defined where a rule first uses it, an unreadable command
+    // answered with "split it" (the agent never runs it as it is), and no command that loosens the
+    // guard.
+    #[test]
+    fn every_reason_reads_as_plain_words_in_full() {
+        let table = [
+            (
+                Reason::Fence,
+                "this would start work in another agent's session; to message an agent, use \
+                 `lunchroom send <name> <text>`.",
+                "a call that starts work in another agent's session by any way but `lunchroom \
+                 send`, calls a local session chat API, or changes the variables Lunchroom reads \
+                 an agent's identity from is DENIED in every session",
+            ),
+            (
+                Reason::Unparsed,
+                "Lunchroom could not read this command in full; split it into simple commands \
+                 and run them one at a time. Only the user can run it as it is, in a terminal of \
+                 their own.",
+                "Lunchroom could not read this call in full, and what it could read names a way \
+                 into another session or an identity variable, or runs a program or script that \
+                 Lunchroom cannot find or read in full; such a call is DENIED in every session",
+            ),
+            (
+                Reason::DeniedPath,
+                "this path is, or leads to, Lunchroom's records or another session's \
+                 transcripts; leave it out of the call, and the user can read it in a terminal \
+                 of their own.",
+                "a HELD session may not read Lunchroom's records or another session's \
+                 transcript, nor search a folder that holds one; HELD means a message from \
+                 another agent is in this session, so Lunchroom restricts what it may do",
+            ),
+            (
+                Reason::Configuration,
+                "changes to Lunchroom and its settings are for the user alone, in a terminal of \
+                 their own.",
+                "Lunchroom's records, its settings and the commands only the user may run are \
+                 changed by the user alone, in a terminal of their own",
+            ),
+            (
+                Reason::NoApprovalChannel,
+                "this session has no permission prompt to ask the user; the user can approve \
+                 this exact call with `lunchroom approve`, and then it can run.",
+                "this call needs the user's yes, and this session has no permission prompt to \
+                 ask it",
+            ),
+            (
+                Reason::Leak,
+                "the text carries or asks for a secret; remove it and send again.",
+                "a message that carries a secret, or asks for one, is DENIED",
+            ),
+            (
+                Reason::Halted,
+                "this pair is HALTED: Lunchroom stopped their conversation, and the user typing \
+                 in either session clears it.",
+                "a conversation between these two agents is HALTED: no message passes between \
+                 them until the user types in either session",
+            ),
+            (
+                Reason::Loop,
+                "this pair repeated itself; send something new.",
+                "these two agents repeated themselves; a repeat stops their conversation",
+            ),
+            (
+                Reason::RateLimit,
+                "this pair passed the rate limit; wait, then send again.",
+                "these two agents passed the rate limit the user set for messages between two \
+                 agents",
+            ),
+        ];
+        for (reason, step, rule) in table {
+            assert_eq!(reason.next_step(), step, "{reason:?}");
+            assert_eq!(reason.rule(), rule, "{reason:?}");
+            for text in [reason.next_step(), reason.rule()] {
+                // A clause code such as (F1.1) or (L1.2, L1.4) is for the code's comments.
+                let coded = text.split('(').skip(1).any(|after| {
+                    after.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                        && after
+                            .split(')')
+                            .next()
+                            .is_some_and(|inside| inside.chars().any(|c| c.is_ascii_digit()))
+                });
+                assert!(!coded, "{text}");
+                assert!(!text.contains("lunchroom mode") && !text.contains("lunchroom yolo"));
+                assert_eq!(find_retired_word(&text), None, "{text}");
+            }
+        }
     }
 
     // §1::3 — none of the table's own words is retired.

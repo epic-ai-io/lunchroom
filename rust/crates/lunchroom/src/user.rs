@@ -9,12 +9,12 @@
 
 use std::fmt::Write as _;
 
-use lunchroom_core::approvals::visible;
+use lunchroom_core::approvals::{APPROVAL_SECS, visible};
 use lunchroom_core::cards;
 use lunchroom_core::identity::{Harness, Identity};
 use lunchroom_core::jcs::shown;
 use lunchroom_core::loops::Limits;
-use lunchroom_core::mail::{Mail, Origin, RegisterRefusal, valid_name};
+use lunchroom_core::mail::{Mail, Origin, RegisterRefusal, clock, span, valid_name};
 use lunchroom_core::passphrase::{self, Verifier};
 use lunchroom_core::policy::HoldMode;
 use lunchroom_core::store::Store;
@@ -46,21 +46,26 @@ pub fn approve(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
         Ok(s) => s,
         Err(o) => return o,
     };
+    // A call that has waited as long as an approval lasts is no longer asked about; the list shows
+    // only calls that can still be approved. A store that cannot be written lists what it reads.
+    let _ = store.update(|m| m.expire_requests(env.now));
     let mail = match read(&store) {
         Ok(m) => m,
         Err(o) => return o,
     };
     let Some(arg) = args.first() else {
         let mut out = String::new();
+        let now = env.now;
         for (n, r) in mail.requests().iter().enumerate() {
             let _ = writeln!(
                 out,
-                "{}. {} ({}) {} {}",
+                "{}. {} ({}) {} {} (asked {} ago)",
                 n + 1,
                 visible(&r.agent),
                 visible(&r.session.to_string()),
                 visible(&r.tool),
-                shown(&r.input)
+                shown(&r.input),
+                span(now.saturating_sub(r.at))
             );
         }
         return Outcome::ok(out);
@@ -79,9 +84,11 @@ pub fn approve(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
         &request.input,
         &request.cwd,
     );
-    let question = format!(
-        "Lunchroom: this call is outside {}. Approve this one call, for 10 minutes, once?\n{shown}\n",
-        request.rule
+    let question = approval_question(
+        &request.rule,
+        &shown,
+        &span(env.now.saturating_sub(request.at)),
+        &clock(request.at.saturating_add(APPROVAL_SECS)),
     );
     if let Err(reason) = confirm(&mail, sys, &question) {
         return Outcome::denied(&reason, 3);
@@ -114,6 +121,24 @@ pub fn approve(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
         ),
         Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
     }
+}
+
+/// What the user is asked to confirm for one waiting call (A2.2): `rule` is the reason the call
+/// waits, `shown` the call as the approval covers it, `ago` how long ago the agent asked and
+/// `lapses` when the request lapses. A rule kept now is a whole sentence ending in `.` and is
+/// printed as it is (G4-1); a request kept by an older Lunchroom holds a noun phrase, which keeps
+/// the old form.
+fn approval_question(rule: &str, shown: &str, ago: &str, lapses: &str) -> String {
+    let why = if rule.ends_with('.') {
+        format!("Lunchroom: {rule}")
+    } else {
+        format!("Lunchroom: this call is outside {rule}.")
+    };
+    format!(
+        "{why} Approve this one call, for 10 minutes, once?\n{shown}\n\
+         The agent asked {ago} ago; the request lapses at {lapses} if it is not approved by \
+         then.\n"
+    )
 }
 
 /// The question `install` asks, and `lunchroom mode` without a mode shows (P1.6).
@@ -257,26 +282,60 @@ pub fn register(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
         }
         Err(e) => return Outcome::failed(&crate::cli::unwritten(e), 1),
     };
-    let question = format!(
-        "Lunchroom: the name \"{name}\" is held by {holder}. Messages already QUEUED for it stay \
-         with it. Move the name to {who}?\n"
-    );
     let mail = match read(&store) {
         Ok(m) => m,
         Err(o) => return o,
     };
+    // What moving the name does to the messages QUEUED for it, found by doing it to a copy.
+    let fate = {
+        let mut copy = mail.clone();
+        let _ = copy.register(name, &who, Origin::User, Some(&holder));
+        queued_fate(copy.fail_unnamed(env.now).len(), &holder)
+    };
+    let question = format!(
+        "Lunchroom: the name \"{name}\" is held by {holder}. {fate} Move the name to {who}?\n"
+    );
     if let Err(reason) = confirm(&mail, sys, &question) {
         return Outcome::denied(&format!("the name stays with {holder}: {reason}"), 3);
     }
-    match store.update(|m| m.register(name, &who, Origin::User, Some(&holder))) {
-        Ok(Ok(_)) => Outcome::ok(format!("{name} is {who} (moved from {holder})\n")),
+    let moved = store.update(|m| {
+        m.register(name, &who, Origin::User, Some(&holder))
+            .map(|_| m.fail_unnamed(env.now))
+    });
+    match moved {
+        Ok(Ok(failed)) => Outcome::ok(format!(
+            "{name} is {who} (moved from {holder})\n{}",
+            failed_line(&failed)
+        )),
         Ok(Err(_)) => Outcome::denied("the name changed holder meanwhile; nothing was moved", 3),
         Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
     }
 }
 
+/// What taking a name from `holder` does to the `count` messages QUEUED for it: they become FAILED,
+/// and their senders are told (D1.7), or there are none.
+fn queued_fate(count: usize, holder: &Identity) -> String {
+    match count {
+        0 => format!("No message is QUEUED for {holder}."),
+        1 => format!("1 message QUEUED for {holder} becomes FAILED, and its sender is told."),
+        n => format!("{n} messages QUEUED for {holder} become FAILED, and their senders are told."),
+    }
+}
+
+/// The line that says which messages a command made FAILED, or nothing when it made none.
+fn failed_line(failed: &[String]) -> String {
+    match failed {
+        [] => String::new(),
+        [one] => format!("{one} is now FAILED, and its sender is told.\n"),
+        many => format!(
+            "{} are now FAILED, and their senders are told.\n",
+            many.join(", ")
+        ),
+    }
+}
+
 /// `lunchroom unregister <name>`: the user takes a name away, so that session receives no more
-/// messages. Messages already QUEUED for it stay QUEUED.
+/// messages. The messages QUEUED for it become FAILED, and their senders are told, in the same step.
 #[must_use]
 pub fn unregister(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     let [name] = args else {
@@ -293,16 +352,25 @@ pub fn unregister(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     let Some(who) = mail.named(name) else {
         return Outcome::denied(&format!("no agent is named \"{name}\""), 2);
     };
+    // What taking the name away does to the messages QUEUED for it, found by doing it to a copy.
+    let fate = {
+        let mut copy = mail.clone();
+        copy.unregister(name);
+        queued_fate(copy.fail_unnamed(env.now).len(), who)
+    };
     let question = format!(
-        "Lunchroom: take the name \"{name}\" from {who}, so it receives no more messages? Messages \
-         already QUEUED for it stay QUEUED.\n"
+        "Lunchroom: take the name \"{name}\" from {who}, so it receives no more messages? {fate}\n"
     );
     if let Err(reason) = confirm(&mail, sys, &question) {
         return Outcome::denied(&reason, 3);
     }
-    match store.update(|m| m.unregister(name)) {
-        Ok(true) => Outcome::ok(format!("{name} is no longer named\n")),
-        Ok(false) => Outcome::denied("the name was removed meanwhile; nothing was changed", 3),
+    let taken = store.update(|m| m.unregister(name).then(|| m.fail_unnamed(env.now)));
+    match taken {
+        Ok(Some(failed)) => Outcome::ok(format!(
+            "{name} is no longer named\n{}",
+            failed_line(&failed)
+        )),
+        Ok(None) => Outcome::denied("the name was removed meanwhile; nothing was changed", 3),
         Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
     }
 }
@@ -545,7 +613,10 @@ pub fn yolo(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             .flatten(),
     ) else {
         return Outcome::failed(
-            "usage: lunchroom yolo <agents|all> till <time>; it always has an end time",
+            &format!(
+                "usage: {}; separate the names with commas; it always has an end time",
+                crate::YOLO_USAGE
+            ),
             2,
         );
     };
@@ -597,15 +668,17 @@ pub fn yolo(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             "no agent can have it turned on yet".to_owned()
         } else {
             format!(
-                "to turn it on for the others, name them: lunchroom yolo {} till <time>",
+                "to turn it on for the others, name just them: lunchroom yolo {} till <HH:MM>",
                 tested.join(",")
             )
         };
         return Outcome::denied(
             &format!(
-                "the harness adapter of {} has not passed its test of starting and ending {}; \
-                 {} turns it on for every agent named or for none; {can}",
+                "{} cannot have {} turned on yet: Lunchroom has not passed its test of starting \
+                 and ending {} in that agent's program, and it works for Claude Code agents \
+                 only. {} turns it on for every agent named or for none; {can}",
                 untested.join(", "),
+                Word::Yolo.text(),
                 Word::Yolo.text(),
                 if targets == "all" {
                     "`yolo all`"
@@ -712,6 +785,7 @@ mod tests {
                 home: root.join("home"),
                 lunchroom_home: root.join("lunchroom"),
                 codex_home: root.join("home/.codex"),
+                claude_home: root.join("home/.claude"),
                 hermes_home: root.join("home/.hermes"),
                 claude_pid: None,
                 attended: None,
@@ -1343,10 +1417,12 @@ mod tests {
         let a = ["all", "till", "14:00"].map(str::to_owned);
         let out = yolo(&a, &s.0, &mut user);
         assert_eq!(out.code, 3, "{}", out.stderr);
+        // G2/G3-14: plain words, the one way of writing the command, and what to do.
         for part in [
-            "adapter of codex has not passed",
-            "`yolo all` turns it on for every agent named or for none",
-            "lunchroom yolo deepseek till <time>",
+            "codex cannot have YOLO turned on yet: Lunchroom has not passed its test of starting \
+             and ending YOLO in that agent's program, and it works for Claude Code agents only.",
+            "`yolo all` turns it on for every agent named or for none; to turn it on for the \
+             others, name just them: lunchroom yolo deepseek till <HH:MM>",
         ] {
             assert!(out.stderr.contains(part), "{part}: {}", out.stderr);
         }
@@ -1616,6 +1692,234 @@ mod tests {
                 .contains("does not hold the passphrase just typed"),
             "{}",
             out.stderr
+        );
+    }
+
+    // ---- Lunchroom 1.0.2, delivery findings G2-7, G2-11 and G3-14 (the yolo usage) ----
+
+    /// A scratch store where claude (c1) sent codex (x1) `queued` messages and codex is named.
+    fn with_queued(s: &Scratch, queued: usize) -> Vec<String> {
+        let (claude, codex) = (
+            Identity::new(Harness::ClaudeCode, "c1"),
+            Identity::new(Harness::Codex, "x1"),
+        );
+        let ids = s.store().and_then(|st| {
+            st.update(|m| {
+                for (name, who) in [("claude", &claude), ("codex", &codex)] {
+                    m.observe(who);
+                    let _ = m.register(name, who, Origin::User, None);
+                }
+                (0..queued)
+                    .map(|n| {
+                        m.send(&claude, "claude", "codex", &format!("note {n}"), 900)
+                            .map(|a| a.id)
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .ok()
+        });
+        assert!(ids.is_some());
+        ids.unwrap_or_default()
+    }
+
+    // G2-7: taking a name away says in its question what happens to the messages QUEUED for it, in
+    // full (none, one, several), and on the user's yes they are FAILED in the same step and their
+    // senders told; before the fix the question promised they "stay QUEUED" and the code left them
+    // to the next check.
+    #[test]
+    fn unregister_says_and_does_what_happens_to_the_queued_messages() {
+        for (count, said) in [
+            (0, "No message is QUEUED for codex:x1."),
+            (
+                1,
+                "1 message QUEUED for codex:x1 becomes FAILED, and its sender is told.",
+            ),
+            (
+                3,
+                "3 messages QUEUED for codex:x1 become FAILED, and their senders are told.",
+            ),
+        ] {
+            let s = Scratch::new();
+            let ids = with_queued(&s, count);
+            let mut yes = UserAt {
+                answer: "yes\n",
+                asked: Vec::new(),
+            };
+            let out = unregister(&["codex".to_owned()], &s.0, &mut yes);
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert_eq!(
+                yes.asked.first().map(String::as_str),
+                Some(
+                    format!(
+                        "Lunchroom: take the name \"codex\" from codex:x1, so it receives no more \
+                         messages? {said}\nPassphrase: "
+                    )
+                    .as_str()
+                ),
+                "{count}"
+            );
+            let line = match count {
+                0 => String::new(),
+                1 => format!("{} is now FAILED, and its sender is told.\n", ids[0]),
+                _ => format!(
+                    "{} are now FAILED, and their senders are told.\n",
+                    ids.join(", ")
+                ),
+            };
+            assert_eq!(out.stdout, format!("codex is no longer named\n{line}"));
+            let mail = s.store().and_then(|st| st.read().ok());
+            for id in &ids {
+                assert_eq!(
+                    mail.as_ref()
+                        .and_then(|m| m.message(id))
+                        .map(|d| d.status.state()),
+                    Some(lunchroom_core::vocab::MessageState::Failed),
+                    "{id}"
+                );
+            }
+            // The sender is told, once, in full.
+            let told = mail
+                .as_ref()
+                .map(|m| m.notices(&Identity::new(Harness::ClaudeCode, "c1")).len());
+            assert_eq!(told, Some(count));
+        }
+    }
+
+    // G2-7: moving a name says the same of the earlier holder's messages and does it.
+    #[test]
+    fn moving_a_name_says_and_does_what_happens_to_the_queued_messages() {
+        let s = Scratch::new();
+        let ids = with_queued(&s, 2);
+        let other = Identity::new(Harness::Codex, "x2");
+        assert!(
+            s.store()
+                .and_then(|st| st.update(|m| m.observe(&other)).ok())
+                .is_some()
+        );
+        let mut yes = UserAt {
+            answer: "yes\n",
+            asked: Vec::new(),
+        };
+        let args = ["codex", "codex:x2"].map(str::to_owned);
+        let out = register(&args, &s.0, &mut yes);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(
+            yes.asked.get(1).map(String::as_str),
+            Some(
+                "Lunchroom: the name \"codex\" is held by codex:x1. 2 messages QUEUED for codex:x1 \
+                 become FAILED, and their senders are told. Move the name to codex:x2?\n\
+                 Passphrase: "
+            )
+        );
+        assert_eq!(
+            out.stdout,
+            format!(
+                "codex is codex:x2 (moved from codex:x1)\n{} are now FAILED, and their senders \
+                 are told.\n",
+                ids.join(", ")
+            )
+        );
+    }
+
+    // G2-11: `lunchroom approve` lists each waiting call with how long it has waited, the question
+    // says it too and when the request lapses, and a call that has waited as long as an approval
+    // lasts is dropped from the list and cannot be approved.
+    #[test]
+    fn approve_shows_the_age_of_a_call_and_drops_one_that_lapsed() {
+        let s = Scratch::new();
+        let make = |at: u64| Request {
+            session: Identity::new(Harness::ClaudeCode, "s1"),
+            agent: "Claude".to_owned(),
+            tool: "Bash".to_owned(),
+            input: json!({"command": format!("git push {at}")}),
+            cwd: "/work/a".to_owned(),
+            rule: "PROTECTED (push or publish)".to_owned(),
+            at,
+        };
+        // Env.now is 1000: one call asked at 700 (5 min ago), one at 400 (10 min ago, lapsed).
+        assert!(
+            s.store()
+                .and_then(|st| st
+                    .update(|m| {
+                        m.request(make(400));
+                        m.request(make(700));
+                    })
+                    .ok())
+                .is_some()
+        );
+        let mut user = UserAt {
+            answer: "yes\n",
+            asked: Vec::new(),
+        };
+        let listed = approve(&[], &s.0, &mut user);
+        assert_eq!(
+            listed.stdout,
+            "1. Claude (claude-code:s1) Bash {\"command\":\"git push 700\"} (asked 5 min ago)\n"
+        );
+        let out = approve(&["1".to_owned()], &s.0, &mut user);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let question = user.asked.first().cloned().unwrap_or_default();
+        assert!(
+            question.ends_with(
+                "\nThe agent asked 5 min ago; the request lapses at 00:21 UTC if it is not \
+                 approved by then.\nPassphrase: "
+            ),
+            "{question}"
+        );
+        assert_eq!(
+            approve(&["2".to_owned()], &s.0, &mut user).code,
+            2,
+            "the lapsed call is gone"
+        );
+    }
+
+    // G3-14 (the error text, in user.rs): the usage line is the one the help text shows.
+    #[test]
+    fn the_yolo_usage_error_is_the_one_usage_line() {
+        let s = Scratch::new();
+        let mut user = UserAt {
+            answer: "yes\n",
+            asked: Vec::new(),
+        };
+        let out = yolo(&["all".to_owned()], &s.0, &mut user);
+        assert_eq!(out.code, 2);
+        assert_eq!(
+            out.stderr.trim_end(),
+            "usage: lunchroom yolo <name,name,...|all> till <HH:MM>; separate the names with \
+             commas; it always has an end time"
+        );
+    }
+
+    // G4-1: the approval question in full, for a rule kept as a whole sentence and for one kept by
+    // an older Lunchroom as a noun phrase.
+    #[test]
+    fn the_approval_question_reads_whole_for_both_kinds_of_rule() {
+        assert_eq!(
+            approval_question(
+                "This call is PROTECTED (deleting a file), so it needs your yes.",
+                "The call's input:\n{\"command\":\"rm x\"}",
+                "2 minutes",
+                "12:10",
+            ),
+            "Lunchroom: This call is PROTECTED (deleting a file), so it needs your yes. Approve \
+             this one call, for 10 minutes, once?\n\
+             The call's input:\n{\"command\":\"rm x\"}\n\
+             The agent asked 2 minutes ago; the request lapses at 12:10 if it is not approved by \
+             then.\n"
+        );
+        assert_eq!(
+            approval_question(
+                "PROTECTED (push or publish)",
+                "The call's input:\n{\"command\":\"git push\"}",
+                "2 minutes",
+                "12:10",
+            ),
+            "Lunchroom: this call is outside PROTECTED (push or publish). Approve this one call, \
+             for 10 minutes, once?\n\
+             The call's input:\n{\"command\":\"git push\"}\n\
+             The agent asked 2 minutes ago; the request lapses at 12:10 if it is not approved by \
+             then.\n"
         );
     }
 }

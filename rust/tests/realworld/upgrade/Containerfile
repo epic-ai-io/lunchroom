@@ -1,0 +1,36 @@
+# Proof 2 (upgrade): Claude Code from Anthropic's own apt repository, upgraded under a running
+# session.
+#
+# The repository setup is Anthropic's, copied from "Install with Linux package managers" (apt tab)
+# at https://code.claude.com/docs/en/setup.md (read 2026-11-03): the signing key from
+# https://downloads.claude.ai/keys/claude-code.asc (fingerprint
+# 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE, checked by the build). This proof uses the page's
+# `latest` channel line, https://downloads.claude.ai/claude-code/apt/latest, because an upgrade
+# needs an older release to start from: the `latest` channel keeps 2.1.309-1 beside the newer ones,
+# and the page's own upgrade command, `apt update && apt upgrade claude-code`, then moves it.
+#
+# Build context: made by ../prove.sh.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISTRO=apt
+ARG OLD=2.1.309-1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      curl gnupg ca-certificates sudo python3 procps util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /etc/apt/keyrings/claude-code.asc \
+ && gpg --show-keys --with-colons /etc/apt/keyrings/claude-code.asc | grep -q '^fpr:::::::::31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE:' \
+ && echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/latest latest main" \
+      > /etc/apt/sources.list.d/claude-code.list \
+ && apt-get update \
+ && apt-get install -y "claude-code=${OLD}"
+
+COPY lunchroom lib.sh ptyrun.py sessionpty.py plaintext.py hang.py mockapi.py inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/sessionpty.py \
+      /opt/proof/plaintext.py /opt/proof/hang.py /opt/proof/mockapi.py
+
+ENV OLD=${OLD}
+CMD ["/opt/proof/inner.sh"]

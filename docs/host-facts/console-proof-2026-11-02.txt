@@ -1,0 +1,146 @@
+
+== facts of this system
+kernel.yama.ptrace_scope=1
+dev.tty.legacy_tiocsti=0
+sudoers use_pty: Defaults	use_pty
+sudo: Sudo version 1.9.15p5
+kernel: 6.8.0-147-generic
+
+== 1. the user dev, and Lunchroom installed for dev
+PASS dev set a passphrase on the program's own prompt
+PASS the passphrase check /etc/lunchroom/1001.verifier is root's
+PASS install claude-code put the hooks on the user-mode program
+
+== 2. lunchroom install console
+PASS install console says the console is set up
+PASS the program is /usr/local/lib/lunchroom/lunchroom, root:lunchroom, mode 2755
+PASS /usr/local/lib/lunchroom is root:root, mode 755
+PASS /var/lib/lunchroom/1001 is root:lunchroom, mode 2770
+PASS dev is not in the group lunchroom
+PASS /etc/sudoers.d/lunchroom is root:root, mode 440
+PASS visudo -cf passes the drop-in
+PASS the drop-in asks for dev's password (no NOPASSWD)
+PASS ~/.local/bin/lunchroom links to /usr/local/lib/lunchroom/lunchroom
+PASS the Claude Code hooks run /usr/local/lib/lunchroom/lunchroom and no other
+PASS the old store was moved aside, not deleted
+PASS the store was copied to /var/lib/lunchroom/1001
+PASS doctor reports console mode
+
+== 3. the console, started as dev starts it
+PASS the console asked for the passphrase and drew its screen
+console pid 151, its terminal /dev/pts/1, the outer terminal /dev/pts/0
+PASS the console runs as the user lunchroom
+PASS console.alive names the console's pid
+PASS console.alive is rewritten every 2 s
+
+== 4. as dev, without the guard: what the kernel answers
+PASS dev cannot list the store folder: refused (ls: cannot open directory '/var/lib/lunchroom/1001': Permission denied )
+PASS dev cannot read the store: refused (cat: /var/lib/lunchroom/1001/store/state.json: Permission denied )
+PASS dev cannot create a file in the store folder: refused (touch: cannot touch '/var/lib/lunchroom/1001/planted': Permission denied )
+PASS dev cannot write the liveness file: refused (_: line 1: /var/lib/lunchroom/1001/console.alive: Permission denied )
+PASS dev cannot write the program: refused (_: line 1: /usr/local/lib/lunchroom/lunchroom: Permission denied )
+PASS dev cannot write the passphrase check: refused (_: line 1: /etc/lunchroom/1001.verifier: Permission denied )
+PASS dev cannot signal the console (kill -0): refused (_: line 1: kill: (151) - Operation not permitted )
+PASS dev cannot kill the console: refused (_: line 1: kill: (151) - Operation not permitted )
+PASS the console is still running
+PASS dev cannot ptrace-attach to the console: refused ()
+PASS strace cannot attach to the console (strace: attach: ptrace(PTRACE_SEIZE, 151): Operation not permitted )
+PASS dev cannot read the console's environment: refused (cat: /proc/151/environ: Permission denied )
+PASS dev cannot read the console's memory: refused (head: cannot open '/proc/151/mem' for reading: Permission denied )
+PASS dev cannot list the console's descriptors: refused (ls: cannot open directory '/proc/151/fd': Permission denied )
+PASS dev cannot read the console's maps: refused (cat: /proc/151/maps: Permission denied )
+MEASURED the console's terminal /dev/pts/1: lunchroom:tty mode 620
+PASS dev cannot read the console's terminal: refused (_: line 1: /dev/pts/1: Permission denied )
+PASS dev cannot write the console's terminal: refused (_: line 1: /dev/pts/1: Permission denied )
+PASS dev cannot push a keystroke into the console's terminal (TIOCSTI): refused (Traceback (most recent call last):   File "<string>", line 1, in <module> PermissionError: [Errno 13)
+PASS dev cannot start the console without sudo's password: refused (sudo: a password is required )
+PASS dev cannot become lunchroom with another command: refused (sudo: a password is required )
+PASS dev's lunchroom status reads the store through the program
+PASS LUNCHROOM_HOME is ignored by the setgid program (same store, nothing made at /tmp/evil)
+MEASURED the setgid program's ids: Uid: 1001 1001 1001 1001 Gid: 1001 999 999 999 
+PASS dev cannot read /proc/<setgid program>/environ (not dumpable): refused (cat: /proc/288/environ: Permission denied )
+PASS dev cannot read /proc/<setgid program>/mem: refused (head: cannot open '/proc/288/mem' for reading: Permission denied )
+MEASURED outer terminal /dev/pts/0 (dev:tty mode 620): a dev process reading it received: '' (the same is true of sudo's own password prompt; the guard's terminal rule covers guarded agents)
+
+== 5. as dev, through the guard, from a HELD session
+ATTACK is HELD: 0 HELD line(s) in status
+PASS DENIED: rule 1: read the console's terminal
+PASS DENIED: rule 1: write the console's terminal
+PASS DENIED: rule 1: write the outer terminal of another process
+PASS DENIED: rule 1: read a virtual console
+PASS DENIED: rule 2: kill the console by pid
+PASS DENIED: rule 2: pkill lunchroom
+PASS DENIED: rule 2: killall lunchroom
+PASS DENIED: rule 3: gdb the console
+PASS DENIED: rule 3: strace the console
+PASS DENIED: rule 3: ptrace through python
+PASS DENIED: rule 3: read the console's environment
+PASS DENIED: rule 3: read init's memory map
+PASS DENIED: rule 4: tmux send-keys to another pane
+PASS DENIED: rule 4: tmux capture-pane of another pane
+PASS DENIED: rule 4: screen stuff into another session
+PASS DENIED: rule 5: sudo -u lunchroom
+PASS DENIED: rule 5: su lunchroom
+PASS DENIED: rule 5: read the store
+PASS DENIED: rule 5: write the passphrase check
+PASS DENIED: rule 5: write the program folder
+PASS DENIED: rule 6: lunchroom console
+PASS DENIED: rule 6: the installed program, console
+PASS allowed: an ordinary command
+PASS allowed: lunchroom status
+PASS allowed: killing an unrelated name
+PASS allowed: sudo for another user
+
+== 6. one event of each kind, on the console's screen within 2 s
+PASS a sent message shows as QUEUED within 2 s
+PASS a FAILED message shows within 2 s
+PASS a call waiting for approval shows, numbered, within 2 s
+PASS a burst of DENIED calls shows PROBING within 2 s
+PASS the probing alert is a notice for the user
+PASS a call the guard could not decide shows within 2 s
+PASS the console survived every attack and event
+---- the last screen ----
+Lunchroom console - 21:03 UTC - hold mode Balanced - acting for dev
+
+AGENTS
+  alpha          Codex        state unknown (the console cannot read your home folder) QUEUED 1
+
+MESSAGES QUEUED OR FAILED
+  QUEUED: lr-00000001 to alpha (codex:A1), sent 2 s ago by S1, attempt 1 of 3: it cannot be handed over: alpha is STOPPED. Its session is not running, or Lunchroom cannot reach it: start it again.; Lunchroom waits for the message id in that session's record, or its next prompt; it is offered once it can be handed over
+  FAILED: lr-00000002 to beta (codex:B1) - beta no longer takes messages: it left with `leave`, or its name was taken away
+
+NOTICES FOR YOU (marked told when shown)
+  21:03 UTC a session with no agent name (ATTACK) had 18 DENIED calls in the last 10 minutes. It may be probing for a way round Lunchroom's guard: look at what it is doing.
+  21:03 UTC lr-00000001 to alpha cannot be handed over: alpha is STOPPED. Its session is not running, or Lunchroom cannot reach it: start it again. It was sent 0 s ago by S1, attempt 1 of 3: waiting for that to clear; Lunchroom waits for the message id in that session's record, or its next prompt; it is offered once it can be handed over. To end the wait without fixing that, the user can run `lunchroom unregister alpha` in a terminal of their own; the message is then FAILED and its sender is told.
+  21:03 UTC lr-00000002 to beta cannot be handed over: beta is STOPPED. Its session is not running, or Lunchroom cannot reach it: start it again. It was sent 0 s ago by S1, attempt 1 of 3: waiting for that to clear; Lunchroom waits for the message id in that session's record, or its next prompt; it is offered once it can be handed over. To end the wait without fixing that, the user can run `lunchroom unregister beta` in a terminal of their own; the message is then FAILED and its sender is told.
+  21:03 UTC lr-00000002 FAILED: beta no longer takes messages: it left with `leave`, or its name was taken away (to beta, sent 0 s ago by S1). Lunchroom was waiting for beta to take it and will not now. To try again, the user names the session again with `lunchroom register beta codex:B1`, and S1 sends the message again.
+
+CALLS WAITING FOR YOUR APPROVAL
+  1. WAITER exec {"command":"git push origin main"} (asked under 1 min ago)
+
+DENIED CALLS
+  a session with no agent name (ATTACK) - 22 in the last 10 min, 22 in the last 24 h - PROBING: 5 or more DENIED calls in 10 minutes
+
+GUARD TIMEOUTS AND SLOW DECISIONS
+  FAIL Lunchroom could not decide on a tool call whose input could not be read at 21:02 UTC in a session with no agent name: Lunchroom hit an error of its own (the hook input is not JSON). Its slowest step was reading what the harness sent (7999 ms). This line clears at 21:02 UTC on 2026-11-03, 24 hours after the call. If the call is still needed, run it yourself in a terminal of your own. If the cause is Lunchroom's store, `lunchroom status` shows whether it can be read, and `lunchroom repair` puts back the last good copy.
+
+CHECKS
+  PASS the console is set up and the store at /var/lib/lunchroom/1001 is out of reach of your agents (group lunchroom)
+  PASS /var/lib/lunchroom/1001 is mode 2770, group lunchroom
+  PASS /usr/local/lib/lunchroom/lunchroom is root's, group lunchroom, with the set-group-id bit
+  PASS your passphrase check is in place and trusted
+  The console cannot read your home folder, so the checks of your agents' setup are in `lunchroom doctor`, run in a terminal of your own.
+
+outer-race-probe is not a key. Keys: a <n> approve call n | u <name> unregister | m strict|balanced|relaxed | y <names> till HH:MM | q quit
+
+Keys: a <n> approve call n | u <name> unregister | m strict|balanced|relaxed | y <names> till HH:MM | q quit
+> -------------------------
+
+== 7. the passphrase and the sudo password: nowhere
+PASS the console removed console.alive when it ended
+PASS the Lunchroom passphrase is in no file, no /proc/*/environ and no /proc/*/cmdline
+PASS the sudo password is in no file, no /proc/*/environ and no /proc/*/cmdline
+
+== result
+RESULT: 80 PASS, 0 FAIL
+exit 0

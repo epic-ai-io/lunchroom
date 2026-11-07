@@ -12,8 +12,10 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -79,6 +81,10 @@ case "$STUB_MODE" in
   signal) kill -TERM $$ ;;
   exit1) exit 1 ;;
   garbage) printf 'not json' ;;
+  badbytes) printf '\\377\\376' ;;
+  badstderr) printf '\\377\\376 DENIED' >&2; exit 2 ;;
+  sleep) exec sleep 5 ;;
+  event) printf '%s' '{"systemMessage":"Lunchroom: bob is UNGUARDED.","hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"Lunchroom: agent text"}}' ;;
 esac
 exit 0
 """
@@ -168,6 +174,118 @@ class PluginWithStandInGuard(unittest.TestCase):
         self.call()
         self.assertEqual(self.sent()["harness_version"], "")
 
+    def test_a_root_owned_checkout_git_refuses_is_read_with_git_trusting_it(self):
+        # H1.2 (2026-11-03): where Hermes runs from a checkout another user owns, git refuses it
+        # ("dubious ownership", hermes4.txt), Hermes's own version information has no commit, and
+        # the plugin reads the commit and its date with git trusting that one checkout, only when
+        # root owns it and nobody else can write to it. The test stands in its own uid for root's.
+        repo = os.path.join(self.dir, "hermes-agent")
+        os.makedirs(os.path.join(repo, "hermes_cli"))
+        open(os.path.join(repo, "hermes_cli", "__init__.py"), "w").close()
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t", GIT_AUTHOR_DATE="@1793038003 +0000",
+                   GIT_COMMITTER_DATE="@1793038003 +0000")
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "x"]):
+            subprocess.run(["git", *args], cwd=repo, env=env, check=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+        # As a root install leaves it: nothing in the checkout writable by group or others.
+        for root, dirs, files in os.walk(repo):
+            for p in [root, *(os.path.join(root, n) for n in dirs + files)]:
+                os.chmod(p, stat.S_IMODE(os.lstat(p).st_mode) & ~0o022)
+        cli = types.ModuleType("hermes_cli")
+        cli.__file__ = os.path.join(repo, "hermes_cli", "__init__.py")
+        info = types.ModuleType("hermes_cli.version_info")
+        info.get_version_info = lambda: types.SimpleNamespace(commit=None, commit_date=None, base_version="unknown")
+        sys.modules["hermes_cli"] = cli
+        sys.modules["hermes_cli.version_info"] = info
+        def fresh():
+            # Each state below is a new Hermes process: the plugin reads the checkout once per
+            # process.
+            self.plugin.CHECKOUT_READ.clear()
+            self.call()
+
+        try:
+            self.plugin.ROOT_UID = os.getuid()
+            fresh()
+            self.assertEqual(self.sent()["harness_version"], f"{sha}@1793038003")
+            # Within one process the read is not repeated: a later change is not seen until the
+            # next process, as Hermes keeps the version it read.
+            os.chmod(repo, 0o775)
+            self.call()
+            self.assertEqual(self.sent()["harness_version"], f"{sha}@1793038003")
+            # Writable by its group: not trusted, so the release stays unread.
+            fresh()
+            self.assertEqual(self.sent()["harness_version"], "unknown")
+            os.chmod(repo, 0o755)
+            # Anything in `.git` another user can write makes the checkout untrusted (review,
+            # 2026-11-04): `.git/config`, the hooks folder, `.git` itself.
+            for inside in (os.path.join(repo, ".git", "config"), os.path.join(repo, ".git", "hooks"),
+                           os.path.join(repo, ".git")):
+                mode = stat.S_IMODE(os.stat(inside).st_mode)
+                os.chmod(inside, mode | 0o002)
+                fresh()
+                self.assertEqual(self.sent()["harness_version"], "unknown", inside)
+                os.chmod(inside, mode)
+            # A working-tree entry another user can write is read by no git command the plugin runs
+            # (hermes.txt, 2026-11-04: `uv` leaves `.venv/.lock` writable by all): still trusted.
+            lock = os.path.join(repo, "hermes_cli", "__init__.py")
+            os.chmod(lock, 0o666)
+            fresh()
+            self.assertEqual(self.sent()["harness_version"], f"{sha}@1793038003")
+            os.chmod(lock, 0o644)
+            fresh()
+            self.assertEqual(self.sent()["harness_version"], f"{sha}@1793038003")
+            # A symbolic link in the working tree, as `uv sync` makes in `.venv`, is outside what the
+            # check reads; one inside `.git`, which git reads, makes the checkout untrusted.
+            venv = os.path.join(repo, ".venv", "bin")
+            os.makedirs(venv)
+            os.chmod(os.path.join(repo, ".venv"), 0o755)
+            os.chmod(venv, 0o755)
+            os.symlink("/usr/bin/python3", os.path.join(venv, "python"))
+            fresh()
+            self.assertEqual(self.sent()["harness_version"], f"{sha}@1793038003")
+            in_git = os.path.join(repo, ".git", "linked")
+            os.symlink("/tmp", in_git)
+            fresh()
+            self.assertEqual(self.sent()["harness_version"], "unknown")
+            os.remove(in_git)
+            # A folder in `.git` the plugin cannot list is not examined, so not trusted (the
+            # reviewer, 2026-11-04: os.walk skips it silently). Root lists any folder, so not as root.
+            if os.getuid() != 0:
+                hidden = os.path.join(repo, ".git", "hidden")
+                os.mkdir(hidden, 0o755)
+                os.chmod(hidden, 0)
+                fresh()
+                self.assertEqual(self.sent()["harness_version"], "unknown")
+                os.chmod(hidden, 0o755)
+                os.rmdir(hidden)
+            # Write granted by an ACL, not by the mode bits, is write by another user too (the
+            # reviewer, 2026-11-04): an entry in `.git`, or the checkout's folder, with an extended
+            # ACL is not trusted. Run only where this filesystem takes an ACL (a probe on a scratch
+            # file in the checkout), so a filesystem mounted without ACL support skips the case.
+            setfacl = shutil.which("setfacl")
+            probe = os.path.join(repo, "acl-probe")
+            if setfacl:
+                open(probe, "w").close()
+                takes_acl = subprocess.run([setfacl, "-m", "u:nobody:r", probe],
+                                           capture_output=True).returncode == 0
+                os.remove(probe)
+            if setfacl and takes_acl:
+                for target in (os.path.join(repo, ".git", "config"), repo):
+                    subprocess.run([setfacl, "-m", "u:nobody:rwx", target], check=True)
+                    fresh()
+                    self.assertEqual(self.sent()["harness_version"], "unknown", target)
+                    subprocess.run([setfacl, "-b", target], check=True)
+                fresh()
+                self.assertEqual(self.sent()["harness_version"], f"{sha}@1793038003")
+            # Owned by someone other than root: not trusted.
+            self.plugin.ROOT_UID = os.getuid() + 1
+            fresh()
+            self.assertEqual(self.sent()["harness_version"], "unknown")
+        finally:
+            sys.modules.pop("hermes_cli.version_info", None)
+            sys.modules.pop("hermes_cli", None)
+
     def test_each_no_person_setting_is_reported_and_yolo_is_reported(self):
         # A1.2: every Hermes case where nobody is asked.
         for name, change in [
@@ -222,10 +340,15 @@ class PluginWithStandInGuard(unittest.TestCase):
         os.environ["STUB_MODE"] = "signal"
         out = self.call()
         self.assertEqual(out["action"], "approve")
-        self.assertTrue(out["message"].startswith("Lunchroom: could not check this call"))
-        self.assertIn("Any script this call runs was not read.", out["message"])
+        self.assertTrue(out["message"].startswith(
+            "Lunchroom could not check this call: stopped by signal 15. It needs your yes: answer this "
+            "prompt (yes runs the call once, no stops it). Lunchroom did not read any script this call runs."),
+            out["message"])
         self.gate.surfaces = (False, False, False)
-        self.assertEqual(self.call()["action"], "block")
+        out = self.call()
+        self.assertEqual(out, {"action": "block", "message": (
+            "Lunchroom could not check this call: stopped by signal 15. "
+            "Nobody can be asked in this session, so this call is DENIED.")})
 
     def test_other_exit_codes_are_a_guard_that_could_not_decide(self):
         os.environ["STUB_MODE"] = "exit1"
@@ -243,7 +366,10 @@ class PluginWithStandInGuard(unittest.TestCase):
                      {"path": "/home/u/.lunchroom/store/state.json", "content": "{}"}):
             out = self.plugin.on_pre_tool_call(tool_name="terminal", args=args, session_id="h1", program=absent)
             self.assertEqual(out["action"], "block", args)
-            self.assertIn("DENIED", out["message"])
+            self.assertEqual(out["message"], (
+                "Lunchroom could not check this call: its program is missing. This call is DENIED, because "
+                "it names Lunchroom or another agent's session, which Lunchroom never lets through unchecked."),
+                args)
             os.environ["STUB_MODE"] = "signal"
             self.assertEqual(self.call(args=args)["action"], "block", args)
             os.environ["STUB_MODE"] = "allow"
@@ -403,7 +529,9 @@ class PluginWithStandInGuard(unittest.TestCase):
             out = self.plugin.on_pre_tool_call(tool_name="terminal", args={"command": command, "workdir": "/d"},
                                                session_id=session, program=program)
             self.assertEqual(out["action"], "approve", session)
-            self.assertTrue(out["message"].startswith("Lunchroom: "), out["message"][:40])
+            self.assertTrue(out["message"].startswith("Lunchroom could not "), out["message"][:40])
+            self.assertIn("It needs your yes: answer this prompt (yes runs the call once, no stops it).",
+                          out["message"])
             self.assertIn(command, out["message"])
             self.assertIn('"workdir": "/d"', out["message"])
             self.assertIn("terminal", out["message"])
@@ -437,9 +565,9 @@ class PluginWithStandInGuard(unittest.TestCase):
         log = []
         real = self.plugin.run_guard
 
-        def spy(args, payload, program=None):
+        def spy(args, payload, program=None, timeout=None):
             log.append((args, payload))
-            return real(args, payload, program)
+            return real(args, payload, program, timeout)
 
         self.plugin.run_guard = spy
         for platform, typed in [("cli", True), ("tui", True), ("desktop", True), ("telegram", False),
@@ -564,6 +692,115 @@ class PluginWithStandInGuard(unittest.TestCase):
         self.gate.surfaces = (False, False, False)
         self.plugin.on_pre_llm_call(session_id="h5", user_message="hi", platform="telegram", program=self.program)
         self.assertIsNone(self.call(session_id="h5"))
+
+    def spied(self):
+        """Every guard run the plugin makes from now on: (arguments, payload, timeout)."""
+        log = []
+        real = self.plugin.run_guard
+
+        def spy(args, payload, program=None, timeout=None):
+            log.append((args, payload, timeout))
+            return real(args, payload, program, timeout)
+
+        self.plugin.run_guard = spy
+        return log
+
+    def test_the_guards_text_for_the_user_is_never_added_to_the_turn(self):
+        # G4-3. Hermes reads only ``context`` from a ``pre_llm_call`` result (agent/turn_context.py:
+        # 838-841 at 9976f4857b72) and adds it to the turn's user message: it shows the user nothing.
+        # So the guard is told it cannot show the user text, its ``systemMessage`` is not added to
+        # the turn, and its ``additionalContext`` (for the agent) is.
+        os.environ["STUB_MODE"] = "event"
+        log = self.spied()
+        out = self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli",
+                                          turn_id="t1", program=self.program)
+        self.assertEqual(out, {"context": "Lunchroom: agent text"})
+        prompt = [payload for args, payload, _ in log if args == ["guard", "prompt"]]
+        self.assertEqual(len(prompt), 1)
+        self.assertIs(prompt[0]["can_show_user"], False)
+        # What the guard says to the user alone adds nothing to the turn.
+        self.assertNotIn("UNGUARDED", json.dumps(out))
+        # The tool-call and report payloads do not carry the flag (it is the prompt hook's).
+        self.call()
+        self.assertNotIn("can_show_user", self.sent())
+
+    def test_output_that_is_not_utf8_never_raises(self):
+        # G4-4. The guard's output is read as UTF-8 with a replacement for any other byte.
+        os.environ["STUB_MODE"] = "badbytes"
+        run = self.plugin.run_guard(["guard", "pretool"], {}, self.program)
+        self.assertEqual(run, {"status": 0, "stdout": "��", "stderr": ""})
+        out = self.call()
+        self.assertEqual(out["action"], "approve")
+        self.assertIn("its answer could not be read", out["message"])
+        os.environ["STUB_MODE"] = "badstderr"
+        self.assertEqual(self.call(), {"action": "block", "message": "�� DENIED"})
+        # The same in a hook that runs the guard for a turn.
+        os.environ["STUB_MODE"] = "badbytes"
+        self.assertIsNone(self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli",
+                                                      program=self.program))
+
+    def test_a_guard_run_never_takes_longer_than_it_is_given(self):
+        # G4-5: run_guard's ``timeout`` ends the run; it never lengthens the guard's own limit.
+        os.environ["STUB_MODE"] = "sleep"
+        started = time.monotonic()
+        run = self.plugin.run_guard(["guard", "pretool"], {}, self.program, timeout=0.5)
+        self.assertEqual(run, {"failed": "no answer in time"})
+        self.assertLess(time.monotonic() - started, 3)
+        self.plugin.DEADLINE_SECONDS = 0.5
+        started = time.monotonic()
+        run = self.plugin.run_guard(["guard", "pretool"], {}, self.program, timeout=60)
+        self.assertEqual(run, {"failed": "no answer in time"})
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_the_prompt_hook_keeps_to_one_budget_under_hermes_limit(self):
+        # G4-5. Hermes abandons a ``pre_llm_call`` callback after ``plugins.hook_callback_timeout``,
+        # 30 seconds by default (hermes_cli/plugins_dispatch.py:183, :44; plugins.py:1049-1071 at
+        # 9976f4857b72). The guard's answer and the next message share one budget under it.
+        clock = [0.0]
+        self.plugin.time = types.SimpleNamespace(monotonic=lambda: clock[0])
+        took = {"guard": 0.0, "listen": 0.0}
+        log = []
+        real = self.plugin.run_guard
+
+        def spy(args, payload, program=None, timeout=None):
+            log.append((args[0], timeout))
+            clock[0] += took[args[0]]
+            return real(args, payload, program, timeout)
+
+        self.plugin.run_guard = spy
+        self.assertEqual(self.plugin.hook_budget(), 25.0)
+        for guard, listen_timeout in ((0.0, 25.0), (20.0, 5.0), (22.5, 2.5)):
+            log.clear()
+            clock[0] = 0.0
+            took["guard"] = guard
+            self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli", program=self.program)
+            self.assertEqual(log, [("guard", 25.0), ("listen", listen_timeout)], guard)
+            # Together they never pass the budget.
+            self.assertLessEqual(guard + listen_timeout, 25.0)
+        # With less than two seconds left the next message waits for the next turn.
+        for guard in (23.5, 25.0, 40.0):
+            log.clear()
+            clock[0] = 0.0
+            took["guard"] = guard
+            self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli", program=self.program)
+            self.assertEqual(log, [("guard", 25.0)], guard)
+
+    def test_the_budget_follows_hermes_own_limit_for_the_hook(self):
+        # plugins.hook_callback_timeout: a number above 0 is the limit; 0 or less, or a Hermes
+        # that cannot be read, keeps the default of 30 seconds. The margin is 5 seconds, and the
+        # budget is never below the 2 seconds the listener needs.
+        plugins = types.ModuleType("hermes_cli.plugins")
+        sys.modules["hermes_cli"] = types.ModuleType("hermes_cli")
+        sys.modules["hermes_cli.plugins"] = plugins
+        self.addCleanup(sys.modules.pop, "hermes_cli.plugins", None)
+        self.addCleanup(sys.modules.pop, "hermes_cli", None)
+        for configured, budget in ((60.0, 55.0), (10.0, 5.0), (6.0, 2.0), (1.0, 2.0), (0.0, 25.0), (-1.0, 25.0)):
+            plugins._resolve_hook_callback_timeout = lambda value=configured: value
+            self.assertEqual(self.plugin.hook_budget(), budget, configured)
+        plugins._resolve_hook_callback_timeout = lambda: "not a number"
+        self.assertEqual(self.plugin.hook_budget(), 25.0)
+        del plugins._resolve_hook_callback_timeout
+        self.assertEqual(self.plugin.hook_budget(), 25.0)
 
 
 @unittest.skipUnless(os.access(BUILT, os.X_OK), "the release program is not built")

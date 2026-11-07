@@ -1,0 +1,158 @@
+MEASURED free space on /: 10920 MB
+== building lunchroom-realworld-hooktext from Containerfile
+MEASURED image lunchroom-realworld-hooktext: 417 MB
+
+== facts of this system
+os: Ubuntu 24.04.5 LTS
+claude: 2.1.311 (Claude Code)
+lunchroom: lunchroom 1.0.2 (d6fa799, modified)
+MEASURED dev's password: dev P; hash scheme $y$
+PASS lunchroom install claude-code finished
+
+== 1. the SessionStart text and the answer to 'join s1'
+    | 
+    |  ▐▛███▛█   Claude Code v2.1.311
+    | ▝▜██████▀  Opus 5.5 · API Usage Billing
+    |  ▝▝   ▝▝   /home/dev
+    | 
+    |   ⎿  SessionStart:startup says: Lunchroom: include this session? Type join, or join <name>. Anything else keeps it out.
+    | 
+    | ❯ join s1
+    | 
+    | ● ok
+    | 
+    | ✻ Sautéed for 0s · done 8:05 AM
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    |                                                                                                                         ◐ medium · /effort
+    | ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── s1 ─
+    | ❯
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ manual mode on · ? for shortcuts · ← for agents
+PASS the user sees the SessionStart text: 'Lunchroom: include this session? Type join, or join <name>. Anything else keeps it out.'
+PASS the session joined as s1
+
+== 2. the DENIED text of a PreToolUse hook
+What the model was given back (one line):
+    PreToolUse:Bash hook error: [/home/dev/.lunchroom/bin/lunchroom guard pretool]: Lunchroom: DENIED · fence: this would start work in another 
+agent's session; to message an agent, use `lunchroom send <name> <text>`. What was DENIED: the command `codex queue other hi` (the part at fault: 
+codex queue other hi). Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or 
+changes the variables Lunchroom reads an agent's identity from is DENIED in every session. Ways forward: - The agent: to reach another agent, use 
+`lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's identity from as they are. - The user: run it in a 
+terminal of their own, outside every agent session.
+What the user's screen shows after the call:
+    | 
+    | ✻ Sautéed for 0s · done 8:05 AM
+    | 
+    | ❯ DENYTEST scr
+    | 
+    |   Ran 1 shell command
+    | 
+    | ● done
+    | 
+    | ✻ Worked for 0s · done 8:05 AM
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    | 
+    |                                                                                                                         ◐ medium · /effort
+    | ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── s1 ─
+    | ❯ ok
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   ⏸ manual mode on · ? for shortcuts · ← for agents
+MEASURED the screen holds 16 non-blank lines in all
+FAIL the hook text has 'Lunchroom: DENIED' but the user does not see it on the screen
+FAIL the hook text has 'What was DENIED' but the user does not see it on the screen
+FAIL the hook text has 'Why:' but the user does not see it on the screen
+FAIL the hook text has 'Ways forward' but the user does not see it on the screen
+MEASURED the screen shows no fold marker (no '+N lines', no 'ctrl+o to expand')
+FAIL the last words of the hook text ('outside every agent session.') are not on the user's screen: the text is cut off
+
+== 3. the same call, with the tool output expanded (ctrl+o)
+    |  ▐▛███▛█   Claude Code v2.1.311
+    | ▝▜██████▀  Opus 5.5 · API Usage Billing
+    |  ▝▝   ▝▝   /home/dev
+    |   ⎿  SessionStart:startup says: Lunchroom: include this session? Type join, or join <name>. Anything else keeps it out.
+    | ❯ join s1
+    |                                                                                                             08:05 AM claude-opus-5-5
+    | ● ok
+    | ✻ Sautéed for 0s · done 8:05 AM
+    | ❯ DENYTEST scr
+    | ● Bash(codex queue other hi)
+    |   ⎿  Error: PreToolUse:Bash hook error: [/home/dev/.lunchroom/bin/lunchroom guard pretool]: Lunchroom: DENIED · fence: this would start work
+    |      in another agent's session; to message an agent, use `lunchroom send <name> <text>`.
+    |      What was DENIED: the command `codex queue other hi` (the part at fault: codex queue other hi).
+    |      Why: a call that starts work in another agent's session by any way but `lunchroom send`, calls a local session chat API, or changes the
+    |      variables Lunchroom reads an agent's identity from is DENIED in every session.
+    |      Ways forward:
+    |      - The agent: to reach another agent, use `lunchroom send <name> <text>` instead, and leave the variables Lunchroom reads an agent's
+    |      identity from as they are.
+    |      - The user: run it in a terminal of their own, outside every agent session.
+    |                                                                                                             08:05 AM claude-opus-5-5
+    | ● done
+    | ✻ Worked for 0s · done 8:05 AM
+    | ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    |   Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · v to open in editor · ? for shortcuts                                verbose
+PASS after ctrl+o the user sees 'DENIED'
+PASS after ctrl+o the user sees 'What was DENIED'
+PASS after ctrl+o the user sees 'Why:'
+PASS after ctrl+o the user sees 'Ways forward'
+PASS after ctrl+o the last words ('outside every agent session.') are shown: the whole text is available to the user
+
+== result
+RESULT: 8 PASS, 5 FAIL
+MEASURED image lunchroom-realworld-hooktext removed
+
+RESULT: 8 PASS, 5 FAIL

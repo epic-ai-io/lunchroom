@@ -5,6 +5,7 @@
 pub mod approvals;
 pub mod cards;
 pub mod classify;
+pub mod denial;
 pub mod fs;
 pub mod identity;
 pub mod jcs;
@@ -14,7 +15,9 @@ pub mod passphrase;
 pub mod paths;
 pub mod policy;
 pub mod secrets;
+pub mod setgid;
 pub mod shell;
+pub mod steps;
 pub mod store;
 pub mod vocab;
 
