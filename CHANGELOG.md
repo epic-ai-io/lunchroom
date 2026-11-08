@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.2
+
+Fixes to 1.1.1, found by upgrading to it. 1.1.1 is superseded by 1.1.2.
+
+Upgrade: download and unpack the new release, then run its program by its path, in your own terminal,
+from the unpacked folder: `./lunchroom install`. `lunchroom install` typed by name runs the program
+already installed, so it reinstalls the build you already have and upgrades nothing.
+
+- A session whose agent has exited now shows STOPPED. Before, an agent that had exited but whose
+  parent had not yet collected it (a zombie process) was shown UNGUARDED, running.
+- `lunchroom install` with no harness named, once a passphrase is set, asks the passphrase once, then
+  asks yes or no for each harness found, and installs only those you answer yes to. Before, it asked
+  the passphrase once for each harness. A no shows as "not installed (you answered no)". The first
+  install, before a passphrase exists, still asks a yes for each harness.
+- An install run with the build already installed now says so before it asks, names the build, and
+  says how to install a newer one: run the new program by its path. Before, typing
+  `lunchroom install` by name to upgrade reinstalled the old build without a word.
+- An install or uninstall now keeps the three newest backups of each file it replaces and removes the
+  older ones; a backup it cannot remove is named in its output. Before, every install and uninstall
+  added a backup and none was ever removed.
+- The READMEs have an Upgrade section: unpack the new release and run `./lunchroom install` from its
+  folder. Their download, signature-check and `lunchroom version` examples name 1.1.2.
+
 ## 1.1.1
 
 Fixes to 1.1.0.

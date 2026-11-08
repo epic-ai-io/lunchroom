@@ -34,11 +34,18 @@ pub fn name(pid: u32) -> Option<String> {
     Some(text.rsplit('/').next().unwrap_or_default().to_owned())
 }
 
-/// `<pid>:<start time>`, naming one process for as long as the system runs.
+/// `<pid>:<start time>`, naming one process for as long as it runs. A process that has exited has
+/// none, also while it is a zombie (`Z`, its parent has not collected it) or dead (`X`): its
+/// `/proc` entry keeps the start time, but nothing runs there (F112-AC1).
 #[must_use]
 pub fn key(pid: u32) -> Option<String> {
+    let fields = stat_fields(pid)?;
+    // Field 3, the state, is the first field after the command name.
+    if matches!(fields.first().map(String::as_str), Some("Z" | "X")) {
+        return None;
+    }
     // Field 22, the start time, is the 20th field after the command name.
-    let start = stat_fields(pid)?.get(19)?.clone();
+    let start = fields.get(19)?.clone();
     Some(format!("{pid}:{start}"))
 }
 
@@ -105,5 +112,32 @@ mod tests {
         assert!(start(child.id()) > now);
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // F112-AC1: a session's process is running while it runs; once it has exited it is not, both
+    // while it is a zombie (exited, its parent, this test, has not collected it) and after it is
+    // collected. Found by the 1.1.1 dogfood upgrade: an uncollected Codex was shown UNGUARDED.
+    #[test]
+    fn f112_ac1_an_exited_process_has_no_key_whether_or_not_it_is_collected() {
+        let state = |pid: u32| stat_fields(pid).and_then(|f| f.first().cloned());
+        let child = std::process::Command::new("sleep").arg("30").spawn();
+        assert!(child.is_ok());
+        let Ok(mut child) = child else { return };
+        let pid = child.id();
+        assert!(key(pid).is_some(), "a running process has a key");
+        let _ = child.kill();
+        // Not waited for yet: the child is a zombie until this test collects it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state(pid).as_deref() != Some("Z") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            state(pid).as_deref(),
+            Some("Z"),
+            "the child did not become a zombie"
+        );
+        assert_eq!(key(pid), None, "a zombie is not running");
+        let _ = child.wait();
+        assert_eq!(key(pid), None, "a collected process is not running");
     }
 }

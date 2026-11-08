@@ -1,5 +1,5 @@
 name: lunchroom
-version: "1.1.1"
+version: "1.1.2"
 description: "Lunchroom's guard: agents talk, the user decides who acts."
 author: "Lunchroom"
 provides_hooks:

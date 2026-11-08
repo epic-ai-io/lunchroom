@@ -79,8 +79,8 @@ Download `lunchroom-v<version>-<target>.tar.gz` for your machine from
 your own terminal:
 
 ```
-tar xzf lunchroom-v1.1.1-x86_64-unknown-linux-musl.tar.gz
-cd lunchroom-v1.1.1-x86_64-unknown-linux-musl
+tar xzf lunchroom-v1.1.2-x86_64-unknown-linux-musl.tar.gz
+cd lunchroom-v1.1.2-x86_64-unknown-linux-musl
 ./lunchroom install
 ```
 
@@ -93,6 +93,15 @@ no passphrase is set and the install exits 1; `lunchroom passphrase` sets it lat
 Each release carries `SHA256SUMS`, signed with Sigstore. [`rust/README.md`](rust/README.md) shows how
 to check a download, how to build from source, and documents every command, the hold modes, each
 harness adapter and Lunchroom's stated limits.
+
+## Upgrade
+
+To upgrade an installed Lunchroom, download and unpack the new release as above, then run its
+program by its path, in your own terminal, from the unpacked folder: `./lunchroom install`.
+
+`lunchroom install` typed by name runs the program already installed, so it reinstalls the build you
+already have and upgrades nothing. From 1.1.2 on, an install says so before it asks; 1.1.1 and earlier
+do not.
 
 ## After install
 

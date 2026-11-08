@@ -244,8 +244,9 @@ fn stamp_in(program: &[u8]) -> Option<String> {
 /// backup; a `target` that already holds `bytes` with `mode` is left as it is. A `target` that is a
 /// link stays one: the file it points to is written. A `target` that is not, once resolved, a
 /// plain file or absent (a folder, a link that leads nowhere) is refused, nothing written. The
-/// backup's path.
-fn replace(target: &Path, bytes: &[u8], mode: u32, now: u64) -> std::io::Result<Option<PathBuf>> {
+/// backup, with the older backups that could not be removed (F112-AC4: once the new file is
+/// written, only the three newest backups of `target` are kept).
+fn replace(target: &Path, bytes: &[u8], mode: u32, now: u64) -> std::io::Result<Option<Backup>> {
     let target = &fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     if plain_file_or_absent(target)? {
         let same = fs::read(target).is_ok_and(|old| old == bytes)
@@ -256,7 +257,87 @@ fn replace(target: &Path, bytes: &[u8], mode: u32, now: u64) -> std::io::Result<
     }
     let backup = back_up(target, now)?;
     write_beside(target, bytes, mode)?;
-    Ok(backup)
+    Ok(backup.map(|path| Backup {
+        path,
+        unremoved: prune_backups(target),
+    }))
+}
+
+/// A backup [`replace`] made, and each older backup it could not remove, with the reason.
+#[derive(Debug)]
+struct Backup {
+    path: PathBuf,
+    unremoved: Vec<String>,
+}
+
+impl Backup {
+    /// The backup's path, then a line for each older backup that could not be removed.
+    fn display(&self) -> String {
+        let mut shown = self.path.display().to_string();
+        for old in &self.unremoved {
+            let _ = write!(shown, "\n  an older backup could not be removed: {old}");
+        }
+        shown
+    }
+}
+
+/// How many backups of one file an install keeps (F112-AC4).
+const BACKUPS_KEPT: usize = 3;
+
+/// F112-AC4: removes all but the [`BACKUPS_KEPT`] newest backups of `target` that an install made:
+/// plain files beside it named `<name>.lunchroom-backup-<stamp>` or `…-<stamp>-<n>`, the names
+/// [`back_up`] makes, newest by stamp and then by `n`. A link, a folder or any other name is never
+/// removed. Each backup that cannot be removed is returned, with the reason.
+fn prune_backups(target: &Path) -> Vec<String> {
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.lunchroom-backup-", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut backups: Vec<((String, u64), PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.file_name().to_str()?.to_owned();
+            let key = backup_key(file.strip_prefix(&prefix)?)?;
+            // The entry's own type, not its target's: a link is never a backup removed.
+            entry
+                .file_type()
+                .ok()?
+                .is_file()
+                .then(|| (key, entry.path()))
+        })
+        .collect();
+    backups.sort();
+    let excess = backups.len().saturating_sub(BACKUPS_KEPT);
+    backups
+        .into_iter()
+        .take(excess)
+        .filter_map(|(_, path)| {
+            fs::remove_file(&path)
+                .err()
+                .map(|e| format!("{} ({e})", path.display()))
+        })
+        .collect()
+}
+
+/// The order of a backup name's tail, `<stamp>` or `<stamp>-<n>` ([`stamp`]'s form,
+/// `YYYYMMDDTHHMMSSZ`); none for any other tail.
+fn backup_key(tail: &str) -> Option<(String, u64)> {
+    let (stamp, n) = match tail.split_once('-') {
+        Some((stamp, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (stamp, n.parse().ok()?)
+        }
+        Some(_) => return None,
+        None => (tail, 0),
+    };
+    let b = stamp.as_bytes();
+    let form = b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit);
+    form.then(|| (stamp.to_owned(), n))
 }
 
 /// Copies `target` to a dated backup beside it, when it exists; the backup's path. The backup is
@@ -761,7 +842,10 @@ pub(crate) fn found_harnesses_in(env: &Env, claude: &Path) -> Vec<(&'static str,
 }
 
 /// `lunchroom install` with no harness named (H1.4): each supported harness found is offered in
-/// turn, and only those the user answers yes to are installed.
+/// turn, and only those the user answers yes to are installed. With a passphrase set and more than
+/// one harness found, the passphrase is asked once, before the first harness, and each harness is
+/// then offered with a plain yes (F112-AC2); with no passphrase set (the first install) or one
+/// harness found, each harness's own question is asked, as in 1.1.1.
 ///
 /// Each harness's outcome is printed on its own line (installed, not installed, or failed with its
 /// reason). The exit code is a failure's own when any harness failed, even if another was
@@ -780,25 +864,61 @@ fn install_found(env: &Env, sys: &mut dyn System) -> (Outcome, bool) {
         );
     }
     let names: Vec<&str> = found.iter().map(|(_, name)| *name).collect();
-    let mut sys = Preface {
-        sys,
-        first: Some(format!("Found: {}\n", names.join(", "))),
-    };
+    let mut first = Some(format!("Found: {}\n", names.join(", ")));
+    // F112-AC2: the one passphrase, asked and checked before the first harness. A wrong one, or
+    // none read, installs nothing.
+    let mut passphrase = None;
+    if found.len() > 1 && sys.verifier().is_ok() {
+        let mail = match Store::<Mail>::open(&env.store_dir()).and_then(|s| s.read()) {
+            Ok(m) => m,
+            Err(e) => return (Outcome::failed(&crate::cli::unread(e), 1), false),
+        };
+        let question = format!(
+            "{}Lunchroom will show each harness's changes and ask yes or no for each.\n",
+            first.take().unwrap_or_default()
+        );
+        let mut capture = Prompted {
+            sys: &mut *sys,
+            mode: Mode::Capture(None),
+        };
+        if let Err(reason) = confirm_or_begin(&mail, &mut capture, &question) {
+            return (Outcome::denied(&reason, 3), false);
+        }
+        if let Mode::Capture(typed) = capture.mode {
+            passphrase = typed;
+        }
+    }
     let mut out = Outcome::ok(String::new());
     let (mut installed, mut failed) = (false, Vec::new());
     for (word, name) in found {
-        let one = install_target(&[word.to_owned()], env, &mut sys);
+        let mode = match &passphrase {
+            Some(typed) => Mode::Offer {
+                harness: name,
+                passphrase: typed.clone(),
+                declined: false,
+            },
+            None => Mode::Preface(first.take()),
+        };
+        let mut asker = Prompted {
+            sys: &mut *sys,
+            mode,
+        };
+        let one = install_target(&[word.to_owned()], env, &mut asker);
+        let declined = matches!(asker.mode, Mode::Offer { declined: true, .. });
         if !out.stdout.is_empty() {
             out.stdout.push('\n');
         }
         let verdict = match one.code {
             0 => "installed",
+            3 if declined => "not installed (you answered no)",
             3 => "not installed",
             _ => "failed",
         };
         let _ = writeln!(out.stdout, "{name}: {verdict}");
-        out.stdout.push_str(&one.stdout);
-        out.stdout.push_str(&one.stderr);
+        if !declined {
+            out.stdout.push_str(&one.stdout);
+            out.stdout.push_str(&one.stderr);
+        }
         installed |= one.code == 0;
         if !matches!(one.code, 0 | 3) {
             failed.push((name, one.code));
@@ -823,13 +943,71 @@ fn install_found(env: &Env, sys: &mut dyn System) -> (Outcome, bool) {
     (out, installed)
 }
 
-/// Puts `first` before the first question, so the user reads it before answering.
-struct Preface<'a> {
-    sys: &'a mut dyn System,
-    first: Option<String>,
+/// How [`Prompted`] meets a question.
+enum Mode {
+    /// Puts the text before the first question, so the user reads it before answering.
+    Preface(Option<String>),
+    /// Asks the user, and keeps the answer (the one passphrase, F112-AC2).
+    Capture(Option<String>),
+    /// F112-AC2: meets the passphrase question with a plain yes from the user and, on yes, gives
+    /// the passphrase already typed; any other answer gives none and marks the harness declined.
+    /// Every other question is asked as it is.
+    Offer {
+        harness: &'static str,
+        passphrase: String,
+        declined: bool,
+    },
 }
 
-impl System for Preface<'_> {
+/// The user's terminal, with each question met as [`Mode`] says.
+struct Prompted<'a> {
+    sys: &'a mut dyn System,
+    mode: Mode,
+}
+
+impl Prompted<'_> {
+    fn meet(&mut self, prompt: &str, secret: bool) -> Option<String> {
+        let ask = |sys: &mut dyn System, prompt: &str| {
+            if secret {
+                sys.ask_secret(prompt)
+            } else {
+                sys.ask(prompt)
+            }
+        };
+        match &mut self.mode {
+            Mode::Preface(first) => match first.take() {
+                Some(first) => ask(&mut *self.sys, &format!("{first}{prompt}")),
+                None => ask(&mut *self.sys, prompt),
+            },
+            Mode::Capture(kept) => {
+                let answer = ask(&mut *self.sys, prompt);
+                kept.clone_from(&answer);
+                answer
+            }
+            Mode::Offer {
+                harness,
+                passphrase,
+                declined,
+            } => {
+                let Some(question) = prompt.strip_suffix("Passphrase: ").filter(|_| secret) else {
+                    return ask(&mut *self.sys, prompt);
+                };
+                // No answer read (no terminal) is not a no: the install reports it as such.
+                let answer = self
+                    .sys
+                    .ask(&format!("{question}Install for {harness}? Type yes: "))?;
+                if answer.trim().eq_ignore_ascii_case("yes") {
+                    Some(passphrase.clone())
+                } else {
+                    *declined = true;
+                    None
+                }
+            }
+        }
+    }
+}
+
+impl System for Prompted<'_> {
     fn ancestors(&self) -> Vec<(Option<String>, String)> {
         self.sys.ancestors()
     }
@@ -840,10 +1018,7 @@ impl System for Preface<'_> {
         self.sys.tty_of(key)
     }
     fn ask(&mut self, question: &str) -> Option<String> {
-        match self.first.take() {
-            Some(first) => self.sys.ask(&format!("{first}{question}")),
-            None => self.sys.ask(question),
-        }
+        self.meet(question, false)
     }
     fn uid(&self) -> Option<u32> {
         self.sys.uid()
@@ -852,10 +1027,7 @@ impl System for Preface<'_> {
         self.sys.verifier()
     }
     fn ask_secret(&mut self, prompt: &str) -> Option<String> {
-        match self.first.take() {
-            Some(first) => self.sys.ask_secret(&format!("{first}{prompt}")),
-            None => self.sys.ask_secret(prompt),
-        }
+        self.meet(prompt, true)
     }
     fn salt(&mut self) -> Result<[u8; lunchroom_core::passphrase::SALT_BYTES], String> {
         self.sys.salt()
@@ -898,6 +1070,17 @@ pub fn install(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             Outcome::failed("usage: lunchroom install console", 2)
         };
     }
+    // F112-AC3: an install run with the build already installed is told so before its question.
+    let installed_now = installed_program(env);
+    let notice = std::env::current_exe()
+        .and_then(fs::read)
+        .ok()
+        .and_then(|running| same_build_notice(&installed_now, &running));
+    let mut noticed = Prompted {
+        sys,
+        mode: Mode::Preface(notice),
+    };
+    let sys: &mut dyn System = &mut noticed;
     // With no passphrase set yet there is nothing to check one against: this install is confirmed
     // with a typed yes, and sets the first passphrase once the hooks are written.
     let first = sys.verifier().is_err_and(|reason| reason == NO_VERIFIER);
@@ -929,6 +1112,20 @@ pub fn install(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
         }
     }
     out
+}
+
+/// F112-AC3: when the program installed at `installed` holds the same bytes as `running`, the
+/// notice that this build is already installed, naming it, and how a newer build is installed.
+fn same_build_notice(installed: &Path, running: &[u8]) -> Option<String> {
+    let bytes = fs::read(fs::canonicalize(installed).ok()?).ok()?;
+    (bytes == running).then(|| {
+        format!(
+            "This is the build already installed ({}); installing it again upgrades nothing. To \
+             install a newer build, unpack it and run its program by its path: ./lunchroom \
+             install, in the unpacked folder.\n",
+            crate::cli::VERSION
+        )
+    })
 }
 
 /// P1.6: after a successful install, the user is asked the hold mode once, on the same terminal
@@ -1212,7 +1409,7 @@ pub(crate) fn user_folder(env: &Env) -> PathBuf {
 /// Writes the running program to `program`, keeping an earlier one beside it. The setgid program
 /// at [`lunchroom_core::setgid::PROGRAM`] is root's and is put in place by the console set-up, so
 /// it is never written here.
-fn write_program(program: &Path, now: u64) -> std::io::Result<Option<PathBuf>> {
+fn write_program(program: &Path, now: u64) -> std::io::Result<Option<Backup>> {
     if program.starts_with(lunchroom_core::setgid::PROGRAM_DIR) {
         return Ok(None);
     }
@@ -1979,8 +2176,10 @@ mod tests {
         let s = Scratch::new();
         // Codex's folder holds a folder where hooks.json should be: its settings cannot be read.
         assert!(fs::create_dir_all(s.env.codex_home.join("hooks.json")).is_ok());
+        // F112-AC2: the passphrase once, then the yes for Claude Code (Codex fails before its
+        // question), then the hold mode.
         let mut user = Answers {
-            answers: vec!["yes\n", "2\n"],
+            answers: vec!["yes\n", "yes\n", "2\n"],
             asked: Vec::new(),
         };
         let out = install(&[], &s.env, &mut user);
@@ -2009,11 +2208,12 @@ mod tests {
             user.asked
         );
         assert!(out.stdout.contains("hold mode: "), "{}", out.stdout);
-        // A user's no beside an install is not a failure.
+        // A user's no beside an install is not a failure (F112-AC2: the passphrase once, then a
+        // no for Claude Code and a yes for Codex).
         let t = Scratch::new();
         assert!(fs::create_dir_all(&t.env.codex_home).is_ok());
         let mut user = Answers {
-            answers: vec!["no\n", "yes\n", "2\n"],
+            answers: vec!["yes\n", "no\n", "yes\n", "2\n"],
             asked: Vec::new(),
         };
         let out = install(&[], &t.env, &mut user);
@@ -2024,6 +2224,290 @@ mod tests {
             out.stdout
         );
         assert!(out.stdout.contains("Codex: installed"), "{}", out.stdout);
+    }
+
+    /// A scratch home where all four harnesses are found.
+    fn four_found() -> Scratch {
+        let s = Scratch::new();
+        for dir in [
+            s.env.codex_home.clone(),
+            s.env.home.join(".openclaw"),
+            s.env.hermes_home.clone(),
+        ] {
+            assert!(fs::create_dir_all(dir).is_ok());
+        }
+        assert_eq!(found_harnesses(&s.env).len(), 4);
+        s
+    }
+
+    const FOUR: [&str; 4] = ["Claude Code", "Codex", "OpenClaw", "Hermes"];
+
+    // F112-AC2: with a passphrase set and all four harnesses found, the passphrase is asked once,
+    // then each harness is offered with a plain yes, asking no passphrase again; only the yes are
+    // installed (the 1.1.1 dogfood upgrade asked the passphrase four times).
+    #[test]
+    fn f112_ac2_four_harnesses_are_offered_after_one_passphrase() {
+        let s = four_found();
+        let mut user = Answers {
+            answers: vec!["yes\n", "yes\n", "no\n", "yes\n", "no\n", "2\n"],
+            asked: Vec::new(),
+        };
+        let out = install(&[], &s.env, &mut user);
+        assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+        let passphrase: Vec<&String> = user
+            .asked
+            .iter()
+            .filter(|q| q.ends_with("Passphrase: "))
+            .collect();
+        assert_eq!(passphrase.len(), 1, "{:?}", user.asked);
+        assert!(
+            user.asked[0].starts_with("Found: Claude Code, Codex, OpenClaw, Hermes\n")
+                && user.asked[0].ends_with("Passphrase: "),
+            "{}",
+            user.asked[0]
+        );
+        for (i, name) in FOUR.iter().enumerate() {
+            let offer = &user.asked[i + 1];
+            assert!(
+                offer.contains(&format!("add Lunchroom to {name}?"))
+                    && offer.ends_with(&format!("Install for {name}? Type yes: ")),
+                "{offer}"
+            );
+        }
+        for name in ["Claude Code", "OpenClaw"] {
+            assert!(
+                out.stdout.contains(&format!("{name}: installed")),
+                "{}",
+                out.stdout
+            );
+        }
+        for name in ["Codex", "Hermes"] {
+            assert!(
+                out.stdout
+                    .contains(&format!("{name}: not installed (you answered no)")),
+                "{}",
+                out.stdout
+            );
+        }
+        assert!(!s.env.codex_home.join("hooks.json").exists());
+        assert_eq!(lunchroom_commands(&s.settings(), "PreToolUse").len(), 1);
+    }
+
+    // F112-AC2: a wrong passphrase, asked once, installs none of the harnesses found and offers
+    // none of them.
+    #[test]
+    fn f112_ac2_a_wrong_passphrase_installs_none() {
+        let s = four_found();
+        let mut user = Answers {
+            answers: vec!["no\n", "yes\n", "yes\n", "yes\n", "yes\n"],
+            asked: Vec::new(),
+        };
+        let out = install(&[], &s.env, &mut user);
+        assert_eq!(out.code, 3, "{}{}", out.stdout, out.stderr);
+        assert_eq!(user.asked.len(), 1, "{:?}", user.asked);
+        assert!(
+            out.stderr.contains("passphrase was wrong"),
+            "{}",
+            out.stderr
+        );
+        assert!(!s.env.codex_home.join("hooks.json").exists());
+        assert_eq!(
+            lunchroom_commands(&s.settings(), "PreToolUse"),
+            Vec::<Value>::new()
+        );
+    }
+
+    // F112-AC3: an install run with the build already installed (the program typed by name, or an
+    // identical copy run by its path) says so before its question; a different build installed, or
+    // none, gets no notice.
+    #[test]
+    fn f112_ac3_an_install_of_the_build_already_installed_says_so() {
+        let notice = "This is the build already installed (";
+        let running = std::env::current_exe()
+            .and_then(fs::read)
+            .unwrap_or_default();
+        assert_ne!(running.len(), 0);
+        let program = |s: &Scratch| s.env.lunchroom_home.join("bin").join("lunchroom");
+        // None installed.
+        let none = Scratch::new();
+        assert!(!program(&none).exists());
+        let mut user = Answers {
+            answers: vec!["yes\n", "2\n"],
+            asked: Vec::new(),
+        };
+        let out = install(&["claude-code".to_owned()], &none.env, &mut user);
+        assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+        assert!(!user.asked[0].contains(notice), "{}", user.asked[0]);
+        // The same build installed: the first question opens with the notice, naming the build.
+        let mut user = Answers {
+            answers: vec!["yes\n"],
+            asked: Vec::new(),
+        };
+        let out = install(&["claude-code".to_owned()], &none.env, &mut user);
+        assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+        assert!(
+            user.asked[0].starts_with(&format!("{notice}{})", crate::cli::VERSION)),
+            "{}",
+            user.asked[0]
+        );
+        assert!(
+            user.asked[0].contains("./lunchroom install"),
+            "{}",
+            user.asked[0]
+        );
+        assert_eq!(
+            user.asked.iter().filter(|q| q.contains(notice)).count(),
+            1,
+            "{:?}",
+            user.asked
+        );
+        // A different build installed: no notice.
+        let other = Scratch::new();
+        assert!(fs::create_dir_all(other.env.lunchroom_home.join("bin")).is_ok());
+        assert!(fs::write(program(&other), b"another build").is_ok());
+        assert!(fs::set_permissions(program(&other), fs::Permissions::from_mode(0o755)).is_ok());
+        assert_eq!(same_build_notice(&program(&other), &running), None);
+        let mut user = Answers {
+            answers: vec!["yes\n", "2\n"],
+            asked: Vec::new(),
+        };
+        let out = install(&["claude-code".to_owned()], &other.env, &mut user);
+        assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+        assert!(!user.asked[0].contains(notice), "{}", user.asked[0]);
+        assert!(same_build_notice(&program(&none), &running).is_some());
+    }
+
+    // F112-AC4: after each backup an install makes, only the three newest backups of that file are
+    // kept; a link or a file of another target's backup form is never removed, nor is a name that
+    // is not of the backup form.
+    #[test]
+    fn f112_ac4_only_the_three_newest_backups_are_kept() {
+        let s = Scratch::new();
+        let dir = s.env.home.join("pruned");
+        assert!(fs::create_dir_all(&dir).is_ok());
+        let target = dir.join("lunchroom");
+        let victim = dir.join("victim");
+        assert!(fs::write(&victim, "victim").is_ok());
+        let link = dir.join(format!("lunchroom.lunchroom-backup-{}", stamp(1)));
+        assert!(std::os::unix::fs::symlink(&victim, &link).is_ok());
+        let other = dir.join(format!("settings.json.lunchroom-backup-{}", stamp(2)));
+        assert!(fs::write(&other, "other target").is_ok());
+        let odd = dir.join("lunchroom.lunchroom-backup-notastamp");
+        assert!(fs::write(&odd, "odd").is_ok());
+        assert!(fs::write(&target, "v0").is_ok());
+        let backups = |dir: &Path| -> Vec<String> {
+            names_in(dir)
+                .into_iter()
+                .filter(|n| {
+                    n.starts_with("lunchroom.lunchroom-backup-2")
+                        && fs::symlink_metadata(dir.join(n)).is_ok_and(|m| m.is_file())
+                })
+                .collect()
+        };
+        // No earlier backup, one, two, three: none removed.
+        for i in 1..=3_u64 {
+            let made = replace(&target, format!("v{i}").as_bytes(), 0o755, s.env.now + i);
+            assert!(made.is_ok_and(|b| b.is_some_and(|b| b.unremoved.is_empty())));
+            assert_eq!(backups(&dir).len(), usize::try_from(i).unwrap_or(0));
+        }
+        // A fourth removes the oldest; ten in all keep the newest three.
+        for i in 4..=10_u64 {
+            assert!(replace(&target, format!("v{i}").as_bytes(), 0o755, s.env.now + i).is_ok());
+            assert_eq!(backups(&dir).len(), 3, "{:?}", names_in(&dir));
+        }
+        let kept: Vec<String> = backups(&dir)
+            .iter()
+            .filter_map(|n| fs::read_to_string(dir.join(n)).ok())
+            .collect();
+        assert_eq!(kept, ["v7", "v8", "v9"]);
+        // Two backups in the same second: `-<n>` orders after the plain stamp.
+        assert!(replace(&target, b"v11", 0o755, s.env.now + 20).is_ok());
+        assert!(replace(&target, b"v12", 0o755, s.env.now + 20).is_ok());
+        let kept: Vec<String> = backups(&dir)
+            .iter()
+            .filter_map(|n| fs::read_to_string(dir.join(n)).ok())
+            .collect();
+        assert_eq!(kept, ["v9", "v10", "v11"]);
+        assert!(fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()));
+        assert_eq!(fs::read_to_string(&victim).ok().as_deref(), Some("victim"));
+        assert_eq!(
+            fs::read_to_string(&other).ok().as_deref(),
+            Some("other target")
+        );
+        assert_eq!(fs::read_to_string(&odd).ok().as_deref(), Some("odd"));
+    }
+
+    // F112-AC4: a backup that cannot be removed is reported with the backup made, and the replace
+    // still succeeds.
+    #[test]
+    fn f112_ac4_a_backup_that_cannot_be_removed_is_reported() {
+        let s = Scratch::new();
+        let dir = s.env.home.join("stuck");
+        assert!(fs::create_dir_all(&dir).is_ok());
+        let target = dir.join("lunchroom");
+        assert!(fs::write(&target, "v0").is_ok());
+        for i in 1..=3_u64 {
+            assert!(replace(&target, format!("v{i}").as_bytes(), 0o755, s.env.now + i).is_ok());
+        }
+        // A fourth, oldest backup, in a folder no one may write: it cannot be removed.
+        let oldest = dir.join(format!("lunchroom.lunchroom-backup-{}", stamp(1)));
+        assert!(fs::write(&oldest, "old").is_ok());
+        assert!(fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).is_ok());
+        let writable = fs::write(dir.join("probe"), "x").is_ok();
+        let unremoved = prune_backups(&target);
+        assert!(fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).is_ok());
+        if writable {
+            // Run as root, where the folder's mode does not stop a removal: nothing to show.
+            return;
+        }
+        assert!(oldest.exists());
+        assert_eq!(unremoved.len(), 1, "{unremoved:?}");
+        assert!(
+            unremoved[0].contains("lunchroom.lunchroom-backup-"),
+            "{unremoved:?}"
+        );
+        let shown = Backup {
+            path: dir.join("made"),
+            unremoved,
+        }
+        .display();
+        assert!(
+            shown.contains("\n  an older backup could not be removed: "),
+            "{shown}"
+        );
+    }
+
+    // F112-AC2: with no passphrase set (the first install), each harness found asks its own yes,
+    // as in 1.1.1, and no passphrase is asked before them.
+    #[test]
+    fn f112_ac2_the_first_install_asks_each_harness_its_own_yes() {
+        let s = four_found();
+        let mut user = NewUser::new(&["yes\n", "no\n", "no\n", "no\n", "2\n"], &[FIRST, FIRST]);
+        let out = install(&[], &s.env, &mut user);
+        assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+        assert!(
+            user.asked[0].starts_with("Found: Claude Code, Codex, OpenClaw, Hermes\n"),
+            "{}",
+            user.asked[0]
+        );
+        for (i, name) in FOUR.iter().enumerate() {
+            let question = &user.asked[i];
+            assert!(
+                question.contains(&format!("add Lunchroom to {name}?"))
+                    && question.ends_with("No passphrase is set yet. Type yes: "),
+                "{question}"
+            );
+        }
+        assert!(
+            out.stdout.contains("Claude Code: installed"),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("Codex: not installed"),
+            "{}",
+            out.stdout
+        );
     }
 
     // §13::4: uninstalling one harness does not tell the user to delete the shared
@@ -2090,29 +2574,40 @@ mod tests {
         s.env.codex_home = s.root.join("codex-elsewhere");
         let _ = fs::create_dir_all(&s.env.codex_home);
         assert!(!s.env.home.join(".codex").exists());
+        // A passphrase is set (F112-AC2): it is asked once, then each harness is offered in turn.
         let mut user = Answers {
-            answers: vec!["no\n", "yes\n", "2\n"],
+            answers: vec!["yes\n", "no\n", "yes\n", "2\n"],
             asked: Vec::new(),
         };
         let out = install(&[], &s.env, &mut user);
         assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
         // What was found is read before the first question, and only there.
         assert!(
-            user.asked[0].starts_with("Found: Claude Code, Codex\nLunchroom: add Lunchroom"),
+            user.asked[0].starts_with("Found: Claude Code, Codex\n"),
             "{}",
             user.asked[0]
         );
+        assert!(user.asked[0].ends_with("Passphrase: "), "{}", user.asked[0]);
         assert!(!user.asked[1].contains("Found:"), "{}", user.asked[1]);
+        assert!(!user.asked[2].contains("Found:"), "{}", user.asked[2]);
         assert!(!out.stdout.contains("Found:"), "{}", out.stdout);
         assert!(
-            user.asked[0].contains("add Lunchroom to Claude Code?"),
-            "{}",
-            user.asked[0]
-        );
-        assert!(
-            user.asked[1].contains("add Lunchroom to Codex?"),
+            user.asked[1].contains("add Lunchroom to Claude Code?")
+                && user.asked[1].ends_with("Install for Claude Code? Type yes: "),
             "{}",
             user.asked[1]
+        );
+        assert!(
+            user.asked[2].contains("add Lunchroom to Codex?")
+                && user.asked[2].ends_with("Install for Codex? Type yes: "),
+            "{}",
+            user.asked[2]
+        );
+        assert!(
+            out.stdout
+                .contains("Claude Code: not installed (you answered no)"),
+            "{}",
+            out.stdout
         );
         assert_eq!(
             lunchroom_commands(&s.settings(), "PreToolUse"),

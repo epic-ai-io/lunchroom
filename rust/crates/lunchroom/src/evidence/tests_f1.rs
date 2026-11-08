@@ -303,3 +303,42 @@ fn f1_ac34_claude_code_with_the_whole_guard_moves_on_to_the_release_reason() {
     );
     assert!(release_reason, "{judged:?}");
 }
+
+// F112-AC1: a session whose recorded process has exited is STOPPED, also while that process is a
+// zombie its parent has not collected (the 1.1.1 dogfood upgrade showed such a Codex UNGUARDED).
+#[test]
+fn f112_ac1_a_session_whose_process_is_a_zombie_is_stopped() {
+    let child = std::process::Command::new("sleep").arg("30").spawn();
+    assert!(child.is_ok());
+    let Ok(mut child) = child else { return };
+    let pid = child.id();
+    let key = crate::process::key(pid);
+    assert!(key.is_some(), "a running process has a key");
+    let key = key.unwrap_or_default();
+    let who = Identity::new(Harness::Codex, "f112-zombie");
+    let mut mail = Mail::default();
+    mail.observe_process(&key, Path::new("/tmp"), &who);
+    let home = Path::new("/nonexistent-f112-home");
+    assert_ne!(
+        assess(&mail, &who, home),
+        Assessment::NotRunning,
+        "a running process is not STOPPED"
+    );
+    let _ = child.kill();
+    let zombie = |p: u32| {
+        std::fs::read_to_string(format!("/proc/{p}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')
+                    .map(|(_, a)| a.split_whitespace().next() == Some("Z"))
+            })
+            .unwrap_or(false)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !zombie(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(zombie(pid), "the child did not become a zombie");
+    assert_eq!(assess(&mail, &who, home), Assessment::NotRunning);
+    let _ = child.wait();
+}
