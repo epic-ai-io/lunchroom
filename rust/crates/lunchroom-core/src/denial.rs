@@ -162,6 +162,9 @@ pub fn holder(from_name: &str, message: &str, from_a_message: bool) -> String {
 }
 
 #[cfg(test)]
+mod tests_f1;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

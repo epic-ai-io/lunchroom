@@ -4535,7 +4535,7 @@ fn codex_send_reports_unconfirmed_and_failed_attempts() {
     );
     // D1.7: each check (every send, and the check a guard hook starts) offers a message whose
     // attempt failed again at once, so the three attempts are spent by these sends and their checks.
-    // A failed attempt is not tried again for RETRY_GAP_SECS (10 seconds, CHANGELOG 1.0.2); the
+    // A failed attempt is not tried again for RETRY_GAP_SECS (10 seconds, CHANGELOG 1.1.0); the
     // test ends that gap, as the passing of the time would, before each send.
     for text in ["Fourth.", "Fifth."] {
         end_retry_gap(&sb, &third);

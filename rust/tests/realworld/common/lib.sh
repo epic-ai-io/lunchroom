@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared by the real-world proofs of Lunchroom 1.0.2. Sourced as root inside a container.
+# Shared by the real-world proofs of Lunchroom 1.1.0. Sourced as root inside a container.
 #
 # It prints PASS or FAIL for a check, MEASURED for a fact it only records; `finish` prints the
 # counts and exits non-zero on any FAIL. Every check that counts a refusal or an absence proves
@@ -78,7 +78,7 @@ pty() {
         -- "$@" >/dev/null 2>&1
 }
 
-# Puts Lunchroom 1.0.2 (the static program in $PROOF) on dev's account for Claude Code, then sets
+# Puts Lunchroom 1.1.0 (the static program in $PROOF) on dev's account for Claude Code, then sets
 # the passphrase, through the program's own prompts. Both run on a pseudo-terminal, as the program
 # requires; the answers are typed from files.
 install_lunchroom() {

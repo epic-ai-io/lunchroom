@@ -1,4 +1,4 @@
-//! Lunchroom 1.0.2, delivery and store findings G2-3 to G2-20, in the core. Each test fails on the
+//! Lunchroom 1.1.0, delivery and store findings G2-3 to G2-20, in the core. Each test fails on the
 //! code before the fix for the defect it names, and asserts the full text where text is the defect.
 
 use std::path::Path;
@@ -374,9 +374,9 @@ fn notices_leave_the_store_only_when_marked_told() {
     assert_eq!(m.notices(&claude("c1")).len(), 0);
 }
 
-// G2-13: a store written by a later program, or by 1.0.2 with fields this program does not know,
+// G2-13: a store written by a later program, or by 1.1.0 with fields this program does not know,
 // reads and writes back with every unknown field at the store, message and told levels; a store
-// from before 1.0.2 reads as schema 0 and is written as the current schema.
+// from before 1.1.0 reads as schema 0 and is written as the current schema.
 #[test]
 fn unknown_fields_survive_a_read_and_a_write() {
     let mut m = pair();
@@ -480,7 +480,8 @@ fn failed_notices_say_what_was_waited_for_and_what_to_do() {
         first.as_deref(),
         Some(
             format!(
-                "{id} to codex: attempt 1 of 3 failed (codex queue exited 1). Lunchroom was \
+                "{id} to codex: attempt 1 of 3 failed (codex queue exited 1). It was sent 1 min \
+                 ago by claude. Lunchroom was \
                  waiting for the message id in that session's record, or its next prompt, and \
                  did not get it. The message is still QUEUED: it is offered again at the next \
                  Lunchroom check (any guard hook, `lunchroom send` or `lunchroom status`), not \

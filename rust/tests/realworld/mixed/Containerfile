@@ -1,4 +1,4 @@
-# Proof 3 (mixed): the public Lunchroom 1.0.1 release program and the 1.0.2 program on one store.
+# Proof 3 (mixed): the public Lunchroom 1.0.1 release program and the 1.1.0 program on one store.
 #
 # The 1.0.1 program is the GitHub release epic-ai-io/lunchroom v1.0.1, downloaded by ../prove.sh
 # with `gh release download` and checked against the release's SHA256SUMS; the build checks the
@@ -19,9 +19,9 @@ RUN cd /tmp/rel \
  && install -m 0755 lunchroom-v1.0.1-x86_64-unknown-linux-musl/lunchroom /usr/local/bin/lunchroom-1.0.1 \
  && rm -rf /tmp/rel
 
-COPY lunchroom /usr/local/bin/lunchroom-1.0.2
+COPY lunchroom /usr/local/bin/lunchroom-1.1.0
 COPY lib.sh ptyrun.py plaintext.py hook.py inner.sh /opt/proof/
-RUN chmod 0755 /usr/local/bin/lunchroom-1.0.2 /opt/proof/inner.sh /opt/proof/ptyrun.py \
+RUN chmod 0755 /usr/local/bin/lunchroom-1.1.0 /opt/proof/inner.sh /opt/proof/ptyrun.py \
       /opt/proof/plaintext.py /opt/proof/hook.py
 
 CMD ["/opt/proof/inner.sh"]

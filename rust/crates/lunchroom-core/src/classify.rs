@@ -2669,7 +2669,7 @@ impl Guard<'_> {
 
     /// The memory, environment, descriptors and maps of a process outside the agent's own subtree
     /// (`secret_pid`, from the path's facts). With the console's rules on (1.1) they are DENIED in
-    /// every session. In 1.0.2 they are a credential read (the lesson of the 2026 Hugging Face
+    /// every session. In 1.1.0 they are a credential read (the lesson of the 2026 Hugging Face
     /// incident, where agents dumped other processes' environments for tokens): PROTECTED while
     /// HELD, nothing added otherwise.
     fn other_process(&self, secret_pid: Option<u32>, named: &str, acc: &mut Acc) {
@@ -2995,6 +2995,6 @@ mod tests;
 #[cfg(all(test, feature = "console"))]
 mod console_tests;
 
-/// The console's guard rules (1.1) are on: built with the feature `console`. Without it (1.0.2) no
+/// The console's guard rules (1.1) are on: built with the feature `console`. Without it (1.1.0) no
 /// console exists, and these rules would only block an agent's ordinary work in every session.
 const CONSOLE: bool = cfg!(feature = "console");

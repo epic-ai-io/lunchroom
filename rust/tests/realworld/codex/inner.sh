@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proof 7, inside the container: the real Codex CLI 0.166.0 on a pseudo-terminal, Lunchroom 1.0.2
+# Proof 7, inside the container: the real Codex CLI 0.166.0 on a pseudo-terminal, Lunchroom 1.1.0
 # installed for it with `lunchroom install codex`, Codex's own hook review answered in Codex's own
 # screen ("Trust all and continue"), and its API answered by codexmock.py so that a prompt becomes a
 # real tool call whose real hooks run.

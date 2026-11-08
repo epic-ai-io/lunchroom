@@ -529,6 +529,9 @@ fn denied(c: &mut Corpus) {
 
 #[allow(clippy::too_many_lines)] // one entry per cause and per hook, each with its own facts
 fn undecided(c: &mut Corpus) {
+    // D1 (T29): the guard's failure path writes only under this scratch world's home.
+    let world = World::new("undecided", None);
+    let env = world.as_ref().map(|w| &w.env);
     let transcript = format!("/home/u/.claude/projects/project/{CLAUDE_SESSION}.jsonl");
     let call = json!({
         "session_id": CLAUDE_SESSION, "cwd": "/home/u/project", "hook_event_name": "PreToolUse",
@@ -561,7 +564,7 @@ fn undecided(c: &mut Corpus) {
         c.add(
             &format!("undecided.pretool.{cause_id}.no-channel"),
             "undecided",
-            &hook_text(&failed(Some("pretool"), reason, &call, false)),
+            &hook_text(&failed(Some("pretool"), reason, &call, false, env)),
             "alice's command `git push origin main` was not checked and, because nobody can be asked in this session, it was blocked",
             why,
             None,
@@ -574,7 +577,7 @@ fn undecided(c: &mut Corpus) {
         c.add(
             &format!("undecided.pretool.{cause_id}.channel"),
             "undecided",
-            &hook_text(&failed(Some("pretool"), reason, &call, true)),
+            &hook_text(&failed(Some("pretool"), reason, &call, true, env)),
             "alice's command `git push origin main` was not checked and goes to the user's permission prompt",
             why,
             None,
@@ -636,6 +639,7 @@ fn undecided(c: &mut Corpus) {
                 "no answer within 10 seconds",
                 raw,
                 false,
+                env,
             )),
             what,
             why,
@@ -908,9 +912,9 @@ fn notices(c: &mut Corpus) {
     let scenarios: Vec<(&str, &str, &str, &str)> = vec![
         (
             "waiting",
-            "alice's message to bob has waited for 5 minutes to be handed over, and is still QUEUED",
-            "bob's session has not taken it yet",
-            "nothing is needed; it is handed over when bob's session can take it",
+            "alice's message to bob was handed over 5 minutes ago and is not confirmed; attempt 1 of 3 failed and it is still QUEUED",
+            "bob's session did not confirm the hand-over in time",
+            "nothing is needed; it is offered again, or the user ends the wait with `lunchroom unregister bob`",
         ),
         (
             "cannot-hand-over",
@@ -942,6 +946,10 @@ fn notices(c: &mut Corpus) {
         let made = w.mail(|m| {
             named(m, "alice", &alice);
             named(m, "bob", &bob);
+            // The prompt typed in alice's session records it running, and the scratch home does
+            // not enable Hermes's plugin: alice is UNGUARDED. The user was told so before; these
+            // entries are the message's notices alone.
+            let _ = m.newly_unguarded(std::slice::from_ref(&alice));
             let msg = m
                 .send(
                     &alice,
@@ -961,7 +969,14 @@ fn notices(c: &mut Corpus) {
                         let _ = m.attempt_failed(&msg, "no answer", at);
                     }
                 }
+                // F1-AC41: the sender is told of a hand-over with no confirmation for 2 minutes,
+                // so bob's session is handed the message as it is sent.
+                "waiting" => {
+                    let _ = m.present(&bob, NOW - 300);
+                }
+                // F1-AC54: DELIVERED is told after a notice of its wait.
                 "delivered-late" => {
+                    let _ = m.present(&bob, NOW - 300);
                     m.tell_waiting(NOW - 170);
                     let _ = m.confirm_at(&bob, &msg, NOW - 10);
                 }
@@ -1076,7 +1091,17 @@ fn unguarded(c: &mut Corpus) {
             c.problems.push(format!("{id}: no scratch world"));
             continue;
         };
-        let made = w.mail(|m| named(m, agent, &Identity::new(harness, session)));
+        // F1-AC34: only a running agent is UNGUARDED (one not running is STOPPED), so the agent's
+        // session is recorded in a live process: this one.
+        let process = crate::process::key(std::process::id());
+        c.expect(&id, process.is_some(), "this process's key cannot be read");
+        let made = w.mail(|m| {
+            let who = Identity::new(harness, session);
+            named(m, agent, &who);
+            if let Some(process) = &process {
+                m.observe_process(process, &w.project, &who);
+            }
+        });
         c.expect(&id, made.is_some(), "no scratch store");
         let (shown, _) = w.typed(HERMES_SESSION, "Run the tests again.");
         c.add(
@@ -1085,12 +1110,10 @@ fn unguarded(c: &mut Corpus) {
             &shown.unwrap_or_default(),
             &format!("the user is told that {agent}, a {label} agent, is UNGUARDED"),
             &format!(
-                "nothing on this computer shows that Lunchroom's guard runs for {agent}'s {label} session, so Lunchroom cannot check what it does"
+                "{label}'s settings for {agent}'s session do not run Lunchroom's whole guard, so Lunchroom cannot check what it does"
             ),
             None,
-            &[&format!(
-                "the user installs Lunchroom for {label} with `lunchroom install`, and starts the session anew"
-            )],
+            &["the user runs the commands the notice names to put the guard in place"],
         );
     }
 }

@@ -175,7 +175,7 @@ fn held_reply_only_to_holding_identities_from_message_record() {
         m.register("codex", &codex("x2"), Origin::User, Some(&codex("x1")))
             .is_ok()
     );
-    // D1.7 (1.0.2): the holder's name moved, so the holder is no longer named and the reply is
+    // D1.7 (1.1.0): the holder's name moved, so the holder is no longer named and the reply is
     // refused as to an agent no longer named. It is never routed to the new holder of the name.
     assert_eq!(
         send(&mut m, &claude("c1"), "claude", "codex", "Again.").map(|a| a.to),
@@ -1399,7 +1399,7 @@ fn a_senders_hand_over_keeps_one_attempt_and_counts_nothing_against_another_send
     );
     // Theirs is out and not yet past its time: nothing else goes.
     assert_eq!(m.present_from(&x1, Some(&claude("c1")), 1), None);
-    // Past its time, c1's send offers c1's own. D1.7 (1.0.2): every program's run checks the time
+    // Past its time, c1's send offers c1's own. D1.7 (1.1.0): every program's run checks the time
     // limits, whatever session it runs in, so the offer of theirs that ran past its time is counted
     // as one failed attempt here too, and theirs waits to be offered again; nothing else about it
     // changes.

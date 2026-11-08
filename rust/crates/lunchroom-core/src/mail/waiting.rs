@@ -548,12 +548,14 @@ impl Mail {
                 .filter(|t| *t > now)
                 .map_or_else(String::new, |t| format!(", not before {}", clock(t)));
             format!(
-                "{} to {}: attempt {} of {MAX_ATTEMPTS} failed ({reason}). Lunchroom was waiting \
-                 for {waited}, and did not get it. The message is still {}: {}{when}; the next try \
-                 is attempt {} of {MAX_ATTEMPTS}.{}",
+                "{} to {}: attempt {} of {MAX_ATTEMPTS} failed ({reason}). It was sent {} ago by \
+                 {}. Lunchroom was waiting for {waited}, and did not get it. The message is still \
+                 {}: {}{when}; the next try is attempt {} of {MAX_ATTEMPTS}.{}",
                 m.id,
                 m.to_name,
                 m.failed_attempts,
+                span(now.saturating_sub(m.sent_at)),
+                m.from_name,
                 MessageState::Queued.word(),
                 offered_when(m),
                 m.failed_attempts + 1,

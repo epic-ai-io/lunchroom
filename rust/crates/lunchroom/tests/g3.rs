@@ -1,4 +1,4 @@
-//! The install, evidence, doctor and entry-point fixes of Lunchroom 1.0.2, through the real
+//! The install, evidence, doctor and entry-point fixes of Lunchroom 1.1.0, through the real
 //! `lunchroom` program: what it prints for a refused `send`, for `help`, and for a `doctor` that
 //! is not run by the user at a terminal. The rules behind them are unit-tested in the program's
 //! own modules (`evidence.rs`, `cli.rs`, `main.rs`).

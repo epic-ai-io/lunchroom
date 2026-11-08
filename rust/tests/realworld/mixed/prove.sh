@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proof 3 (mixed): the public 1.0.1 release program and the 1.0.2 program on one store.
+# Proof 3 (mixed): the public 1.0.1 release program and the 1.1.0 program on one store.
 #
 #   LUNCHROOM_102=<static program> rust/tests/realworld/mixed/prove.sh | tee mixed.txt
 #

@@ -2254,6 +2254,9 @@ pub(crate) fn reported_release(
 }
 
 #[cfg(test)]
+mod tests_f1;
+
+#[cfg(test)]
 mod tests {
     use serde_json::json;
 

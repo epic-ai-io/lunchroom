@@ -1,5 +1,5 @@
 //! The Claude Code adapter's timeout path and notices, end to end (findings G4-6 and G4-8 of the
-//! Lunchroom 1.0.2 review): the `lunchroom` binary run as Claude Code runs it, on a scratch home.
+//! Lunchroom 1.1.0 review): the `lunchroom` binary run as Claude Code runs it, on a scratch home.
 //! The unit tests of the message texts are in `src/claude/tests_g4.rs`.
 
 mod common;

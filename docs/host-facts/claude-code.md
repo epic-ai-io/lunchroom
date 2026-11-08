@@ -122,7 +122,7 @@ session is UNGUARDED with that reason (R3.4).
 The adapter passes with 2.1.309, the release Anthropic's stable apt, dnf and apk channels served on 2026-11-02.
 Claude Code 2.1.309 was taken from Anthropic's own `claude-code_2.1.309-1_amd64.deb` (`claude --version`:
 `2.1.309 (Claude Code)`) and run from `…/claude/versions/2.1.309` in a separate Linux account with Lunchroom
-1.0.2 installed by `lunchroom install`, two interactive sessions in that account, on Sonnet:
+the 1.1.0 pre-release build installed by `lunchroom install`, two interactive sessions in that account, on Sonnet:
 
 | Check | Result |
 |---|---|

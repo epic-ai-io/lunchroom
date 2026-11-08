@@ -16,7 +16,7 @@ workspace = true
 
 [features]
 # The console's guard rules (1.1): terminals, process memory and environment, debuggers, kill,
-# tmux and `ptrace`. Off in 1.0.2, where no console exists to protect.
+# tmux and `ptrace`. Off in 1.1.0, where no console exists to protect.
 console = []
 
 [dependencies]

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proof 8, inside the container: the real OpenClaw gateway 2026.10.7 (npm), Lunchroom 1.0.2 installed
+# Proof 8, inside the container: the real OpenClaw gateway 2026.10.7 (npm), Lunchroom 1.1.0 installed
 # for it with `lunchroom install openclaw`, the plugin installed and enabled the way the install
 # tells the user (`openclaw plugins install --link ... --force`, `plugins enable`, `config set ...
 # allowConversationAccess true`), and the model's API answered by chatmock.py so that a typed turn

@@ -110,7 +110,7 @@ impl Layout {
         // The console's wall holds every path in its system folders but the setgid program itself
         // (which `system_store` leaves out): a file planted beside the program is the store's
         // kind, DENIED, even where that folder is also the program folder of this layout.
-        // `/var/lib/lunchroom` and the program folder are 1.1 only (feature `console`): 1.0.2
+        // `/var/lib/lunchroom` and the program folder are 1.1 only (feature `console`): 1.1.0
         // ships the console off, and they are not Lunchroom's stores there. `/etc/lunchroom`, the
         // passphrase checks, is a store in every build (L1.1, K1.11).
         let system = system_store(p);
@@ -271,7 +271,7 @@ fn in_process_folder(p: &Path, segs: &[String]) -> bool {
 }
 
 /// The folders and files of the console's wall: the passphrase checks (`/etc/lunchroom`), in every
-/// build (they exist from 1.0.2, A1.3, and a HELD agent's read of one is DENIED, L1.1); and, with
+/// build (they exist from 1.1.0, A1.3, and a HELD agent's read of one is DENIED, L1.1); and, with
 /// the console (1.1, feature `console`) only, the store folders (`/var/lib/lunchroom`) and
 /// everything in the program folder except the program itself.
 fn system_store(p: &Path) -> bool {

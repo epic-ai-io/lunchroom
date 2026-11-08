@@ -190,7 +190,7 @@ impl Env {
         if let Some(nr) = tty {
             layout.own_terminals = lunchroom_core::paths::terminal_paths(nr);
         }
-        // 1.1 only (feature `console`): no console runs in a 1.0.2 build.
+        // 1.1 only (feature `console`): no console runs in a 1.1.0 build.
         #[cfg(feature = "console")]
         {
             layout.console_pid = crate::console::alive_pid(&self.lunchroom_home);

@@ -3513,7 +3513,7 @@ fn a_script_the_guard_cannot_read_is_denied_in_every_session() {
     }
 }
 
-// 1.0.2, option A (decided 2026-11-03): the console ships switched off, and so do its guard rules.
+// 1.1.0, option A (decided 2026-11-03): the console ships switched off, and so do its guard rules.
 // An agent that is not HELD is not blocked from terminals, debuggers, signals, tmux or `ptrace`;
 // another process's folder in /proc (its memory, environment, descriptors) is, as in 1.0.1, a read
 // L1.1 DENIES while HELD (the lesson of the 2026 Hugging Face incident, already in place), and adds
@@ -3541,7 +3541,7 @@ fn without_the_console_its_rules_block_nothing() {
 }
 
 // #42 item 3 (the lesson of the 2026 Hugging Face incident: every shared file is a channel between
-// agents): each file Lunchroom keeps in its folder, the store and every file 1.0.2 added beside it,
+// agents): each file Lunchroom keeps in its folder, the store and every file 1.1.0 added beside it,
 // is a store path. P1.4 (docs/spec/lunchroom-spec.md §6 item 4): "A command that names a path in
 // Lunchroom's stores, a reply included, … counts as writing them", and a write of the stores is
 // DENIED, never asked: no agent, HELD or not, can read, write, move or remove any of them, by a

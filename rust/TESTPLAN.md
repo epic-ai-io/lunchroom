@@ -224,7 +224,7 @@ Requirements are ordered by clause number, then by number within the clause.
 
 Counts: 201 rows, of which 198 live requirements and 3 retired (not counted: P1/20, P1/24, L1/6). Of the 198 live requirements, 192 are in the current scope and 6 are later (release-time inspections, all `todo`). In scope, by layer: unit 73, integration 109, e2e 3, inspection 7; by status: written 149, partial 30, decision 4, inspect-ready 7, todo 2.
 
-## 1.0.2 fixes from the real-world proofs (2026-11-03)
+## 1.1.0 fixes from the real-world proofs (2026-11-03)
 
 Each fix's test failed before the fix and passes after it; each real-world proof ran the real
 harness in a container (`rust/tests/realworld/`).
@@ -239,4 +239,4 @@ harness in a container (`rust/tests/realworld/`).
 | R3.1, V1 | UNGUARDED says Lunchroom lacks evidence of the guard, never "nothing it does is checked" | the_help_text_says_what_held_and_unguarded_mean + the help-text and doctor tests | upgrade/ |
 | H1.2, R3.4 | the Hermes plugin reads a root-owned checkout's release with git trusting it; the reason names the checkout's owner otherwise | test_a_root_owned_checkout_git_refuses_is_read_with_git_trusting_it + the evidence reason-text test | hermes/ |
 | A1.3, K1.8 | a script naming `owner/lunchroom` with an option is not a Lunchroom command; user-only commands still are | a_script_naming_the_lunchroom_repository_with_options_is_ordinary (the real program on real script files) + f1_scripts_and_code_are_searched_for_channels | none in a container: found when the 1.0.1 guard DENIED `mixed/prove.sh` (`gh release download --repo epic-ai-io/lunchroom --pattern …`) |
-| D1.2, K1.26 | a 1.0.1 write drops 1.0.2's fields and its layout number, and `lunchroom doctor` then says an older program wrote the store | doctor_says_when_an_older_program_last_wrote_the_store | mixed/ (19 PASS) |
+| D1.2, K1.26 | a 1.0.1 write drops 1.1.0's fields and its layout number, and `lunchroom doctor` then says an older program wrote the store | doctor_says_when_an_older_program_last_wrote_the_store | mixed/ (19 PASS) |

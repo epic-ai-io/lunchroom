@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proof 9, inside the container: the real Hermes Agent (commit 9976f48), Lunchroom 1.0.2 installed for
+# Proof 9, inside the container: the real Hermes Agent (commit 9976f48), Lunchroom 1.1.0 installed for
 # it with `lunchroom install hermes`, the plugin enabled the way the install tells the user, and the
 # model's API answered by chatmock.py so that a one-shot turn becomes a real tool call whose real
 # pre_tool_call hook runs the plugin, which runs the guard.

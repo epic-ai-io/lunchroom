@@ -884,10 +884,10 @@ impl System for Preface<'_> {
 #[must_use]
 pub fn install(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     if args.first().map(String::as_str) == Some("console") {
-        // The console is part of 1.1; a build without it says so and changes nothing.
+        // The console comes in a later release; a build without it says so and changes nothing.
         #[cfg(not(feature = "console"))]
         return Outcome::failed(
-            "lunchroom install console: the Lunchroom console comes in release 1.1; this \
+            "lunchroom install console: the Lunchroom console comes in a later release; this \
              release does not include it, so nothing was changed.",
             2,
         );

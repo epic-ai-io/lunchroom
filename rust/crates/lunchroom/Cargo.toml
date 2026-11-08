@@ -16,7 +16,7 @@ workspace = true
 
 [features]
 # The console (1.1): `lunchroom console` and `lunchroom install console`. Built but switched off
-# in 1.0.2; the 1.1 release builds with it on.
+# in 1.1.0; the release that includes the console builds with it on.
 console = ["lunchroom-core/console"]
 
 [dependencies]

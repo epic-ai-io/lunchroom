@@ -1,4 +1,4 @@
-//! Lunchroom 1.0.2, delivery and store findings (G2), through the `lunchroom` binary run in a
+//! Lunchroom 1.1.0, delivery and store findings (G2), through the `lunchroom` binary run in a
 //! scratch home with an empty environment. Each test fails on the code before the fix for the
 //! defect it names.
 

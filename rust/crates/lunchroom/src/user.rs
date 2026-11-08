@@ -1695,7 +1695,7 @@ mod tests {
         );
     }
 
-    // ---- Lunchroom 1.0.2, delivery findings G2-7, G2-11 and G3-14 (the yolo usage) ----
+    // ---- Lunchroom 1.1.0, delivery findings G2-7, G2-11 and G3-14 (the yolo usage) ----
 
     /// A scratch store where claude (c1) sent codex (x1) `queued` messages and codex is named.
     fn with_queued(s: &Scratch, queued: usize) -> Vec<String> {

@@ -141,6 +141,8 @@ fn guard(mode: Option<&str>, env: Result<home::Env, String>) -> ExitCode {
     let records_at = env.as_ref().ok().map(|e| (e.lunchroom_home.clone(), e.now));
     // The check of D1.7 runs with this, after the answer is written.
     let check_env = env.as_ref().ok().cloned().filter(|_| starts_check(mode));
+    // D1 (T29): an undecided call's records go under this run's own home.
+    let failed_env = env.as_ref().ok().cloned();
     let began = std::time::Instant::now();
     let mut worker_id = None;
     let result = if owned.starts_with("listen") {
@@ -222,7 +224,15 @@ fn guard(mode: Option<&str>, env: Result<home::Env, String>) -> ExitCode {
         let settled = (mode == Some("pretool") && !timed_out)
             .then(|| judged_again(&text, &reason))
             .flatten();
-        settled.unwrap_or_else(|| claude::failed(mode, &reason, &text, claude::process_channel()))
+        settled.unwrap_or_else(|| {
+            claude::failed(
+                mode,
+                &reason,
+                &text,
+                claude::process_channel(),
+                failed_env.as_ref(),
+            )
+        })
     });
     // H1.8: an undecided call, or a decision past 2 seconds, is recorded; the listener, which waits
     // by design, is not.

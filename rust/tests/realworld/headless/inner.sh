@@ -1,6 +1,6 @@
 #!/bin/bash
 # Proof 13 (headless), inside the container: the real Claude Code (Anthropic's apt package), Lunchroom
-# 1.0.2 installed by `lunchroom install claude-code`, the API answered by mockapi.py. Three spellings of
+# 1.1.0 installed by `lunchroom install claude-code`, the API answered by mockapi.py. Three spellings of
 # a headless run are each run twice with a 120 s timeout:
 #   p      claude -p "say hi"
 #   json   claude -p "say hi" --output-format json

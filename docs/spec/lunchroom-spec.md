@@ -470,7 +470,7 @@ rules and hook denies, Hermes `approvals.deny`, read 2026-10-25).
    as one argument; a message of 64 KiB in lines of at least 100 bytes is accepted. A delivery attempt repeated after a
    crash or retry never shows the
    recipient the same message twice, and a late copy of a FAILED message is blocked and says so.
-   The store file carries the number of the program layout that wrote it (2 in 1.0.2), and every
+   The store file carries the number of the program layout that wrote it (2 in 1.1.0), and every
    program keeps each field it does not know through every read and write.
 3. When the outcome of an attempt cannot be known, Lunchroom says so ("Not confirmed; still QUEUED")
    and never reports DELIVERED. A hand-over that could not start because the recipient's program
@@ -877,7 +877,7 @@ These are statements for users of what Lunchroom does not prevent; they are not 
     is PROTECTED (L1.1).
 25. A notice shown by a hook that was killed before it wrote its answer is shown again (D1.8).
 26. A Lunchroom 1.0.1 program that is still running (a listener runs up to 23 hours) rewrites the
-    store without the 1.0.2 fields and without the layout number (D1.2): notices repeat and the
+    store without the 1.1.0 fields and without the layout number (D1.2): notices repeat and the
     10-second gap before an offer is offered again is lost, until that session ends. Start sessions
     anew after an upgrade; `lunchroom doctor` says so (C1.4).
 
@@ -900,12 +900,12 @@ The six cards are printed. The product matches the cards.
 2. Tests: each card's three lines are replayed end to end with the card's agents, and Lunchroom's
    output contains the card's Lunchroom line.
 
-## §17 C2. The console (1.1, not in the 1.0.2 build)
+## §17 C2. The console (a later minor release, not in the 1.1.0 build)
 
-This section describes version 1.1. It is not part of the 1.0.2 build, and nothing in it is promised
-or tested for 1.0.2 except item 1, item 7 and the last rule of item 5.
+This section describes a later minor release. It is not part of the 1.1.0 build, and nothing in it is
+promised or tested for 1.1.0 except item 1, item 7 and the last rule of item 5.
 
-1. The 1.0.2 build ships the console and its guard rules switched off; `lunchroom install console`
+1. The 1.1.0 build ships the console and its guard rules switched off; `lunchroom install console`
    says so and changes nothing. In that build the console's own lines and notices do not appear
    (the line `lunchroom doctor` prints for the console's mode, and the notice that the console is
    not running), the guard keeps no record of DENIED decisions (H1.8 keeps its 200 records), and a
@@ -941,7 +941,7 @@ or tested for 1.0.2 except item 1, item 7 and the last rule of item 5.
    - `sudo`, `su`, `runuser`, `machinectl shell` and `pkexec` to user `lunchroom`, and any write to
      `/var/lib/lunchroom`, `/usr/local/lib/lunchroom` or `/etc/lunchroom`, are DENIED;
    - running the program with `console` is DENIED (A1.3).
-6. Limits, published with the 1.1 release: a person who walks away from an unlocked console for
+6. Limits, published with the release that switches the console on: a person who walks away from an unlocked console for
    under 15 minutes leaves `approve` open to whoever is at its keyboard, as `sudo`'s timeout does;
    the console's own terminal cannot be read by the developer's processes, but the developer's
    outer terminal, which relays to it, is owned by the developer, and a process that opens it can

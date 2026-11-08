@@ -49,11 +49,11 @@ table below gives the full meaning of each.
 Each release publishes `lunchroom-v<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl`, with `SHA256SUMS` signed by Sigstore. Check a download before you run
 it, with cosign 3 or newer: first that this repository's release workflow signed `SHA256SUMS` for the
-release's own tag (here `v1.1.0`; use the tag you downloaded), then the archive against it:
+release's own tag (here `v1.1.1`; use the tag you downloaded), then the archive against it:
 
 ```
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.1.0 \
+  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.1.1 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum -c SHA256SUMS --ignore-missing
 ```
@@ -137,7 +137,7 @@ What you do afterwards:
 A broken guard never locks you out: what the guard cannot check goes to you, or, where nobody can be
 asked, that one call is DENIED (see "When the guard cannot decide a call" below).
 
-`lunchroom version` names the build, for example `lunchroom 1.1.0 (a1b2c3d)`: the version, then the commit it was built from, with
+`lunchroom version` names the build, for example `lunchroom 1.1.1 (a1b2c3d)`: the version, then the commit it was built from, with
 `, modified` when a tracked file of the source differs from that commit (untracked files do not
 count); a build from a source copy with no git history shows the version alone. The install reports the build it installed and the
 one it kept as a backup.
@@ -398,7 +398,7 @@ them, only show):
   approve one exact call once. A call that has waited 10 minutes, as long as an approval lasts, no
   longer waits.
 - `lunchroom mode [relaxed|balanced|strict]`: show the hold mode, or set it.
-- `lunchroom yolo <name,...|all> till <HH:MM>`: let the named agents act without asking until then
+- `lunchroom yolo <name,name,...|all> till <HH:MM>`: let the named agents act without asking until then
   (UTC); name them separated by commas. The end may also be a date and time, `YYYY-MM-DDTHH:MMZ`. It
   turns YOLO on for every agent named, or for none: `all` names every agent, so while any of them is
   a Codex, OpenClaw or Hermes agent (`lunchroom yolo` works for Claude Code agents only) it is DENIED
@@ -449,7 +449,7 @@ How Lunchroom works with Claude Code, item by item, and the tests that prove it.
 2.1.309, the release Anthropic's stable apt, dnf and apk channels served on 2026-11-02.
 
 Live measurement: Claude Code 2.1.309, taken from Anthropic's own `claude-code_2.1.309-1_amd64.deb`
-and run from `…/claude/versions/2.1.309` in a separate Linux account with Lunchroom 1.0.2 installed
+and run from `…/claude/versions/2.1.309` in a separate Linux account with the Lunchroom 1.1.0 pre-release build installed
 by `lunchroom install`, two interactive sessions. Both sessions started, were asked to join and
 joined, and were shown AVAILABLE. A session's `lunchroom send` of a message asking for an API key
 was DENIED (exit 7). An ordinary message to the idle session was QUEUED, woke the session and was

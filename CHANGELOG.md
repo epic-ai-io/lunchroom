@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.1
+
+Fixes to 1.1.0.
+
+- `lunchroom send`: when Lunchroom's store cannot be used during a hand-over, the report now also says
+  what to do: do not send the message again, `lunchroom status` shows where it stands, and tell the
+  user if the store still cannot be used. Before, it said only what happened and why.
+- The notice that an attempt to hand a message over failed now names the message's age and its sender,
+  as Lunchroom's other notices about a message do.
+- The README's `lunchroom yolo` usage now reads `lunchroom yolo <name,name,...|all> till <HH:MM>`, the
+  same as `lunchroom help` and the message for a wrong use.
+- `lunchroom install console` now says the console comes in a later release; 1.1.0 said it comes in
+  release 1.1.
+- The documentation (the spec's console section, TESTPLAN, the Claude Code host facts) now names the
+  shipped build 1.1.0 where it said 1.0.2, and says the console comes in a later release.
+- The READMEs' download, signature-check and `lunchroom version` examples name 1.1.1.
+
 ## 1.1.0
 
 Fixes for what failed in real use of 1.0.1, and new checks of your setup.

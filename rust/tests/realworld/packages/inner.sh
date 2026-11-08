@@ -1,7 +1,7 @@
 #!/bin/bash
 # Proof 1, inside one container: Claude Code installed from Anthropic's own apt, dnf or apk
 # repository (the Containerfile of the distro), a real session of it running, and what Lunchroom
-# 1.0.2 says about that session. $DISTRO is apt, dnf or apk (set by the Containerfile).
+# 1.1.0 says about that session. $DISTRO is apt, dnf or apk (set by the Containerfile).
 #
 # The session is the real /usr/bin/claude the package installed, started on a pseudo-terminal as
 # a person's terminal window starts it, with the user typing `join NAME` in it. It points at a
@@ -58,7 +58,7 @@ grep -rqs "downloads.claude.ai/claude-code/$DNFURL/stable" /etc/apk/repositories
     && pass "the repository file names downloads.claude.ai/claude-code/$DNFURL/stable" \
     || fail "the repository file does not name downloads.claude.ai/claude-code/$DNFURL/stable"
 
-heading "2. Lunchroom 1.0.2 installed for a user, and a real session"
+heading "2. Lunchroom 1.1.0 installed for a user, and a real session"
 make_user
 seed_claude
 install_lunchroom

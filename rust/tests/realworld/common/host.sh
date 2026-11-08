@@ -1,5 +1,5 @@
 #!/bin/bash
-# Host-side helpers for the real-world proofs of Lunchroom 1.0.2 (sourced by each proof's prove.sh).
+# Host-side helpers for the real-world proofs of Lunchroom 1.1.0 (sourced by each proof's prove.sh).
 #
 # The proofs build container images with podman. Disk is tight on the machine that runs them, so
 # before each image build the free space of / is read and the proof stops, as a FAIL, under 2 GB;
@@ -43,7 +43,7 @@ wait_load() {
 make_context() {
     local proof=$1 ctx
     if [ ! -x "$LUNCHROOM_102" ]; then
-        echo "FAIL the 1.0.2 program is not at $LUNCHROOM_102 (cargo build --release --target x86_64-unknown-linux-musl -p lunchroom)" >&2
+        echo "FAIL the 1.1.0 program is not at $LUNCHROOM_102 (cargo build --release --target x86_64-unknown-linux-musl -p lunchroom)" >&2
         return 1
     fi
     ctx=$(mktemp -d)

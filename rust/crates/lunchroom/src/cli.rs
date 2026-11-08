@@ -404,10 +404,12 @@ pub(crate) fn hand_over_report(
             format!("{}\n", cards::not_confirmed(id))
         }
         Ok(crate::codex::Delivered::Nothing) => String::new(),
-        // The store could not be used during the hand-over: the sender is told, with the reason;
-        // the message is QUEUED as reported above.
+        // The store could not be used during the hand-over: the sender is told what happened, why
+        // and what to do; the message is QUEUED as reported above.
         Err(e) => format!(
-            "{sent}: the hand-over could not be completed ({e}); it is still {}\n",
+            "{sent}: the hand-over could not be completed ({e}); it is still {}. Do not send it \
+             again; `lunchroom status` shows where it stands. If the store still cannot be used, \
+             tell the user.\n",
             MessageState::Queued.word()
         ),
     }
@@ -1306,7 +1308,7 @@ pub(crate) fn doctor_on(env: &Env, host: &Host<'_>) -> Outcome {
     // 1.1: where the console is set up (or this program runs setgid), which store is in force: a
     // PASS when it is out of reach of the user's own processes, a FAIL with what to do when not.
     let console_program = std::path::Path::new(lunchroom_core::setgid::PROGRAM);
-    // 1.1 only (feature `console`): a 1.0.2 build prints no console line.
+    // 1.1 only (feature `console`): a 1.1.0 build prints no console line.
     #[cfg(feature = "console")]
     if console_program.is_file() || lunchroom_core::setgid::active() {
         checks.line(crate::console::mode_check(env, host.sys.uid()));
@@ -1520,6 +1522,9 @@ fn held_by_text(mail: &Mail, who: &Identity) -> String {
 /// protects, and the reply, and the user can add nothing that changes a file or runs a command.
 pub const SLIP: &str =
     "read any file except the paths Lunchroom denies or protects; reply with lunchroom send";
+
+#[cfg(test)]
+mod tests_f1_doctor;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2672,11 +2677,13 @@ pub(crate) mod tests {
         s.env.now = 1_793_038_003 + 3 * 3600 + 5 * 60;
         s.add_hermes();
         let out = s.doctor();
+        let none_since = format!(
+            "Hermes: no Hermes session has reported its release to Lunchroom since Lunchroom {} \
+             was installed: start a Hermes session, then run lunchroom doctor again.",
+            env!("CARGO_PKG_VERSION")
+        );
         assert!(
-            fails(&out).iter().any(|l| l.contains(
-                "Hermes: no Hermes session has reported its release to Lunchroom since Lunchroom \
-                 1.1.0 was installed: start a Hermes session, then run lunchroom doctor again."
-            )),
+            fails(&out).iter().any(|l| l.contains(&none_since)),
             "{}",
             out.stdout
         );

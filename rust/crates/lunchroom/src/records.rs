@@ -431,7 +431,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // DV-10 (H1.8): a 1.0.2 build keeps 200 records and no others: a record of a DENIED decision
+    // DV-10 (H1.8): a 1.1.0 build keeps 200 records and no others: a record of a DENIED decision
     // (1.1) is not kept apart there, so the file never holds more than 200 lines, and `recent`
     // does not hide it. With the console the same file keeps up to 1,000 of them besides.
     #[test]

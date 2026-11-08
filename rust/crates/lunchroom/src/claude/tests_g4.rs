@@ -1,5 +1,5 @@
 //! Tests for the Claude Code adapter's messages and timeout path (findings G4-1, G4-6, G4-7,
-//! G4-8, G4-10, G4-12, G4-13, G4-14 of the Lunchroom 1.0.2 review). Each test is derived from the
+//! G4-8, G4-10, G4-12, G4-13, G4-14 of the Lunchroom 1.1.0 review). Each test is derived from the
 //! failure enumeration of its finding, not from the code that fixes it.
 
 use super::*;
@@ -374,7 +374,7 @@ fn prompts_results_and_starts_that_could_not_be_checked_say_what_happened() {
 fn failed_answers_each_hook_in_its_own_form() {
     let raw = raw_call("touch a");
     let reason = "no answer within 10 seconds";
-    let HookOut::Ask(ask) = failed(Some("pretool"), reason, &raw, true) else {
+    let HookOut::Ask(ask) = failed(Some("pretool"), reason, &raw, true, None) else {
         unreachable!("a call with a permission prompt is asked");
     };
     assert!(
@@ -382,7 +382,7 @@ fn failed_answers_each_hook_in_its_own_form() {
         "{ask}"
     );
     // No input a session can be read from, so the call is not kept and `approve` is not offered.
-    let HookOut::Block(denied) = failed(Some("pretool"), reason, &raw, false) else {
+    let HookOut::Block(denied) = failed(Some("pretool"), reason, &raw, false, None) else {
         unreachable!("a call nobody can be asked about is DENIED");
     };
     assert!(!denied.contains("lunchroom approve"), "{denied}");
@@ -392,15 +392,15 @@ fn failed_answers_each_hook_in_its_own_form() {
     })
     .to_string();
     assert!(matches!(
-        failed(Some("prompt"), reason, &agent_prompt, false),
+        failed(Some("prompt"), reason, &agent_prompt, false, None),
         HookOut::Block(_)
     ));
     let typed = json!({ "session_id": "s1", "cwd": "/w", "prompt": "hi" }).to_string();
     assert!(matches!(
-        failed(Some("prompt"), reason, &typed, false),
+        failed(Some("prompt"), reason, &typed, false, None),
         HookOut::Notice(_)
     ));
-    let HookOut::Notice(start) = failed(Some("start"), reason, "{}", false) else {
+    let HookOut::Notice(start) = failed(Some("start"), reason, "{}", false, None) else {
         unreachable!("a start goes on");
     };
     assert!(start.starts_with(INCLUDE_LINE), "{start}");
@@ -448,6 +448,49 @@ fn an_undecided_call_is_kept_for_approve() {
         unreachable!("the input did not parse");
     };
     assert!(!keep_call(&store, &no_call, 500, "x"));
+}
+
+// F1-AC22, F1-AC23 (defect D1, task T29): the guard's failure path keeps an undecided call in the
+// store of the environment it is given, never in the store of the process's own home. Before the
+// fix `failed` took its home from the process, so this caller's store stayed empty.
+#[test]
+fn an_undecided_call_is_kept_under_the_callers_home() {
+    let home = scratch("d1-home");
+    let env = Env {
+        home: home.clone(),
+        lunchroom_home: home.join(".lunchroom"),
+        codex_home: home.join(".codex"),
+        claude_home: home.join(".claude"),
+        hermes_home: home.join(".hermes"),
+        claude_pid: None,
+        attended: None,
+        entrypoint: None,
+        claude_session: None,
+        codex_thread: None,
+        hermes_session: None,
+        lunchroom_session: None,
+        now: 500,
+    };
+    let raw = json!({
+        "session_id": "s1", "cwd": "/w", "tool_name": "Bash",
+        "tool_input": { "command": "touch a" },
+    })
+    .to_string();
+    let _ = failed(
+        Some("pretool"),
+        "the hook input has no session id",
+        &raw,
+        false,
+        Some(&env),
+    );
+    let Ok(store) = Store::<Mail>::open(&env.store_dir()) else {
+        unreachable!("the caller's store could not be opened");
+    };
+    let Ok(kept) = store.update(|m| m.requests().to_vec()) else {
+        unreachable!("the caller's store could not be read");
+    };
+    assert_eq!(kept.len(), 1, "the call is kept in the caller's store");
+    assert_eq!(kept[0].input, json!({ "command": "touch a" }));
 }
 
 // G4-7, H1.5: a call the rules that need no record DENY is DENIED with the true cause named, not

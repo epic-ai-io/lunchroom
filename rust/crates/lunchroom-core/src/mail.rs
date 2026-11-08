@@ -122,7 +122,7 @@ pub struct Message {
     #[serde(default)]
     pub handed_over: bool,
     /// What the user and the sender have been told of it while it waits (D1.8), and why it cannot
-    /// be handed over now (D1.9). A store written before 1.0.2 reads as nothing told.
+    /// be handed over now (D1.9). A store written before 1.1.0 reads as nothing told.
     #[serde(default)]
     pub told: Told,
     /// Fields a later program wrote that this one does not know, carried through every read and
@@ -212,7 +212,7 @@ pub enum Evidence {
 pub struct Notice {
     pub message: String,
     pub text: String,
-    /// When it was made (seconds since the Unix epoch); a notice from before 1.0.2 has none.
+    /// When it was made (seconds since the Unix epoch); a notice from before 1.1.0 has none.
     #[serde(default)]
     pub at: u64,
     /// It states why the message cannot be handed over or waits: a newer one for the same message
@@ -309,7 +309,7 @@ pub enum AttemptOutcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mail {
     /// The [`SCHEMA`] of the program that last wrote the store: every write stamps the current one,
-    /// and a store an older program rewrote reads as less. 0 is a store from before 1.0.2.
+    /// and a store an older program rewrote reads as less. 0 is a store from before 1.1.0.
     #[serde(default, serialize_with = "write_schema")]
     schema: u32,
     next_message: u64,
@@ -1313,7 +1313,7 @@ impl Mail {
         self.requests.len()
     }
 
-    /// The [`SCHEMA`] of the program that last wrote this store; 0 for a store from before 1.0.2.
+    /// The [`SCHEMA`] of the program that last wrote this store; 0 for a store from before 1.1.0.
     #[must_use]
     pub const fn schema(&self) -> u32 {
         self.schema
@@ -1377,3 +1377,9 @@ mod tests;
 
 #[cfg(test)]
 mod tests_102;
+
+#[cfg(test)]
+mod tests_f1_sweep;
+
+#[cfg(test)]
+mod tests_f1_notices;

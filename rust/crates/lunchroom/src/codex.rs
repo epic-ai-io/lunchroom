@@ -866,7 +866,7 @@ mod tests {
         assert_eq!(crate::delivery::envelope_ids(&line), ["ap-00000001"]);
     }
 
-    // ---- Lunchroom 1.0.2, delivery findings G2-1 and G2-24 ----
+    // ---- Lunchroom 1.1.0, delivery findings G2-1 and G2-24 ----
 
     fn scratch_env(name: &str) -> Env {
         let root = crate::test_target()

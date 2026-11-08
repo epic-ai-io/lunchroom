@@ -63,9 +63,17 @@ const HELD_MEANS: &str = lunchroom_core::vocab::HELD_MEANING;
 /// its deadline passed), given the hook's raw input. Never a lockout: a call goes to the user, or
 /// is DENIED alone where nobody can answer (A1.2); a prompt or a result goes on and the user is
 /// told, except a prompt carrying another agent's text (T1), which is blocked because the guard
-/// could not hold the session it reaches.
+/// could not hold the session it reaches. `env` is the caller's environment: every record this
+/// writes (the unjudged marker, the call kept for approval) goes under its home and nowhere else;
+/// with `None` nothing is written (F1 defect D1, task T29).
 #[must_use]
-pub fn failed(mode: Option<&str>, reason: &str, raw: &str, channel: bool) -> HookOut {
+pub fn failed(
+    mode: Option<&str>,
+    reason: &str,
+    raw: &str,
+    channel: bool,
+    env: Option<&Env>,
+) -> HookOut {
     // The prompt's own text; the whole input only when it is not JSON at all.
     let parsed: Option<Value> = serde_json::from_str(raw).ok();
     let prompt = match &parsed {
@@ -95,9 +103,9 @@ pub fn failed(mode: Option<&str>, reason: &str, raw: &str, channel: bool) -> Hoo
             .iter()
             .chain(CROSS_SESSION.iter())
             .any(|l| out.contains(l))
-        && let (Ok(input), Ok(env)) = (HookInput::parse(raw), Env::from_process())
+        && let (Ok(input), Some(env)) = (HookInput::parse(raw), env)
     {
-        let marker = unjudged_marker(&env, &input.me());
+        let marker = unjudged_marker(env, &input.me());
         if let Some(dir) = marker.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -107,9 +115,9 @@ pub fn failed(mode: Option<&str>, reason: &str, raw: &str, channel: bool) -> Hoo
     // being read. That read is not repeated, and the text left unread may carry another agent's
     // message, so the session's next hook that can use the store holds it.
     if cut_off_in_transcript(reason)
-        && let (Ok(input), Ok(env)) = (HookInput::parse(raw), Env::from_process())
+        && let (Ok(input), Some(env)) = (HookInput::parse(raw), env)
     {
-        let marker = unjudged_marker(&env, &input.me());
+        let marker = unjudged_marker(env, &input.me());
         if let Some(dir) = marker.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -120,7 +128,7 @@ pub fn failed(mode: Option<&str>, reason: &str, raw: &str, channel: bool) -> Hoo
     let kept = mode == Some("pretool")
         && !channel
         && matches!(Cause::of(reason), Cause::Own(_))
-        && keep_for_approval(raw, reason);
+        && env.is_some_and(|env| keep_for_approval(raw, reason, env));
     let text = undecided_details(mode, reason, raw, channel, agent_text, kept);
     match mode {
         Some("pretool") if channel => HookOut::Ask(text),
@@ -135,11 +143,11 @@ pub fn failed(mode: Option<&str>, reason: &str, raw: &str, channel: bool) -> Hoo
 /// H1.7: keeps the call in `raw`, a tool call the guard could not decide, for `lunchroom approve`,
 /// when the guard's own error left the store usable. `false` when it could not be kept (the input
 /// has no tool call, the store cannot be used or its writes have stopped).
-fn keep_for_approval(raw: &str, reason: &str) -> bool {
-    let (Ok(input), Ok(env)) = (HookInput::parse(raw), Env::from_process()) else {
+fn keep_for_approval(raw: &str, reason: &str, env: &Env) -> bool {
+    let Ok(input) = HookInput::parse(raw) else {
         return false;
     };
-    let Ok(store) = store(&env) else {
+    let Ok(store) = store(env) else {
         return false;
     };
     keep_call(&store, &input, env.now, reason)
