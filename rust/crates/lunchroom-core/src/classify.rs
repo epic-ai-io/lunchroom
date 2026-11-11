@@ -2861,7 +2861,19 @@ impl Guard<'_> {
         LUNCHROOM_NAMES.contains(&basename(w))
             || self
                 .resolve(w, here)
-                .is_some_and(|r| self.layout.facts(&r).program)
+                .is_some_and(|r| self.layout.facts(&r).program || self.is_a_program_file(&r))
+    }
+
+    /// 1.1.3 F113-AC1: `r` is the same file (device and inode) as Lunchroom's installed program, a
+    /// program in `layout.programs`, or the setgid program: a hard link under any name and folder.
+    fn is_a_program_file(&self, r: &Path) -> bool {
+        let Some(id) = self.fs.file_id(r) else {
+            return false;
+        };
+        std::iter::once(self.layout.program_dir.join(LUNCHROOM_NAMES[0]))
+            .chain(self.layout.programs.iter().cloned())
+            .chain(std::iter::once(PathBuf::from(crate::setgid::PROGRAM)))
+            .any(|p| self.fs.file_id(&p) == Some(id))
     }
 
     /// §6 item 1: the text is exactly one `lunchroom send`, with nothing before the program and

@@ -227,16 +227,18 @@ impl Drop for Verifier {
     }
 }
 
-// §7::12 (A1.3) through the real system, as root. This writes `/etc/lunchroom`, so it is
-// ignored in an ordinary run; CI runs it with sudo: `sudo -E cargo test --test terminal -- --ignored`.
+// §7::12 (A1.3) through the real system, as root. This writes `/etc/lunchroom`, so its
+// checks run as root in a throwaway container (TF2), in every run, and never on the host.
 // With a verifier root made for the user running the test, a command only the user may run, typed
 // in a real terminal (a pseudo-terminal that `script` makes), carries out on the passphrase and
 // only on it: a wrong passphrase, a `yes`, and a verifier that is not root's alone (another owner,
 // or writable by its group) change nothing.
 #[test]
-#[ignore = "writes /etc/lunchroom: CI runs it as root, with sudo"]
 fn a_user_command_in_a_real_terminal_runs_only_on_the_passphrase() {
     const PASSPHRASE: &str = "correct horse battery";
+    if !common::in_root_container("a_user_command_in_a_real_terminal_runs_only_on_the_passphrase") {
+        return;
+    }
     assert_eq!(
         uid(),
         Some(0),

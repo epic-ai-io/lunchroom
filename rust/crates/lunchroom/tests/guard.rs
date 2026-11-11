@@ -1926,6 +1926,50 @@ fn guard_denies_commands_running_approve_yolo_or_config_changes() {
     }
 }
 
+// 1.1.3 F113-AC1, F113-AC2 (§3::2, spec lines 125 and 147): a hard link to Lunchroom's
+// program, under another name and in another folder, is Lunchroom's program: a command only the user
+// may run through it is DENIED, HELD or not, as it is through the program's own path. A different file
+// under another name (a copy of `/bin/true`; `/bin` is on another device, so it cannot be a hard link)
+// is not DENIED as Lunchroom's program.
+#[test]
+fn a_hard_link_to_the_program_runs_no_user_only_command() {
+    let program = env!("CARGO_BIN_EXE_lunchroom");
+    let sb = Sandbox::new();
+    let link = sb.0.root.join("lh");
+    assert!(
+        std::fs::hard_link(program, &link).is_ok(),
+        "{}",
+        link.display()
+    );
+    let other = sb.0.root.join("lo");
+    assert!(std::fs::copy("/bin/true", &other).is_ok());
+    for held in [false, true] {
+        if held {
+            hold(&sb, "s1");
+        }
+        for command in [
+            format!("{program} yolo all till 14:00"),
+            format!("{} yolo all till 14:00", link.display()),
+            format!("{} approve 1", link.display()),
+        ] {
+            let run = sb.pretool("s1", &command, &interactive());
+            assert_eq!(run.code, Some(2), "held {held}: {command}: {}", run.stderr);
+            assert!(
+                run.stderr.contains("DENIED"),
+                "held {held}: {command}: {}",
+                run.stderr
+            );
+        }
+        let command = format!("{} yolo all till 14:00", other.display());
+        let run = sb.pretool("s1", &command, &interactive());
+        assert!(
+            !run.stderr.contains("configuration"),
+            "held {held}: {command}: {}",
+            run.stderr
+        );
+    }
+}
+
 // §7::1, §7::12 (binary part): run where a guarded session is in its parent chain (here a
 // recorded harness process, and this environment's own Claude Code), or with no controlling
 // terminal, `lunchroom approve`, `register`, `rate` and `mode` change nothing.

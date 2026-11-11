@@ -197,6 +197,13 @@ pub trait Fs {
     fn runs_as_script(&self, p: &Path) -> bool;
     /// Where `PATH` finds a program, as a real path.
     fn which(&self, prog: &str) -> Option<PathBuf>;
+    /// 1.1.3 F113-AC1: the device and inode of the file at `p` (following links), so a hard link
+    /// under another name and folder is known to be the same file. A view that cannot tell, and a
+    /// file that cannot be read, answer `None`, which matches nothing.
+    fn file_id(&self, p: &Path) -> Option<(u64, u64)> {
+        let _ = p;
+        None
+    }
 }
 
 /// The real file system, with one time budget shared by every question.
@@ -436,6 +443,11 @@ impl Fs for OsFs {
             .map(|d| d.join(prog))
             .find(|c| c.is_file())
             .map(|c| self.real(&c))
+    }
+
+    fn file_id(&self, p: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
     }
 }
 

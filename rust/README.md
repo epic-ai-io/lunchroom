@@ -49,11 +49,11 @@ table below gives the full meaning of each.
 Each release publishes `lunchroom-v<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl`, with `SHA256SUMS` signed by Sigstore. Check a download before you run
 it, with cosign 3 or newer: first that this repository's release workflow signed `SHA256SUMS` for the
-release's own tag (here `v1.1.2`; use the tag you downloaded), then the archive against it:
+release's own tag (here `v1.1.3`; use the tag you downloaded), then the archive against it:
 
 ```
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.1.2 \
+  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.1.3 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum -c SHA256SUMS --ignore-missing
 ```
@@ -137,7 +137,7 @@ What you do afterwards:
 A broken guard never locks you out: what the guard cannot check goes to you, or, where nobody can be
 asked, that one call is DENIED (see "When the guard cannot decide a call" below).
 
-`lunchroom version` names the build, for example `lunchroom 1.1.2 (a1b2c3d)`: the version, then the commit it was built from, with
+`lunchroom version` names the build, for example `lunchroom 1.1.3 (a1b2c3d)`: the version, then the commit it was built from, with
 `, modified` when a tracked file of the source differs from that commit (untracked files do not
 count); a build from a source copy with no git history shows the version alone. The install reports the build it installed and the
 one it kept as a backup.
@@ -182,8 +182,8 @@ To upgrade an installed Lunchroom, download and unpack the new release, then run
 path, in your own terminal, from the unpacked folder:
 
 ```
-tar xzf lunchroom-v1.1.2-x86_64-unknown-linux-musl.tar.gz
-cd lunchroom-v1.1.2-x86_64-unknown-linux-musl
+tar xzf lunchroom-v1.1.3-x86_64-unknown-linux-musl.tar.gz
+cd lunchroom-v1.1.3-x86_64-unknown-linux-musl
 ./lunchroom install
 ```
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.3
+
+Fixes to 1.1.2. 1.1.2 is superseded by 1.1.3.
+
+Upgrade: download and unpack the new release, then run its program by its path, in your own terminal,
+from the unpacked folder: `./lunchroom install`. `lunchroom install` typed by name runs the program
+already installed, so it reinstalls the build you already have and upgrades nothing.
+
+- A command only you may run (such as `lunchroom yolo` or `lunchroom approve`) is now DENIED to an
+  agent that runs it through a hard link to Lunchroom's program under another name and folder, as it
+  is through the program's own path. Before, such a link was not recognised as Lunchroom's program.
+
 ## 1.1.2
 
 Fixes to 1.1.1, found by upgrading to it. 1.1.1 is superseded by 1.1.2.

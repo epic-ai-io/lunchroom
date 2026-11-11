@@ -2563,6 +2563,9 @@ impl crate::fs::Fs for Blind {
     fn which(&self, prog: &str) -> Option<PathBuf> {
         self.inner.which(prog)
     }
+    fn file_id(&self, p: &Path) -> Option<(u64, u64)> {
+        self.inner.file_id(p)
+    }
 }
 
 // §11::10 — a part of the path the guard has no permission to look at leaves the file
@@ -3016,19 +3019,27 @@ fn apply_patch_is_decided_quickly_and_only_its_header_paths_are_judged() {
             "+// {i} match **/*.rs and ~/.lunchroom/inbox/m{i} and {{a,b}} $(x) [a-z]*?"
         );
     }
+    let body = patch.clone();
     patch.push_str("*** End Patch\n");
     let input = patch_input(&patch);
+    // TF1-AC2: twice the body lines under the same one header line, for counting looks.
+    let mut doubled = body.clone();
+    doubled
+        .push_str(&body["*** Begin Patch\n*** Update File: src/main.rs\n@@ fn main() {\n".len()..]);
+    doubled.push_str("*** End Patch\n");
+    let longer = patch_input(&doubled);
     for held in [true, false] {
-        let started = std::time::Instant::now();
         let (class, fault) = h.explained(held, "apply_patch", &input);
-        assert!(
-            started.elapsed() < decide_limit(),
-            "held={held}: {:?}",
-            started.elapsed()
-        );
         // Decided: an ordinary call, not undecided, not DENIED for text in the patch's lines.
         assert_eq!(class, CallClass::Ordinary, "held={held}");
         assert_eq!(fault, None, "held={held}");
+        // Only the header line is judged: more body lines make no more looks at the file system.
+        let (once, twice) = (
+            h.looks(held, "apply_patch", &input),
+            h.looks(held, "apply_patch", &longer),
+        );
+        assert!(once > 0, "held={held}: the counting view counted nothing");
+        assert_eq!(once, twice, "held={held}");
     }
 }
 
@@ -3176,17 +3187,27 @@ fn an_unknown_tool_with_a_long_text_is_decided_at_once() {
         );
     }
     let input = json!({ "patch": text });
-    let started = std::time::Instant::now();
-    let class = h.class(true, "mystery_tool", &input);
-    assert!(
-        started.elapsed() < decide_limit(),
-        "{:?}",
-        started.elapsed()
-    );
-    assert_eq!(class, UNPARSED);
-    let started = std::time::Instant::now();
+    assert_eq!(h.class(true, "mystery_tool", &input), UNPARSED);
     assert_eq!(h.class(false, "mystery_tool", &input), CallClass::Ordinary);
-    assert!(started.elapsed() < decide_limit());
+    // TF1-AC1: past the limit of strings looked up, more text makes no more looks at the file
+    // system, held or not (the work, not the time, which a busy host changes).
+    // Twice the lines, every one new (repeated words add no new string to look up).
+    let mut doubled = text.clone();
+    for i in 5_000..10_000 {
+        let _ = writeln!(
+            doubled,
+            "line {i} matches **/*.rs and a/b/c{i} and [a-z]*?x{i}"
+        );
+    }
+    let longer = json!({ "patch": doubled });
+    for held in [true, false] {
+        let (once, twice) = (
+            h.looks(held, "mystery_tool", &input),
+            h.looks(held, "mystery_tool", &longer),
+        );
+        assert!(once > 0, "held={held}: the counting view counted nothing");
+        assert_eq!(once, twice, "held={held}");
+    }
     // The store path comes after thousands of words, past the limit of strings looked up in the
     // file system: it is still found, in every session.
     let hidden = json!({ "patch": format!("{text} ~/.lunchroom/inbox/m1") });
@@ -3208,14 +3229,87 @@ fn an_unknown_tool_with_a_long_text_is_decided_at_once() {
     assert_eq!(candidates("a/b a/b"), vec!["a/b a/b", "a/b", "/b"]);
 }
 
-/// How long a decision on a very large call may take in these tests: 1 s in the release build that
-/// ships (measured 2026-11-02: the 5,000-line case passes), 3 s in an unoptimized test build, whose
-/// code runs several times slower (the same case measured 1.39 s there, alone).
-fn decide_limit() -> Duration {
-    if cfg!(debug_assertions) {
-        Duration::from_secs(3)
-    } else {
-        Duration::from_secs(1)
+/// TF1: a view of the real file system that counts every look at it, so a test measures the guard's
+/// work and not the time it took (which a busy host changes).
+struct Counting {
+    fs: OsFs,
+    looks: std::cell::Cell<usize>,
+}
+
+impl Counting {
+    fn look(&self) {
+        self.looks.set(self.looks.get() + 1);
+    }
+}
+
+impl crate::fs::Fs for Counting {
+    fn real(&self, p: &Path) -> PathBuf {
+        self.look();
+        self.fs.real(p)
+    }
+    fn node(&self, p: &Path) -> crate::fs::Node {
+        self.look();
+        self.fs.node(p)
+    }
+    fn out_of_time(&self) -> bool {
+        self.fs.out_of_time()
+    }
+    fn descends_from(&self, pid: u32, root: u32) -> bool {
+        self.fs.descends_from(pid, root)
+    }
+    fn is_dir(&self, p: &Path) -> bool {
+        self.look();
+        self.fs.is_dir(p)
+    }
+    fn exists(&self, p: &Path) -> bool {
+        self.look();
+        self.fs.exists(p)
+    }
+    fn expand(&self, pattern: &Path) -> crate::fs::Expansion {
+        self.look();
+        self.fs.expand(pattern)
+    }
+    fn walk(&self, dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> crate::fs::WalkEnd {
+        self.look();
+        self.fs.walk(dir, visit)
+    }
+    fn script(&self, p: &Path) -> crate::fs::Script {
+        self.look();
+        self.fs.script(p)
+    }
+    fn runs_as_script(&self, p: &Path) -> bool {
+        self.look();
+        self.fs.runs_as_script(p)
+    }
+    fn which(&self, prog: &str) -> Option<PathBuf> {
+        self.look();
+        self.fs.which(prog)
+    }
+    fn file_id(&self, p: &Path) -> Option<(u64, u64)> {
+        self.look();
+        self.fs.file_id(p)
+    }
+}
+
+impl Fixture {
+    /// TF1: how many times classifying this call looks at the file system.
+    fn looks(&self, held: bool, tool: &str, input: &Value) -> usize {
+        // A budget that never runs out on any host: the time budget (`BUDGET`, 2 s) would cut a
+        // busy host's looks short and make the count depend on load, which TF1-C1 rules out.
+        let counting = Counting {
+            fs: OsFs::with_path(
+                Duration::from_hours(24),
+                Some(self.home.join("bin").into_os_string()),
+            ),
+            looks: std::cell::Cell::new(0),
+        };
+        let g = Guard {
+            layout: &self.layout,
+            fs: &counting,
+            held,
+        };
+        let _ = g.classify(tool, input, &self.home.join("project"));
+        counting.looks.get()
     }
 }
 

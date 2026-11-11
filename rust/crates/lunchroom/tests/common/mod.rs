@@ -192,6 +192,56 @@ pub fn which(program: &str) -> Option<PathBuf> {
         .find(|file| file.is_file())
 }
 
+/// TF2: the throwaway container a root test runs in (Ubuntu 24.04, the CI runner's release and the
+/// development host's, so the binaries built on either run in it).
+const ROOT_IMAGE: &str = "docker.io/library/ubuntu@sha256:\
+                          fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852";
+
+/// TF2-AC2, TF2-AC3: `true` inside a container (podman's `/run/.containerenv`) as root: the caller
+/// makes its checks here. Anywhere else, root or not, the one test `test` of this test binary is
+/// run as root in a throwaway container, so the host's `/etc` is never written; it returns `false`
+/// once that run has passed, and fails the test, with podman's output, when it has not.
+pub fn in_root_container(test: &str) -> bool {
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Uid:"))
+                .and_then(|l| l.split_whitespace().next().map(str::to_owned))
+        });
+    if Path::new("/run/.containerenv").exists() && uid.as_deref() == Some("0") {
+        return true;
+    }
+    let exe = std::env::current_exe();
+    assert!(exe.is_ok(), "{exe:?}");
+    let exe = exe.unwrap_or_default();
+    // The build folder: the test binary is in its `deps`, the `lunchroom` binary in it.
+    let build = exe.parent().and_then(Path::parent).map(Path::to_path_buf);
+    assert!(build.is_some(), "no build folder above {}", exe.display());
+    let build = build.unwrap_or_default().display().to_string();
+    // The crate folder, where `Sandbox` makes its folders.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let out = Command::new("podman")
+        .args(["run", "--rm", "--network=none", "--pull=missing", "-v"])
+        .arg(format!("{manifest}:{manifest}"))
+        .arg("-v")
+        .arg(format!("{build}:{build}:ro"))
+        .arg(ROOT_IMAGE)
+        .arg(&exe)
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .output();
+    assert!(out.is_ok(), "podman could not be run: {out:?}");
+    let Ok(out) = out else { return false };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the root container run of {test} did not pass ({:?}):\n{stdout}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}
+
 /// `program` as a command. The CI runner and a development machine have every program the tests
 /// name; a system without one is a broken environment, so the test fails rather than passes.
 pub fn require(program: &str) -> Command {

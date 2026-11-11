@@ -1,6 +1,6 @@
 //! The message corpus for the comprehension gate.
 //!
-//! `cargo test --release message_corpus -- --ignored` writes `rust/target/message-corpus.json`:
+//! `cargo test --release message_corpus` (and every suite) writes `target/message-corpus.json`:
 //! every kind of message Lunchroom shows a user or an agent, rendered by the code that prints it
 //! (the hooks and commands themselves, run on a scratch home and a scratch store), each with the
 //! facts a first-time reader must get from it (`what`, `why`, `holder`, `ways`). The facts are
@@ -1162,8 +1162,10 @@ fn doctor(c: &mut Corpus) {
     );
 }
 
+// Every message a person can be shown is built and checked, and written to
+// `target/message-corpus.json` (the build folder) for the comprehension gate. It runs in every
+// suite: tests are never ignored.
 #[test]
-#[ignore = "writes rust/target/message-corpus.json for the comprehension gate; run on request"]
 fn message_corpus() {
     let mut c = Corpus::default();
     denied(&mut c);
