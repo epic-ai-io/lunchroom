@@ -86,6 +86,14 @@ pub struct Resolved {
     pub complete: bool,
 }
 
+/// `/dev/stdin`, `/dev/stdout` or `/dev/stderr`: the opening command's own input and output.
+/// `/dev/fd/N` is not one: it can name a descriptor the command inherited, so it is followed.
+fn is_own_descriptor(p: &Path) -> bool {
+    ["/dev/stdin", "/dev/stdout", "/dev/stderr"]
+        .iter()
+        .any(|d| p == Path::new(d))
+}
+
 /// The parts of `p` that name something (`Normal` and `..`), last first, for use as a stack.
 fn parts_reversed(p: &Path) -> Vec<OsString> {
     let mut v: Vec<OsString> = p
@@ -166,6 +174,15 @@ pub trait Fs {
             if self.out_of_time() {
                 self.note_cut(p);
                 (exists, complete) = (false, false);
+                out = next;
+                continue;
+            }
+            // `/dev/stdin`, `/dev/stdout` and `/dev/stderr` are the input and output of the command
+            // that opens them, an ordinary device (§12::19). Followed here, they would lead through
+            // `/proc/self` to this process's own (a hook's are pipes), which say nothing about the
+            // command's. A `..` after one leaves the result incomplete, as after a missing part.
+            if is_own_descriptor(&next) {
+                exists = false;
                 out = next;
                 continue;
             }
@@ -1251,6 +1268,61 @@ mod tests {
         assert_eq!(resolved(&fs, "/a/b/back/f"), ("/z/f".to_owned(), true));
         // `..` after a relative link leaves the target's folder.
         assert_eq!(resolved(&fs, "/a/rel/../g"), ("/a/b/g".to_owned(), true));
+    }
+
+    // §12::19, §17::50: `/dev/stdin` and its kin are the opening command's own descriptors, an
+    // ordinary device; they are not followed through this process's `/proc/self` (a hook's
+    // standard input is a pipe). Fails before the change: `/dev/stdin` resolves to
+    // `/proc/4242/fd/pipe:[9]`, another process's folder.
+    #[test]
+    fn the_commands_own_descriptors_are_not_followed_through_this_process() {
+        let fs = MapFs::with(
+            &["/dev", "/proc", "/proc/4242", "/proc/4242/fd"],
+            &[
+                ("/dev/stdin", "/proc/self/fd/0"),
+                ("/dev/stdout", "/proc/self/fd/1"),
+                ("/dev/stderr", "/proc/self/fd/2"),
+                ("/dev/fd", "/proc/self/fd"),
+                ("/proc/self", "4242"),
+                ("/proc/4242/fd/0", "pipe:[9]"),
+                ("/dev/core", "/proc/kcore"),
+            ],
+        );
+        for p in ["/dev/stdin", "/dev/stdout", "/dev/stderr"] {
+            assert_eq!(resolved(&fs, p), (p.to_owned(), true), "{p}");
+        }
+        // `/dev/fd/N` can name an inherited descriptor: it is followed, as before, into a
+        // process's own folder, which a HELD agent's read is DENIED.
+        assert_eq!(
+            resolved(&fs, "/dev/fd/3"),
+            ("/proc/4242/fd/3".to_owned(), true)
+        );
+        // Spelled another way, it is the same path; a link to it is followed to it.
+        let aliased = MapFs::with(&["/dev", "/t"], &[("/t/in", "/dev/stdin")]);
+        for p in ["//dev/stdin", "/dev/./stdin", "/t/in"] {
+            assert_eq!(
+                resolved(&aliased, p),
+                ("/dev/stdin".to_owned(), true),
+                "{p}"
+            );
+        }
+        // Past one, `..` is not resolved: incomplete, which the caller treats as anywhere.
+        assert!(!fs.resolve(Path::new("/dev/stdin/../x")).complete);
+        assert!(
+            !fs.resolve(Path::new("/dev/stderr/../../proc/4242/environ"))
+                .complete
+        );
+        // On the real file system, whatever this process's descriptors are.
+        let os = OsFs::new(BUDGET);
+        for p in ["/dev/stdin", "/dev/stdout", "/dev/stderr"] {
+            assert_eq!(os.resolve(Path::new(p)).path, PathBuf::from(p), "{p}");
+        }
+        // Every other link is followed as before, `/proc/self` included.
+        assert_eq!(
+            resolved(&fs, "/proc/self/fd/0"),
+            ("/proc/4242/fd/pipe:[9]".to_owned(), true)
+        );
+        assert_eq!(resolved(&fs, "/dev/core"), ("/proc/kcore".to_owned(), true));
     }
 
     // L1.1: a destination that does not exist yet keeps its name; a dangling link is followed to

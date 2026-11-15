@@ -540,10 +540,15 @@ mod tests {
     // password and then the passphrase. Fails before the change: neither has the section.
     #[test]
     fn both_readmes_have_the_console_section_with_the_open_line() {
-        for file in ["README.md", "public-overlay/README.md"] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../..")
-                .join(file);
+        // The public repository is the export: its README.md is public-overlay/README.md, and it
+        // has no public-overlay folder. The private tree has both files.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut files = vec!["README.md"];
+        if root.join("public-overlay").is_dir() {
+            files.push("public-overlay/README.md");
+        }
+        for file in files {
+            let path = root.join(file);
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let section = text
                 .split("\n## ")

@@ -1311,8 +1311,18 @@ mod tests {
         assert_eq!(crate::delivery::envelope_ids(&handed), ["ap-00000001"]);
         assert!(handed.contains("id ap-00000001"), "{handed}");
         assert!(handed.contains(" read ap-00000001`"), "{handed}");
+        // The program's own path sits between "Read it with `" and " read": it is where the test
+        // binary was built (on a CI runner, under /home/runner/work), not text of the call.
+        let opening = "Read it with `";
+        let at = handed.find(opening).map_or(0, |i| i + opening.len());
+        let end = handed.find(" read ap-00000001`").unwrap_or(0);
+        assert!(at > 0 && end > at, "no read command: {handed}");
+        let without_program = format!("{}{}", &handed[..at], &handed[end..]);
         for call_text in ["Bash", "command", "lr-00000001", "/work"] {
-            assert!(!handed.contains(call_text), "{call_text}: {handed}");
+            assert!(
+                !without_program.contains(call_text),
+                "{call_text}: {handed}"
+            );
         }
         let read =
             lunchroom_core::approvals::tell_line(TellKind::Approved, "ap-00000001", "Bash", &input);
