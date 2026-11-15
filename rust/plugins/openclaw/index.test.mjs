@@ -14,6 +14,7 @@ import plugin, {
   personCanAnswer,
   surfaces,
   afterToolCall,
+  waiting,
   agentEnd,
   beforeAgentRun,
   beforeToolCall,
@@ -32,14 +33,19 @@ const ARGS = join(dir, "args.txt");
 writeFileSync(
   STUB,
   `#!/bin/sh
+# A call's end (D1.8) is reported in the background, after the hook returns; it is kept in files of
+# its own so it never overwrites the call a test reads (c5.test.mjs tests the reports themselves).
+if [ "$2" = callend ]; then printf '%s\\n' "$@" > '${ARGS}.callend'; cat > '${IN}.callend'; exit 0; fi
 printf '%s\\n' "$@" > '${ARGS}'
 cat > '${IN}'
 case "$STUB_MODE" in
   deny) echo "Lunchroom: DENIED · fence" >&2; exit 2 ;;
   ask) printf '%s' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Lunchroom: s1 is HELD."}}' ;;
+  freed) printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"Lunchroom: YOLO authorized until 14:00 UTC."}}' ;;
   signal) kill -TERM $$ ;;
   exit1) exit 1 ;;
   slow) sleep 1 ;;
+  hang) exec sleep 30 ;;
   garbage) printf 'not json' ;;
   event) printf '%s' '{"systemMessage":"Lunchroom: bob is UNGUARDED.","hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"Lunchroom: agent text"}}' ;;
 esac
@@ -79,6 +85,18 @@ test("a call the guard lets run returns nothing, and the guard sees the call as 
   await beforeToolCall(exec, { ...ctx, runId: "unseen" }, STUB);
   assert.equal(sent().approval_channel, false);
   assert.equal(input.plugin_file, fileURLToPath(new URL("./index.mjs", import.meta.url)));
+});
+
+test("a call the guard frees under a `lunchroom yolo` runs: no block, no approval prompt, in a run with a person and one without (R2.2, H1.1)", async () => {
+  mode("freed");
+  const own = { ...exec, toolCallId: "y1" };
+  assert.equal(await beforeToolCall(own, ctx, STUB), undefined);
+  assert.equal(await beforeToolCall(own, { ...ctx, runId: "unseen" }, STUB), undefined);
+  // The guard's `allow` is no `ask`: with a person present no approval is requested for it.
+  assert.equal(sent().approval_channel, false);
+  mode("ask");
+  const asked = await beforeToolCall(own, ctx, STUB);
+  assert.ok(asked && asked.requireApproval, "the call asks again once the guard asks");
 });
 
 test("a DENIED call is blocked with the guard's reason", async () => {
@@ -229,6 +247,42 @@ test("a missing guard program sends the call to the user, or DENIES it where nob
   assert.equal((await beforeToolCall(exec, { ...ctx, runId: "unseen" }, absent)).block, true);
 });
 
+test("a guard that is missing, fails, is killed, is unreadable or gives no answer could not decide: the call goes to the user, or is DENIED where nobody can be asked (§13::107, §13::108)", async () => {
+  const absent = join(dir, "absent");
+  const cases = [
+    ["allow", absent, "its program is missing"],
+    ["exit1", STUB, "exit 1"],
+    ["signal", STUB, "stopped by SIGTERM"],
+    ["garbage", STUB, "its answer could not be read"],
+    // The guard's own answer comes within its deadline; past the plugin's, no answer in time.
+    ["hang", STUB, "no answer in time"],
+  ];
+  surfaces.set("r1", true);
+  for (const [m, program, why] of cases) {
+    if (m === "hang") continue;
+    mode(m);
+    // Where a person can be asked: the call goes to the user.
+    const asked = await beforeToolCall(exec, ctx, program);
+    assert.ok(asked.requireApproval, `${m}: ${JSON.stringify(asked)}`);
+    assert.ok(asked.requireApproval.description.includes(why), `${m}: ${asked.requireApproval.description}`);
+    assert.ok(asked.requireApproval.description.includes("It needs your yes"), m);
+    // Where nobody can be asked: the call is DENIED.
+    const denied = await beforeToolCall(exec, { ...ctx, runId: "unseen" }, program);
+    assert.equal(denied.block, true, m);
+    assert.ok(denied.blockReason.includes(why), `${m}: ${denied.blockReason}`);
+    assert.ok(denied.blockReason.includes("Nobody can be asked in this session, so this call is DENIED."), m);
+  }
+  // No answer in time: both run at once, since each waits the plugin's whole deadline.
+  mode("hang");
+  const [asked, denied] = await Promise.all([
+    beforeToolCall(exec, ctx, STUB),
+    beforeToolCall(exec, { ...ctx, runId: "unseen" }, STUB),
+  ]);
+  assert.ok(asked.requireApproval.description.includes("no answer in time"), JSON.stringify(asked));
+  assert.equal(denied.block, true);
+  assert.ok(denied.blockReason.includes("no answer in time"), denied.blockReason);
+});
+
 test("only a call the user approved is reported as approved after it runs (card 4)", async () => {
   surfaces.set("r1", true);
   // "allow-always" is outside allowedDecisions; were it reported, it would not count as a yes.
@@ -244,6 +298,30 @@ test("only a call the user approved is reported as approved after it runs (card 
   }
   await afterToolCall({ ...exec, toolCallId: "t3" }, ctx, STUB);
   assert.equal(sent().tool_use_id, "t3");
+});
+
+test("the after-call hook carries the call's id and input as the guard judged them before it ran (T1.8)", async () => {
+  surfaces.set("r1", true);
+  mode("allow");
+  // An earlier test's unanswered request for `t1` is not this call's answer.
+  waiting.clear();
+  // With no tool-call id the run's id is the call's key before the call, so it is after it.
+  const call = { ...exec, params: { command: "echo x > out.txt", workdir: "/w" } };
+  await beforeToolCall(call, ctx, STUB);
+  const before = sent();
+  await afterToolCall({ ...call, result: "ok" }, ctx, STUB);
+  const after = sent();
+  assert.deepEqual(args(), ["guard", "posttool"]);
+  assert.notEqual(before.tool_use_id, "");
+  assert.equal(after.tool_use_id, before.tool_use_id);
+  assert.deepEqual(after.tool_input, before.tool_input);
+  // A call the user refused is not reported as run, so no paths of it are recorded.
+  mode("ask");
+  const asked = await beforeToolCall({ ...call, toolCallId: "w9" }, ctx, STUB);
+  asked.requireApproval.onResolution("deny");
+  mode("allow");
+  await afterToolCall({ ...call, toolCallId: "w9", result: "x" }, ctx, STUB);
+  assert.equal(sent().tool_use_id, "");
 });
 
 test("the turn's prompt reaches the guard; typed only from the owner with no other session (T1)", async () => {
@@ -382,6 +460,8 @@ test("the plugin entry registers every hook, with id lunchroom and an empty conf
     "after_tool_call",
     "agent_end",
     "before_agent_run",
+    // The session's own notices at the start of a turn a person typed (index.mjs, beforePromptBuild).
+    "before_prompt_build",
     "before_tool_call",
     "resolve_exec_env",
   ]);

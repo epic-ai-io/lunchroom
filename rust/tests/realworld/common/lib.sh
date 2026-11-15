@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared by the real-world proofs of Lunchroom 1.1.0. Sourced as root inside a container.
+# Shared by the real-world proofs of Lunchroom 1.1. Sourced as root inside a container.
 #
 # It prints PASS or FAIL for a check, MEASURED for a fact it only records; `finish` prints the
 # counts and exits non-zero on any FAIL. Every check that counts a refusal or an absence proves
@@ -11,6 +11,15 @@ PROOF=/opt/proof
 RUN=/run/proof
 SESS=/run/sess
 DEVHOME=/home/dev
+
+# 1.1, spec section 17 item 2 (docs/spec/lunchroom-spec.md, section 17 C2): the program of an
+# install is /usr/local/lib/lunchroom/lunchroom, setgid lunchroom; the store is
+# /var/lib/lunchroom/<uid>/ (group lunchroom, setgid folder, mode 2770), which the user and the
+# user's processes cannot enter. A proof that must read or change the store does it as root (the
+# container's root stands in for the setgid program, the only thing that reaches the store in real
+# use).
+LR=/usr/local/lib/lunchroom/lunchroom
+STOREROOT=/var/lib/lunchroom
 
 pass() { echo "PASS $*"; PASSES=$((PASSES + 1)); }
 fail() { echo "FAIL $*"; FAILS=$((FAILS + 1)); }
@@ -47,6 +56,7 @@ make_user() {
     head -c 24 /dev/urandom | base64 | tr -d '/+=\n' > "$RUN/sudo.pw"
     : > "$RUN/enter"
     echo yes > "$RUN/yes"
+    echo no > "$RUN/no"
     printf 'dev:%s\n' "$(cat "$RUN/sudo.pw")" | chpasswd || echo "chpasswd failed: $?"
     umask 022
     # The password must be usable for sudo: check what was stored (the hash's scheme, never the hash).
@@ -70,6 +80,7 @@ pty() {
     shift
     python3 "$PROOF/ptyrun.py" --log "$RUN/$name.log" --timeout 120 \
         --auto "Type yes: ::$RUN/yes" \
+        --auto "Type yes to write the rule; anything else writes nothing and sets nothing up: ::$RUN/no" \
         --auto "Choose 1, 2 or 3 \\[2\\]: ::$RUN/enter" \
         --auto "New passphrase \\(at least [0-9]+ characters\\): ::$RUN/lr.pw" \
         --auto "New passphrase again: ::$RUN/lr.pw" \
@@ -78,9 +89,15 @@ pty() {
         -- "$@" >/dev/null 2>&1
 }
 
-# Puts Lunchroom 1.1.0 (the static program in $PROOF) on dev's account for Claude Code, then sets
-# the passphrase, through the program's own prompts. Both run on a pseudo-terminal, as the program
+# Puts Lunchroom 1.1 (the static program in $PROOF) on dev's account for the harness, then sets the
+# passphrase, through the program's own prompts. Both run on a pseudo-terminal, as the program
 # requires; the answers are typed from files.
+#
+# 1.1, spec section 17 item 2: `lunchroom install <harness>` sets the store wall up (the user and
+# group lunchroom, the program at /usr/local/lib/lunchroom/lunchroom, the store at
+# /var/lib/lunchroom/<uid>/), asks for dev's sudo password for its root steps, and runs the setgid
+# program's own install, so the hooks run /usr/local/lib/lunchroom/lunchroom. The 1.0.x program
+# ~/.lunchroom/bin/lunchroom is no longer where the hooks point.
 install_lunchroom() {
     local harness=${1:-claude-code}
     cp "$PROOF/lunchroom" "$DEVHOME/lunchroom-dl"
@@ -89,15 +106,26 @@ install_lunchroom() {
     pty install "${DEV[@]}" "$DEVHOME/lunchroom-dl" install "$harness"
     # With sudo present the install sets the passphrase itself; otherwise it is set here.
     [ -e "/etc/lunchroom/$(id -u dev).verifier" ] \
-        || pty passphrase "${DEV[@]}" "$DEVHOME/.lunchroom/bin/lunchroom" passphrase
+        || pty passphrase "${DEV[@]}" "$LR" passphrase
 }
+
+# lr_installed: true when the 1.1 install finished: the setgid program is in place and the store
+# folder exists (section 17 item 2).
+lr_installed() {
+    [ -g "$LR" ] && [ -d "$STOREROOT/$(id -u dev)" ]
+}
+
+# store_dir and store_state: the store's folder and its state file, for a proof that reads or changes
+# the store as root.
+store_dir() { echo "$STOREROOT/$(id -u dev)/store"; }
+store_state() { echo "$STOREROOT/$(id -u dev)/store/state.json"; }
 
 # Claude Code is told to use a key and a server that never answers, and its first-run questions are
 # answered in its own configuration file, as a person who had answered them once would have it.
 seed_claude() {
     cat > "$DEVHOME/.claude.json" <<'J'
 {"hasCompletedOnboarding": true, "theme": "dark", "numStartups": 5,
- "customApiKeyResponses": {"approved": ["ke-key-for-the-proof"], "rejected": []},
+ "customApiKeyResponses": {"approved": ["sk-ant-mock", "ke-key-for-the-proof"], "rejected": []},
  "projects": {"/home/dev": {"hasTrustDialogAccepted": true, "allowedTools": []}}}
 J
     chown dev "$DEVHOME/.claude.json"
@@ -144,6 +172,12 @@ start_session() {
         n=$((n + 1))
         [ $n -ge 40 ] && break
     done
+    # 2026-11-14: when the session did not join, its terminal is the only record of why, and it
+    # is gone with the container; print its end (plain text) so the log carries the evidence.
+    if ! status | grep -q "^$name	"; then
+        echo "MEASURED session '$name' did not join within 20 s; the end of its terminal follows"
+        python3 "$PROOF/plaintext.py" "$SESS/$name.log" 2>/dev/null | tail -40 | sed 's/^/    | /'
+    fi
 }
 
 # probe SESSION KIND LABEL: types "KIND LABEL" (KIND is DENYTEST or CONTROLTEST) into the session's
@@ -185,11 +219,11 @@ PY
 exe_of() { as_dev readlink "/proc/$1/exe" 2>/dev/null; }
 
 # status: Lunchroom's status as dev (it needs no terminal).
-status() { as_dev "$DEVHOME/.lunchroom/bin/lunchroom" status 2>&1; }
+status() { as_dev "$LR" status 2>&1; }
 
 # doctor: Lunchroom's doctor as dev, on a pseudo-terminal (it runs only for a user at one).
 doctor() {
     rm -f "$RUN/doctor.log"
-    pty doctor "${DEV[@]}" "$DEVHOME/.lunchroom/bin/lunchroom" doctor
+    pty doctor "${DEV[@]}" "$LR" doctor
     python3 "$PROOF/plaintext.py" "$RUN/doctor.log"
 }

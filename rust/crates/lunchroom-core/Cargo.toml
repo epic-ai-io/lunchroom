@@ -16,10 +16,12 @@ workspace = true
 
 [features]
 # The console's guard rules (1.1): terminals, process memory and environment, debuggers, kill,
-# tmux and `ptrace`. Off in 1.1.0, where no console exists to protect.
+# tmux and `ptrace`. On in 1.1 (spec §17 C2 item 1).
+default = ["console"]
 console = []
 
 [dependencies]
+rustix = { version = "=1.1.4", features = ["process", "thread"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

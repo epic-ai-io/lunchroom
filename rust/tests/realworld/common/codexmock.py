@@ -87,7 +87,8 @@ class Handler(BaseHTTPRequestHandler):
                 patch = "*** Begin Patch\n*** Add File: hello-%s.txt\n+hello\n*** End Patch\n" % label
                 item = {"type": "custom_tool_call", "call_id": "call_%d" % n, "name": "apply_patch", "input": patch}
             elif kind == "PATCHPROT":
-                patch = "*** Begin Patch\n*** Add File: /home/dev/.lunchroom/planted-%s.txt\n+planted\n*** End Patch\n" % label
+                # 1.1, spec section 17 item 5: a write to /var/lib/lunchroom is DENIED (1.0.x protected ~/.lunchroom).
+                patch = "*** Begin Patch\n*** Add File: /var/lib/lunchroom/planted-%s.txt\n+planted\n*** End Patch\n" % label
                 item = {"type": "custom_tool_call", "call_id": "call_%d" % n, "name": "apply_patch", "input": patch}
             else:
                 cmd = "codex queue other hi" if kind == "DENYTEST" else "touch /tmp/control-ran-%s && ls /opt/proof" % label

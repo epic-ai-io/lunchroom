@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """Runs a command on a real pseudo-terminal and types secrets into its prompts.
 
-    ptyrun.py --log FILE [--auto 'REGEX::SECRETFILE'] ... [--keys FIFO] [--ready FILE]
-              [--owner UID] [--timeout SECONDS] -- COMMAND [ARGUMENT ...]
+    ptyrun.py --log FILE [--auto 'REGEX::SECRETFILE'] ... [--keys FIFO [--raw-keys]] [--ready FILE]
+              [--owner UID] [--size ROWSxCOLS] [--timeout SECONDS] -- COMMAND [ARGUMENT ...]
 
 The command runs with the slave side of a new pseudo-terminal as its controlling terminal. Output
 is appended to FILE as it arrives. Each --auto rule waits for REGEX in the output after the
 previous match, waits half a second (so the program has hidden the typed characters), and types
-the contents of SECRETFILE and a newline: an empty file types just the newline. A secret is read
+the contents of SECRETFILE and Enter, a carriage return as a terminal's Enter key sends it (a
+prompt in cooked mode reads it as a newline; the console's own prompt, in raw mode, reads only a
+carriage return as Enter): an empty file types just Enter. A secret is read
 from a file, never taken from the command line or the environment, so it is in no process's
 argument list or environment. With --keys, lines written to the FIFO are typed too (the console is
 driven that way). --ready names a file that gets the child's pid and the slave's path. --owner
-gives the slave to that user id, as a terminal a person opened is theirs. Exit status: the
-command's, or 124 when --timeout passes.
+gives the slave to that user id, as a terminal a person opened is theirs.
+
+1.1 (spec section 17 item 10, the Ratatui screen): --size sets the terminal's window (rows x
+columns) before the command starts, since the console draws to the window it finds; --raw-keys
+types the FIFO's bytes exactly as written, with no Enter added, so a proof can press a single key
+(`a`, Esc, an arrow) or send a mouse click as its escape sequence. Without --raw-keys each line
+written to the FIFO is typed with an Enter after it, as before.
+
+Exit status: the command's, or 124 when --timeout passes.
 """
 
 import argparse
@@ -21,6 +30,7 @@ import os
 import re
 import select
 import signal
+import struct
 import sys
 import termios
 import time
@@ -33,6 +43,8 @@ def main() -> int:
     ap.add_argument("--keys")
     ap.add_argument("--ready")
     ap.add_argument("--owner", type=int)
+    ap.add_argument("--size", help="ROWSxCOLS, the terminal window size")
+    ap.add_argument("--raw-keys", action="store_true", help="type the FIFO's bytes as written")
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -52,6 +64,9 @@ def main() -> int:
     slave = os.ttyname(slave_fd)
     if args.owner is not None:
         os.chown(slave, args.owner, -1)
+    if args.size:
+        rows, _, cols = args.size.partition("x")
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", int(rows), int(cols), 0, 0))
     pid = os.fork()
     if pid == 0:
         os.close(master)
@@ -69,7 +84,8 @@ def main() -> int:
 
     keys = None
     if args.keys:
-        keys = os.open(args.keys, os.O_RDONLY | os.O_NONBLOCK)
+        # O_RDWR keeps the FIFO open with no writer, so a reader never sees end-of-file.
+        keys = os.open(args.keys, os.O_RDWR | os.O_NONBLOCK)
     log = open(args.log, "ab", buffering=0)
     seen = ""
     start = 0
@@ -99,7 +115,7 @@ def main() -> int:
                     time.sleep(0.5)
                     with open(secret_file, "rb") as f:
                         secret = f.read().rstrip(b"\n")
-                    os.write(master, secret + b"\n")
+                    os.write(master, secret + b"\r")
                     start = m.end()
                     del secret
                     break
@@ -108,6 +124,10 @@ def main() -> int:
                 chunk = os.read(keys, 4096)
             except BlockingIOError:
                 chunk = b""
+            if args.raw_keys:
+                if chunk:
+                    os.write(master, chunk)
+                continue
             typed += chunk
             while b"\n" in typed:
                 line, _, rest = bytes(typed).partition(b"\n")

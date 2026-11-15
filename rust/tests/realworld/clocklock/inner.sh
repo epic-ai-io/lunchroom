@@ -15,9 +15,10 @@
 set -u
 . /opt/proof/lib.sh
 
-LR=$DEVHOME/.lunchroom/bin/lunchroom
-STATE=$DEVHOME/.lunchroom/store/state.json
-FLOCK=$DEVHOME/.lunchroom/store/state.flock
+# 1.1, section 17 item 2: the program is $LR (lib.sh), /usr/local/lib/lunchroom/lunchroom, setgid
+# lunchroom, and the store is /var/lib/lunchroom/<uid>/store, which dev cannot enter. The proof's
+# own reads and plants of the store and its lock run as root, the container's stand-in for the
+# setgid program; dev reaches the store only through the program.
 
 heading "facts of this system"
 echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
@@ -29,7 +30,15 @@ measured "this container's effective capabilities: 0x$CAPEFF; CAP_SYS_TIME (bit 
 
 make_user
 install_lunchroom
-[ -x "$LR" ] && pass "lunchroom install claude-code finished" || { fail "lunchroom install did not finish"; finish; }
+lr_installed && pass "lunchroom install claude-code finished" || { fail "lunchroom install did not finish"; finish; }
+STATE=$(store_state)
+FLOCK=$(store_dir)/state.flock
+# The wall (item 2): a process of dev cannot list, read or write the store; the program reaches it.
+as_dev "ls $(dirname "$(store_dir)")" >/dev/null 2>&1 && fail "dev can list the store folder" || pass "dev cannot list the store folder (item 2)"
+as_dev "cat $STATE" >/dev/null 2>&1 && fail "dev can read the store" || pass "dev cannot read the store (item 2)"
+as_dev "echo x >> $STATE" >/dev/null 2>&1 && fail "dev can write the store" || pass "dev cannot write the store (item 2)"
+[ -f "$STATE" ] && pass "the store file exists, so those refusals are not for a missing file" || fail "no store file at $STATE"
+as_dev "$LR" status >/dev/null 2>&1 && pass "dev's lunchroom status reads the store through the program" || fail "dev's lunchroom status failed"
 mkdir -p "$DEVHOME/proof-plugin"
 echo "const PROGRAM = \"$LR\";" > "$DEVHOME/proof-plugin/index.mjs"
 chown -R dev "$DEVHOME/proof-plugin"
@@ -58,17 +67,17 @@ as_dev env "$PLUGIN_ENV" sh -c "python3 /opt/proof/hook.py prompt S1 hello --typ
 sed 's/^/    /' "$SESS/send.out"
 MSG=$(python3 -c 'import json; print(next(iter(json.load(open("'"$STATE"'"))["messages"]), ""))')
 [ -n "$MSG" ] && pass "a message exists in the store: $MSG" || { fail "no message was queued"; finish; }
-as_dev python3 /opt/proof/msg.py "$STATE" "$MSG" | sed 's/^/    /'
+python3 /opt/proof/msg.py "$STATE" "$MSG" | sed 's/^/    /'
 
 heading "2. stamps from a clock that stepped back (D1.4 item 4)"
 # case REL HANDED EXPECT WHY: plant presented_at = now+REL, run one check (`lunchroom status`),
 # and read the message's failed_attempts.
 case_run() {
     local rel=$1 handed=$2 expect=$3 why=$4 got
-    as_dev python3 /opt/proof/msg.py "$STATE" "$MSG" plant "$rel" "$handed" >/dev/null
+    python3 /opt/proof/msg.py "$STATE" "$MSG" plant "$rel" "$handed" >/dev/null
     as_dev "$LR" status >/dev/null 2>&1
-    got=$(as_dev python3 /opt/proof/msg.py "$STATE" "$MSG" | grep -o '"failed_attempts": [0-9]*' | cut -d' ' -f2)
-    measured "planted presented_at=now($rel s) handed_over=$handed -> after one check: failed_attempts=$got ($(as_dev python3 /opt/proof/msg.py "$STATE" "$MSG"))"
+    got=$(python3 /opt/proof/msg.py "$STATE" "$MSG" | grep -o '"failed_attempts": [0-9]*' | cut -d' ' -f2)
+    measured "planted presented_at=now($rel s) handed_over=$handed -> after one check: failed_attempts=$got ($(python3 /opt/proof/msg.py "$STATE" "$MSG"))"
     if [ "$got" = "$expect" ]; then
         pass "$why: failed_attempts = $expect"
     else
@@ -85,9 +94,11 @@ case_run +3600 0 1 "an offer stamped 1 hour ahead (the clock stepped back an hou
 case_run +3600 1 1 "a hand-over stamped 1 hour ahead: it has run out"
 
 heading "3. the store lock held by another process (LOCK_WAIT 10 s)"
-as_dev env "$PLUGIN_ENV" sh -c "python3 /opt/proof/hold.py $FLOCK 75 $SESS/held >/dev/null 2>&1 &"
+# 1.1: dev cannot open the lock file (section 17 item 2), so the holder, which stands for another
+# Lunchroom process that never lets go, runs as root.
+python3 /opt/proof/hold.py "$FLOCK" 75 "$SESS/held" >/dev/null 2>&1 &
 n=0; until [ -e "$SESS/held" ] || [ $n -ge 20 ]; do sleep 0.25; n=$((n + 1)); done
-[ -e "$SESS/held" ] && pass "a process of dev holds $FLOCK (exclusive flock) for 75 s" || { fail "the lock holder did not start"; finish; }
+[ -e "$SESS/held" ] && pass "a Lunchroom process stand-in holds $FLOCK (exclusive flock) for 75 s" || { fail "the lock holder did not start"; finish; }
 
 start=$(date +%s%N)
 as_dev "$LR" status > "$RUN/busy.out" 2>&1
@@ -129,9 +140,9 @@ measured "the user's typed prompt: exit $GUARD_CODE after ${GUARD_SECS} ms"
     || fail "the user's prompt was blocked with the store held (exit $GUARD_CODE)"
 
 heading "5. after the lock is let go"
-pkill -u dev -f "hold.py" 2>/dev/null
-n=0; while pgrep -u dev -f "hold.py" >/dev/null && [ $n -lt 20 ]; do sleep 0.25; n=$((n + 1)); done
-pgrep -u dev -f "hold.py" >/dev/null && fail "the lock holder is still running" || pass "the lock holder has ended"
+pkill -f "hold.py" 2>/dev/null
+n=0; while pgrep -f "hold.py" >/dev/null && [ $n -lt 20 ]; do sleep 0.25; n=$((n + 1)); done
+pgrep -f "hold.py" >/dev/null && fail "the lock holder is still running" || pass "the lock holder has ended"
 start=$(date +%s%N)
 as_dev "$LR" status > "$RUN/free.out" 2>&1
 code=$?
@@ -186,7 +197,7 @@ measured "hold mode in effect: $HOLDMODE"
 { [ "$HOLDMODE" = Balanced ] && [ "$GUARD_CODE" -eq 0 ] && ! echo "$GUARD_OUT" | grep -q '"permissionDecision":"ask"'; } \
     && pass "P1.6 Balanced (the hold mode in effect): a HELD agent's exec 'cat /etc/hostname' is not PROTECTED, so it runs" \
     || fail "P1.6 Balanced: the HELD agent's exec 'cat /etc/hostname' did not run (mode '$HOLDMODE', exit $GUARD_CODE)"
-as_dev sh -c "echo 'this is not json' > $STATE; echo 'this is not json either' > $STATE.prev"
+sh -c "echo 'this is not json' > $STATE; echo 'this is not json either' > $STATE.prev"
 guard_call pretool H0 "ls /home/dev"
 measured "unusable store, 'ls /home/dev' (a folder that holds Lunchroom's own): exit $GUARD_CODE after ${GUARD_SECS} ms: $(echo "$GUARD_OUT" | head -c 250 | tr '\n' ' ')"
 guard_call readtool H1 "/etc/hostname"
@@ -211,6 +222,6 @@ cat "$RUN/state.good" > "$STATE"
 [ -f "$RUN/state.prev.good" ] && cat "$RUN/state.prev.good" > "$STATE.prev"
 as_dev "$LR" status > "$RUN/restored.out" 2>&1 && pass "with the state file put back, status works again" \
     || { fail "status fails after the state file was put back; its output follows"; sed 's/^/    /' "$RUN/restored.out" | head -12
-         ls -l "$DEVHOME/.lunchroom/store/" | sed 's/^/    /'; }
+         ls -l "$(store_dir)/" | sed 's/^/    /'; }
 
 finish

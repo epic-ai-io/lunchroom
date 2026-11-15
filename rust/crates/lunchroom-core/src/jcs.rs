@@ -28,7 +28,14 @@ pub fn shown(value: &Value) -> String {
     canonical(value)
         .chars()
         .map(|c| {
-            if matches!(c, '\u{7f}'..='\u{9f}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+            if matches!(c, '\u{7f}'..='\u{9f}'
+                    | '\u{ad}'
+                    | '\u{61c}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2069}'
+                    | '\u{feff}'
+            ) {
                 format!("\\u{{{:04x}}}", u32::from(c))
             } else {
                 c.to_string()
@@ -40,12 +47,44 @@ pub fn shown(value: &Value) -> String {
 /// SHA-256 of `value`'s canonical form, in lower-case hex (A2.1).
 #[must_use]
 pub fn input_hash(value: &Value) -> String {
-    let digest = Sha256::digest(canonical(value).as_bytes());
+    sha256_hex(canonical(value).as_bytes())
+}
+
+/// SHA-256 of `bytes`, in lower-case hex.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(64);
     for byte in digest {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+/// SHA-256 of everything `reader` yields, in lower-case hex, read in blocks (a file is never held
+/// whole in memory).
+///
+/// # Errors
+/// What the reader fails with.
+pub fn sha256_hex_of(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut block = vec![0u8; 64 * 1024];
+    loop {
+        let n = match reader.read(&mut block) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            break;
+        }
+        hasher.update(&block[..n]);
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
 }
 
 fn write_value(value: &Value, out: &mut String) {

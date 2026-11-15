@@ -321,12 +321,36 @@ fn f1_ac46_a_rewrite_through_the_store_keeps_later_records_of_a_message() {
     let mut v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     v["schema"] = json!(SCHEMA + 1);
     v["messages"][id.as_str()]["future_message"] = json!("kept");
-    v["messages"][id.as_str()]["told"]["future_told"] = json!([1, 2]);
     assert!(std::fs::write(&file, v.to_string()).is_ok());
+    // `told` is a field 1.0.1 has no name for, so this build keeps it in the second file
+    // (mail/side.rs); a later version's field inside it is planted where it is kept.
+    let side_file = dir.join("state.side.json");
+    let side_text = std::fs::read_to_string(&side_file).unwrap_or_default();
+    let mut side_v: Value = serde_json::from_str(&side_text).unwrap_or(Value::Null);
+    assert!(
+        side_v["messages"][id.as_str()]["told"].is_object(),
+        "{side_v}"
+    );
+    side_v["messages"][id.as_str()]["told"]["future_told"] = json!([1, 2]);
+    assert!(std::fs::write(&side_file, side_v.to_string()).is_ok());
     assert!(store.update(|m| m.observe(&claude("c9"))).is_ok());
     let raw = std::fs::read_to_string(&file).unwrap_or_default();
     let raw: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    let message = &raw["messages"][id.as_str()];
+    // D1.2 (mail/side.rs `split_map(.., "messages", &MESSAGE)`): every message field 1.0.1 has no
+    // name for (`future_message`, and `told`, which holds `future_told`) is kept in the second
+    // file, `state.side.json`, under `messages.<id>`, not in `state.json`. The record is read as
+    // 1.1 keeps it: the state file's message with the second file's fields put back.
+    let side = std::fs::read_to_string(dir.join("state.side.json")).unwrap_or_default();
+    let side: Value = serde_json::from_str(&side).unwrap_or(Value::Null);
+    let mut message = raw["messages"][id.as_str()].clone();
+    if let (Some(fields), Some(message)) = (
+        side["messages"][id.as_str()].as_object(),
+        message.as_object_mut(),
+    ) {
+        for (name, value) in fields {
+            message.insert(name.clone(), value.clone());
+        }
+    }
     assert_eq!(message["future_message"], json!("kept"));
     assert_eq!(message["told"]["future_told"], json!([1, 2]));
     assert_eq!(raw["schema"], json!(SCHEMA));

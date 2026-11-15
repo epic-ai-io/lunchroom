@@ -1,6 +1,6 @@
 #!/bin/bash
 # Proof 13 (headless), inside the container: the real Claude Code (Anthropic's apt package), Lunchroom
-# 1.1.0 installed by `lunchroom install claude-code`, the API answered by mockapi.py. Three spellings of
+# 1.1 installed by `lunchroom install claude-code`, the API answered by mockapi.py. Three spellings of
 # a headless run are each run twice with a 120 s timeout:
 #   p      claude -p "say hi"
 #   json   claude -p "say hi" --output-format json
@@ -22,7 +22,8 @@ make_user
 export MOCK_API=1
 seed_claude
 install_lunchroom
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install claude-code finished" || { fail "install did not finish"; finish; }
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install claude-code finished" || { fail "install did not finish"; finish; }
 python3 - "$DEVHOME/.claude/settings.json" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))

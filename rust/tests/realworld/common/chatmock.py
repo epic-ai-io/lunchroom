@@ -91,7 +91,9 @@ class Handler(BaseHTTPRequestHandler):
                 # PATCHLINK: a path inside the workspace that is a symlink to a file of Lunchroom's
                 # store (link-file.json); PATCHLINKDIR: a new file under a symlink to its folder (link-dir).
                 path = {"PATCHTEST": "hello-%s.txt" % label,
-                        "PATCHPROT": "/home/dev/.lunchroom/planted-%s.txt" % label,
+                        # 1.1, spec section 17 item 5: a write to /var/lib/lunchroom (the store's
+                        # folder) is DENIED; 1.0.x protected ~/.lunchroom.
+                        "PATCHPROT": "/var/lib/lunchroom/planted-%s.txt" % label,
                         "PATCHLINK": "link-file.json",
                         "PATCHLINKDIR": "link-dir/planted-%s.txt" % label,
                         "PATCHWSUPD": "ws-link", "PATCHWSADD": "ws-dir/new.txt"}[kind]

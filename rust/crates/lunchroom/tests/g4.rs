@@ -370,9 +370,10 @@ fn a_transcript_read_the_deadline_cut_off_holds_the_session() {
     assert_eq!(held(&sb, "s9"), Some(false));
 }
 
-// G4-13: a read the deadline cuts off is not repeated by the next call. The first hook that sees
-// the session marks its transcript searched before it reads it, so the second hook on the same
-// stalled transcript decides at once instead of stalling again.
+// G4-13, T1.7 (§5::32): the next hook goes on from the offset kept, so it reads the transcript
+// again; a read the deadline cut off is kept as unreported, and the next hook's read of that
+// transcript is limited to 2 seconds, so a stalled transcript does not cost every hook the guard's
+// whole 10 seconds.
 #[test]
 fn a_transcript_read_that_was_cut_off_is_not_repeated() {
     let sb = sandbox();

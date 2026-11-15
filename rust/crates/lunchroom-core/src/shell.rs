@@ -8,6 +8,7 @@
 
 /// One word of a command, after quotes and escapes are removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent facts about one word
 pub struct Word {
     /// The word's text.
     pub text: String,
@@ -15,6 +16,11 @@ pub struct Word {
     pub glob: bool,
     /// It names a redirection's target (`> file`), not an argument.
     pub redirect: bool,
+    /// It names the target of a redirection that opens the file for writing (`>`, `>>`, `>|`,
+    /// `&>`, `<>`); `false` for `<` and `<<<` and for any word that is not a target.
+    pub write: bool,
+    /// The redirection appends (`>>`, `&>>`): the file's text before is kept.
+    pub append: bool,
 }
 
 /// One simple command: its words in order, redirection targets included.
@@ -61,6 +67,7 @@ pub fn single(text: &str, home: &str) -> Option<Command> {
     lx.cmds.pop()
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent facts about the text read so far
 struct Lexer<'a> {
     s: Vec<char>,
     i: usize,
@@ -73,6 +80,8 @@ struct Lexer<'a> {
     continued: bool,
     /// The text has a separator or a redirection.
     joined: bool,
+    /// The redirection being read appends.
+    append: bool,
 }
 
 fn is_blank(c: char) -> bool {
@@ -104,6 +113,7 @@ impl<'a> Lexer<'a> {
             named: false,
             continued: false,
             joined: false,
+            append: false,
         }
     }
 
@@ -148,9 +158,10 @@ impl<'a> Lexer<'a> {
                 }
                 '&' if self.at(1) == Some('&') => self.separator(2, true)?,
                 '&' if self.at(1) == Some('>') => {
-                    self.i += if self.at(2) == Some('>') { 3 } else { 2 };
+                    self.append = self.at(2) == Some('>');
+                    self.i += if self.append { 3 } else { 2 };
                     self.joined = true;
-                    self.target()?;
+                    self.target(true)?;
                 }
                 '&' => self.separator(1, false)?,
                 '|' if matches!(self.at(1), Some('|' | '&')) => self.separator(2, true)?,
@@ -198,7 +209,7 @@ impl<'a> Lexer<'a> {
             ('<', Some('<')) => {
                 if self.at(2) == Some('<') {
                     self.i += 3;
-                    self.target()
+                    self.target(false)
                 } else {
                     None // a heredoc: its body is not a command the guard can read
                 }
@@ -211,27 +222,31 @@ impl<'a> Lexer<'a> {
                     }
                     Some(())
                 } else {
-                    self.target()
+                    self.target(c == '>')
                 }
             }
             ('>', Some('>' | '|')) | ('<', Some('>')) => {
+                self.append = c == '>' && self.at(1) == Some('>');
                 self.i += 2;
-                self.target()
+                self.target(true)
             }
             _ => {
                 self.i += 1;
-                self.target()
+                self.target(c == '>')
             }
         }
     }
 
-    /// The word a redirection names; it is kept with the command's words.
-    fn target(&mut self) -> Option<()> {
+    /// The word a redirection names; it is kept with the command's words. `write`: the file is
+    /// opened for writing (`>`, `>>`, `>|`, `&>`, `<>`), not only read (`<`, `<<<`).
+    fn target(&mut self, write: bool) -> Option<()> {
         self.skip_blanks();
         match self.peek() {
             Some(c) if !ends_word(c) => {
                 let (mut w, _) = self.word()?;
                 w.redirect = true;
+                w.write = write;
+                w.append = std::mem::take(&mut self.append);
                 self.cur.words.push(w);
                 self.continued = false;
                 Some(())
@@ -331,6 +346,8 @@ impl<'a> Lexer<'a> {
             text,
             glob,
             redirect: false,
+            write: false,
+            append: false,
         };
         Some((word, quoted))
     }

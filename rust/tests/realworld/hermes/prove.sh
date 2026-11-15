@@ -1,7 +1,7 @@
 #!/bin/bash
 # Proof 9 (hermes): the real Hermes Agent, Lunchroom's plugin loaded in it, and real tool calls.
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/hermes/prove.sh | tee hermes.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/hermes/prove.sh | tee hermes.txt
 #
 # Needs podman and network access (docker.io python:3.14, github.com, PyPI).
 

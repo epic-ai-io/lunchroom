@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proof 8, inside the container: the real OpenClaw gateway 2026.10.7 (npm), Lunchroom 1.1.0 installed
+# Proof 8, inside the container: the real OpenClaw gateway 2026.10.7 (npm), Lunchroom 1.1 installed
 # for it with `lunchroom install openclaw`, the plugin installed and enabled the way the install
 # tells the user (`openclaw plugins install --link ... --force`, `plugins enable`, `config set ...
 # allowConversationAccess true`), and the model's API answered by chatmock.py so that a typed turn
@@ -25,7 +25,8 @@ export MOCK_LOG="$SESS/mock.log"
 SHELL_TOOL=exec SHELL_ARG=command python3 "$PROOF/chatmock.py" &
 sleep 1
 install_lunchroom openclaw
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install openclaw finished" \
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install openclaw finished" \
     || { fail "lunchroom install openclaw did not finish"; finish; }
 
 OC=(as_dev env OPENCLAW_GATEWAY_TOKEN=proof-token openclaw)
@@ -89,17 +90,33 @@ case "$C" in *lib.sh*) pass "the control call ran (its output lists /opt/proof)"
     *) fail "the control call did not run: '${C:-nothing}'" ;; esac
 turn agent:main:alpha "PATCHPROT p1" >/dev/null
 P=$(await_result PATCHPROT p1)
-echo "MEASURED apply_patch of ~/.lunchroom/planted-p1.txt: the model was given back: $(echo "$P" | head -c 700)"
+# 1.1, spec section 17 item 5: a write to /var/lib/lunchroom is DENIED (1.0.x protected ~/.lunchroom).
+echo "MEASURED apply_patch of /var/lib/lunchroom/planted-p1.txt: the model was given back: $(echo "$P" | head -c 700)"
 grep apply_patch_schema "$MOCK_LOG.requests" | head -1 | cut -c1-400 | sed 's/^/MEASURED the harness own apply_patch schema: /'
 case "$P" in *"Lunchroom: DENIED"*) pass "an apply_patch into Lunchroom's own folder is DENIED by Lunchroom ('Lunchroom: DENIED' reached the model)" ;;
     "") fail "no result for the apply_patch into Lunchroom's folder" ;; *) fail "the apply_patch into Lunchroom's folder was not denied: $P" ;; esac
-[ -e "$DEVHOME/.lunchroom/planted-p1.txt" ] && fail "the file ~/.lunchroom/planted-p1.txt was created" \
-    || pass "the file ~/.lunchroom/planted-p1.txt does not exist"
+[ -e /var/lib/lunchroom/planted-p1.txt ] && fail "the file /var/lib/lunchroom/planted-p1.txt was created" \
+    || pass "the file /var/lib/lunchroom/planted-p1.txt does not exist"
 turn agent:main:alpha "PATCHTEST p2" >/dev/null
 Q=$(await_result PATCHTEST p2)
 measured "apply_patch of hello-p2.txt: the model was given back: $(echo "$Q" | head -c 300)"
 case "$Q" in *DENIED*) fail "an ordinary apply_patch was DENIED: $Q" ;; "") fail "no result for the ordinary apply_patch" ;;
     *) pass "an ordinary apply_patch was not stopped by the guard" ;; esac
+
+heading "2b. the plugin with Lunchroom's program gone: the call is not run (1.1, spec section 13 item 5, H1.5)"
+# "The OpenClaw and Hermes plugins treat a guard program that is missing or fails as a guard that could
+# not decide: the call goes to the user, or is DENIED where nobody can be asked." The program is moved
+# aside, then put back.
+mv "$LR" "$LR.gone"
+turn agent:main:alpha "CONTROLTEST c2" >/dev/null
+F=$(await_result CONTROLTEST c2)
+mv "$LR.gone" "$LR"
+measured "the shell tool with the program gone: the model was given back: $(echo "$F" | head -c 400)"
+case "$F" in
+    *lib.sh*) fail "the control call RAN with Lunchroom's program gone: the plugin failed open" ;;
+    "") fail "no result came back for the call made with the program gone" ;;
+    *) pass "the control call did not run with Lunchroom's program gone (the plugin did not fail open)" ;;
+esac
 
 heading "3. what the plugin left in the gateway's log"
 grep -i "lunchroom" "$SESS/gateway.log" | tail -8 | cut -c1-240 | sed 's/^/    /'

@@ -209,6 +209,10 @@ impl Env {
             self.lunchroom_home.join("bin")
         };
         layout.lunchroom_home.clone_from(&self.lunchroom_home);
+        layout.lunchroom_ids = lunchroom_ids(
+            &std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
+            &std::fs::read_to_string("/etc/group").unwrap_or_default(),
+        );
         if let Ok(exe) = std::env::current_exe() {
             layout.programs.push(exe);
         }
@@ -216,6 +220,25 @@ impl Env {
         self.console_wall_facts(&mut layout);
         layout
     }
+}
+
+/// The numeric user id and group id of the system user and group `lunchroom`, from the text of
+/// `/etc/passwd` and `/etc/group` (§17.5: `sudo -u '#998'` runs as the user as `sudo -u lunchroom`
+/// does, so the classifier must know the numbers). Empty where the system has neither.
+pub(crate) fn lunchroom_ids(passwd: &str, group: &str) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::new();
+    for id in [
+        setgid::uid_from_passwd(passwd, setgid::SYSTEM_USER),
+        setgid::gid_from_group(group, setgid::SYSTEM_USER),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 /// The variables that move a harness's folder or configuration away from its usual place.
@@ -302,9 +325,16 @@ impl Locations {
 
     /// The location variables in process `pid`'s starting environment, and its `--settings`.
     fn read_process(&mut self, pid: u32, env: &Env) {
-        let base =
-            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|_| PathBuf::from("/"));
-        if let Ok(raw) = std::fs::read(format!("/proc/{pid}/environ")) {
+        // As the user's own group: a setgid program cannot read another process's cwd link or
+        // environ (`lunchroom_core::setgid::as_own_group`).
+        let (base, environ) = lunchroom_core::setgid::as_own_group(|| {
+            (
+                std::fs::read_link(format!("/proc/{pid}/cwd")),
+                std::fs::read(format!("/proc/{pid}/environ")),
+            )
+        });
+        let base = base.unwrap_or_else(|_| PathBuf::from("/"));
+        if let Ok(raw) = environ {
             for kv in raw.split(|b| *b == 0) {
                 let kv = String::from_utf8_lossy(kv);
                 if let Some((name, value)) = kv.split_once('=')
@@ -442,4 +472,76 @@ fn dotenv(file: &Path, key: &str) -> Option<String> {
                 .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_owned())
         })
         .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PATH_VARS;
+
+    /// The names `Env::from_process` reads through its `var` closure, from its own source.
+    fn names_read_through_var() -> Vec<String> {
+        let source = include_str!("home.rs");
+        let start = source.find("pub fn from_process").unwrap_or(0);
+        let end = source[start..]
+            .find("pub fn for_console")
+            .map_or(source.len(), |e| start + e);
+        let body = &source[start..end];
+        let mut names = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find("var(\"") {
+            let after = &rest[at + 5..];
+            if let Some(close) = after.find('"') {
+                // `env_var(` is the closure that ignores the mode: it must not be called by name.
+                let before = &rest[..at];
+                if !before.ends_with("env_") {
+                    names.push(after[..close].to_owned());
+                }
+            }
+            rest = &rest[at + 5..];
+        }
+        names
+    }
+
+    // F2-AC5: "Lunchroom shall ignore `LUNCHROOM_HOME` and every other variable that sets a path".
+    // `from_process` blanks exactly the variables in PATH_VARS in setgid mode, so each variable
+    // that sets a path (the folder of the user, of Lunchroom, of Codex, of Hermes, of Claude Code)
+    // must be in it. A real setgid process cannot be made here; this is the list the mode reads.
+    #[test]
+    fn every_variable_that_sets_a_path_is_blanked_in_setgid_mode() {
+        for name in [
+            "HOME",
+            "LUNCHROOM_HOME",
+            "CODEX_HOME",
+            "HERMES_HOME",
+            "CLAUDE_CONFIG_DIR",
+        ] {
+            assert!(PATH_VARS.contains(&name), "{name} is not in PATH_VARS");
+        }
+    }
+
+    // F2-AC5: no variable is read for a path that is not in PATH_VARS. Every name `from_process`
+    // reads is either in PATH_VARS or one of the named variables that hold an id, a number or a
+    // name (not a path); a new variable read for a path fails here until it is added to PATH_VARS.
+    #[test]
+    fn from_process_reads_no_other_variable_that_could_set_a_path() {
+        let ids = [
+            "CLAUDE_PID",
+            "CLAUDE_CODE_SESSION_ATTENDED",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "HERMES_SESSION_ID",
+            "LUNCHROOM_SESSION",
+        ];
+        let names = names_read_through_var();
+        assert!(names.len() >= 12, "the scan found too little: {names:?}");
+        for name in &names {
+            assert!(
+                PATH_VARS.contains(&name.as_str()) || ids.contains(&name.as_str()),
+                "{name} is read by from_process and is neither blanked in setgid mode nor a known id"
+            );
+        }
+        // The HOME of a setgid process comes from the account database, never the variable.
+        assert!(names.iter().any(|n| n == "HOME"));
+    }
 }

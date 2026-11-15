@@ -1,8 +1,8 @@
 #!/bin/bash
 # Proof 1 (packages): Claude Code from Anthropic's real apt, dnf and apk repositories, a real
-# session running /usr/bin/claude, and what Lunchroom 1.1.0 says about it.
+# session running /usr/bin/claude, and what Lunchroom 1.1 says about it.
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/packages/prove.sh | tee packages.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/packages/prove.sh | tee packages.txt
 #
 # Needs podman, network access to downloads.claude.ai, and 2 GB free on /. Prints PASS, FAIL or
 # MEASURED for each check; exits non-zero on any FAIL.

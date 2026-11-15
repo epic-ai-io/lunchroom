@@ -22,6 +22,7 @@ mkdir -p "$SESS" "$SESS/hooks"
 chmod 777 "$SESS" "$SESS/hooks"
 mkdir -p "$DEVHOME/.codex"
 BASECONF='model = "gpt-5.5"
+check_for_update_on_startup = false
 model_provider = "mock"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
@@ -37,10 +38,15 @@ chown -R dev "$DEVHOME/.codex"
 MOCK_LOG="$SESS/mock.log" python3 "$PROOF/codexmock.py" &
 sleep 1
 install_lunchroom codex
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install codex finished" || { fail "install did not finish"; finish; }
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install codex finished" || { fail "install did not finish"; finish; }
 cp "$DEVHOME/.codex/hooks.json" "$RUN/hooks.base.json"
 cp "$DEVHOME/.codex/config.toml" "$RUN/config.after-install.toml"
 measured "config.toml after the install (features): $(grep -A2 '^\[features\]' "$DEVHOME/.codex/config.toml" | tr '\n' ' ')"
+# 1.1, spec section 13 (H1.4): the install also sets web_search = "disabled" at the top of config.toml.
+grep -q '^web_search *= *"disabled"' "$DEVHOME/.codex/config.toml" \
+    && pass "config.toml holds web_search = \"disabled\" after the install (H1.4)" \
+    || fail "config.toml does not hold web_search = \"disabled\" after the install"
 cp /opt/proof/tee-wrap.sh /usr/local/bin/tee-wrap.sh
 cp /opt/proof/tee-hook.sh /usr/local/bin/tee-hook.sh
 chmod 755 /usr/local/bin/tee-wrap.sh /usr/local/bin/tee-hook.sh

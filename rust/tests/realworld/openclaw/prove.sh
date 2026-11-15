@@ -1,7 +1,7 @@
 #!/bin/bash
 # Proof 8 (openclaw): the real OpenClaw gateway, Lunchroom's plugin loaded in it, and real tool calls.
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/openclaw/prove.sh | tee openclaw.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/openclaw/prove.sh | tee openclaw.txt
 #
 # Needs podman and network access (docker.io node:24, the npm registry).
 

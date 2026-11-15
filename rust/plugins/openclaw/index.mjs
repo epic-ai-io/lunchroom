@@ -19,7 +19,8 @@ import { fileURLToPath } from "node:url";
 const PROGRAM = "__LUNCHROOM_PROGRAM__";
 // The guard answers within its own 10-second deadline (H1.5); this limit is reached only when the
 // system stops the guard before it answers.
-const DEADLINE_MS = 12000;
+// A holder, so a test can shorten it.
+export const timing = { deadlineMs: 12000, killAfterMs: 1000 };
 const PLUGIN_FILE = fileURLToPath(import.meta.url);
 
 // OpenClaw's own version (H1.2): the `openclaw` package's package.json above the gateway's entry
@@ -74,8 +75,17 @@ export function runGuard(mode, input, program = PROGRAM) {
     const child = spawn(program, mode, { stdio: ["pipe", "pipe", "pipe"] });
     timer = setTimeout(() => {
       child.kill("SIGTERM");
+      // A guard that ignores SIGTERM is stopped for good a little later.
+      const hard = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }, timing.killAfterMs);
+      hard.unref();
       finish({ failed: "no answer in time" });
-    }, DEADLINE_MS);
+    }, timing.deadlineMs);
     child.stdout.setEncoding("utf8").on("data", (d) => { stdout += d; });
     child.stderr.setEncoding("utf8").on("data", (d) => { stderr += d; });
     child.stdin.on("error", () => {});
@@ -93,7 +103,19 @@ export function runGuard(mode, input, program = PROGRAM) {
 // The session this event belongs to: OpenClaw's session key, which `openclaw agent
 // --session-key` names when Lunchroom delivers to it.
 export function sessionOf(ctx) {
-  return (ctx && ctx.sessionKey) || "";
+  // Only a text key names a session; any other type is no session.
+  return ctx && typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
+}
+
+// The run id of a context, as text; any other type is no run.
+export function runOf(ctx) {
+  return ctx && typeof ctx.runId === "string" ? ctx.runId : "";
+}
+
+// A context field as trimmed text; absent is "", any other type is a value no rule accepts.
+function field(value) {
+  if (value === undefined || value === null) return "";
+  return typeof value === "string" ? value.trim() : "\u0000not text";
 }
 
 // The guard's answer; `null` when its output cannot be read, which is a guard that could not
@@ -115,8 +137,10 @@ function decision(stdout) {
 export const surfaces = new Map();
 
 export function personCanAnswer(ctx) {
-  const trigger = ((ctx && ctx.trigger) || "").trim();
-  const channel = ((ctx && (ctx.channel || ctx.channelId || ctx.messageProvider)) || "").trim();
+  const trigger = field(ctx && ctx.trigger);
+  // The first of the three fields that holds text names the channel; one of another type is none.
+  const named = ctx ? [ctx.channel, ctx.channelId, ctx.messageProvider].find((v) => typeof v === "string" && v.trim() !== "") : "";
+  const channel = field(named);
   return (trigger === "" || trigger === "user") && channel !== "";
 }
 
@@ -129,13 +153,48 @@ const NO_RECORD_DENY =
   /\b(lunchroom|hermes|codex|claude|opencode|openclaw|acp|sessions_send|CLAUDE_CODE_SESSION_ID|CODEX_THREAD_ID|HERMES_SESSION_ID|LUNCHROOM_SESSION|LUNCHROOM_HOME)\b|\/api\/sessions\//i;
 const FENCED_TOOLS = ["sessions_send", "openclaw", "acp"];
 
+// Backslash-n, -t and -r as a space, and backslash-uXXXX as its character: the text a shell or a
+// JSON string inside a string would read.
+function unescapeText(text) {
+  return text.replace(/\\(?:([ntr])|u([0-9a-fA-F]{4}))/g, (_, sep, hex) => (sep ? " " : String.fromCharCode(parseInt(hex, 16))));
+}
+
+// Every string in a call's input, keys and values, at any depth; other values as text. Input nested
+// too deeply, or cyclic, throws: it cannot be shown free of the rules.
+function collectStrings(value, out, depth) {
+  if (depth > 64) throw new Error("input nested too deeply to read");
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out, depth + 1);
+  else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      out.push(key);
+      collectStrings(item, out, depth + 1);
+    }
+  } else if (value !== undefined && value !== null) out.push(String(value));
+}
+
 export function deniedWithoutRecord(event) {
-  const params = event.params || {};
-  if (FENCED_TOOLS.includes(event.toolName)) return true;
-  if (event.toolName === "automations" && ["add", "update"].includes(params.action)) return true;
+  const params = (event && event.params) || {};
+  const tool = field(event && event.toolName).toLowerCase();
+  if (FENCED_TOOLS.includes(tool)) return true;
+  if (tool === "automations") {
+    // An action that is not text is not one this rule can read as harmless.
+    const action = params.action;
+    if (action !== undefined && action !== null && typeof action !== "string") return true;
+    if (["add", "update"].includes(field(action).toLowerCase())) return true;
+  }
   try {
-    const text = JSON.stringify(params);
-    return NO_RECORD_DENY.test(text) || NO_RECORD_DENY.test(text.replace(/[\\"'`]/g, ""));
+    // The match runs on the decoded text, never on its JSON form: a tab or newline in the call is
+    // one character there, not a backslash and a letter that would join it to the next word. Each
+    // string stands alone and all of them stand together, one to a line. A literal backslash-n,
+    // -t or -r, which a shell turns into a separator, is read as one as well.
+    const strings = [];
+    collectStrings(params, strings, 0);
+    const decoded = strings.join("\n");
+    for (const text of [decoded, unescapeText(decoded), ...strings]) {
+      if (NO_RECORD_DENY.test(text) || NO_RECORD_DENY.test(text.replace(/[\\"'`]/g, ""))) return true;
+    }
+    return false;
   } catch {
     // Parameters that cannot be read cannot be shown free of those rules.
     return true;
@@ -151,10 +210,63 @@ export const unjudged = new Set();
 // Only "allow-once" counts as the user's yes. OpenClaw itself turns an answer outside
 // `allowedDecisions`, such as "allow-always", into "timeout", which blocks the call, before it
 // reports it here (dist/agent-tools.before-tool-call-CReBJLEA.mjs:801-803, 870-874).
-export const answers = new Map();
+//
+// Each call is kept under its session and call id together (two sessions may use one id), with
+// `answer` (the user's answer so far), `resolved` (a first answer came: later ones count for
+// nothing) and `done` (its end was reported to Lunchroom, once).
+export const waiting = new Map();
 
-function approval(description, toolCallId = "") {
-  if (toolCallId) answers.set(toolCallId, "");
+// The key is the pair as JSON, so no text in either part can make two pairs collide.
+const callKey = (session, id) => JSON.stringify([session, id]);
+
+// The guard program's subcommands for the notices of a turn and for the end of a call a harness's
+// own prompt answered (D1.8). One place, so a name changes in one edit.
+export const NOTICES_MODE = ["guard", "notices"];
+export const CALL_END_MODE = ["guard", "callend"];
+
+// The reports to Lunchroom in flight (a test waits on them). A report never throws and never
+// changes what OpenClaw does with the call.
+export const reports = new Set();
+
+function reportEnd(entry, outcome, program = PROGRAM) {
+  if (entry.done) return;
+  entry.done = true;
+  const run = Promise.resolve()
+    .then(() =>
+      runGuard(CALL_END_MODE, {
+        harness: "openclaw",
+        hook_event_name: "CallEnd",
+        session_id: entry.session,
+        tool_use_id: entry.id,
+        outcome,
+      }, program),
+    )
+    .catch(() => undefined)
+    .then(() => {
+      reports.delete(run);
+    });
+  reports.add(run);
+}
+
+// The call goes to OpenClaw's own prompt: Lunchroom's record of it ends by what OpenClaw reports
+// (D1.8): `deny` or `cancelled` is Denied, `timeout` is Not approved in time, `allow-once` is
+// told by `after_tool_call`. Any other answer tells nothing: the turn's next start ends the call.
+function approval(description, event, ctx, program = PROGRAM) {
+  const session = sessionOf(ctx);
+  // Only a nonempty text id names a call; any other type is not tracked.
+  const id = event && typeof event.toolCallId === "string" ? event.toolCallId : "";
+  let entry;
+  if (session && id) {
+    const key = callKey(session, id);
+    const live = waiting.get(key);
+    // A second request for a call still live shares its record: neither overwrites the other, and
+    // the first answer is the only one.
+    if (live && !live.done) entry = live;
+    else {
+      entry = { session, id, answer: "", resolved: false, done: false };
+      waiting.set(key, entry);
+    }
+  }
   return {
     requireApproval: {
       title: "Lunchroom",
@@ -163,7 +275,23 @@ function approval(description, toolCallId = "") {
       timeoutMs: 120000,
       pluginId: "lunchroom",
       onResolution: (decision) => {
-        if (toolCallId) answers.set(toolCallId, decision);
+        try {
+          if (!entry || entry.resolved || entry.done) return;
+          if (decision === "deny" || decision === "cancelled") {
+            entry.resolved = true;
+            entry.answer = decision;
+            reportEnd(entry, "denied", program);
+          } else if (decision === "timeout") {
+            entry.resolved = true;
+            entry.answer = decision;
+            reportEnd(entry, "not_approved_in_time", program);
+          } else if (decision === "allow-once") {
+            entry.resolved = true;
+            entry.answer = decision;
+          }
+        } catch {
+          // Never into OpenClaw's approval.
+        }
       },
     },
   };
@@ -196,7 +324,7 @@ function base(event, ctx, hookEventName) {
 
 // before_tool_call: the guard's answer as OpenClaw's.
 export async function beforeToolCall(event, ctx, program = PROGRAM) {
-  const channel = surfaces.get((ctx && ctx.runId) || "") === true;
+  const channel = surfaces.get(runOf(ctx)) === true;
   // A call the guard cannot judge goes to the user where a person can answer, else it is DENIED;
   // one the rules needing no record DENY is DENIED.
   // The request shows the call in full (A1.4).
@@ -214,6 +342,9 @@ export async function beforeToolCall(event, ctx, program = PROGRAM) {
       ? approval(
           `Lunchroom ${why} It needs your yes: answer this prompt (yes runs the call once, no stops it). ` +
             `Lunchroom did not read any script this call runs.${shown(event, ctx)}`,
+          event,
+          ctx,
+          program,
         )
       : { block: true, blockReason: `Lunchroom ${why} Nobody can be asked in this session, so this call is DENIED.` };
   };
@@ -228,7 +359,7 @@ export async function beforeToolCall(event, ctx, program = PROGRAM) {
     ...base(event, ctx, "PreToolUse"),
     tool_name: event.toolName,
     tool_input: judgedInput(event, ctx),
-    tool_use_id: event.toolCallId || event.runId || "",
+    tool_use_id: typeof event.toolCallId === "string" && event.toolCallId !== "" ? event.toolCallId : typeof event.runId === "string" ? event.runId : "",
     // A1.1, A1.2: whether a person can answer OpenClaw's approval in this run.
     approval_channel: channel,
   }, program);
@@ -243,7 +374,7 @@ export async function beforeToolCall(event, ctx, program = PROGRAM) {
   // A1.2: with nobody to ask, a call for the user is DENIED, whatever the guard answered.
   if (d.decision === "ask") {
     return channel
-      ? approval(d.reason, event.toolCallId || "")
+      ? approval(d.reason, event, ctx, program)
       : { block: true, blockReason: d.reason || "Lunchroom: DENIED" };
   }
   // The guard lets it run, but the plugin knows what the guard's record may not: the user decides.
@@ -277,15 +408,25 @@ export function modelVisible(event) {
 // user was asked about carries its id only when the user allowed it, so Lunchroom never reports
 // a refused call as approved (card 4).
 export async function afterToolCall(event, ctx, program = PROGRAM) {
-  const id = event.toolCallId || "";
-  const answer = answers.get(id);
-  answers.delete(id);
+  if (!event || typeof event !== "object") return;
+  const id = typeof event.toolCallId === "string" ? event.toolCallId : "";
   if (!sessionOf(ctx)) return;
+  const key = callKey(sessionOf(ctx), id);
+  const entry = id ? waiting.get(key) : undefined;
+  // `undefined` for a call never sent to OpenClaw's prompt.
+  const answer = entry ? entry.answer : undefined;
+  // Granted in OpenClaw: this report after the answer `allow-once` (D1.8).
+  if (entry && answer === "allow-once") reportEnd(entry, "granted", program);
+  // A call whose end is reported is forgotten; one with no answer the plugin knows (an answer
+  // outside its protocol, or none) stays, so the next turn's start tells it as Denied.
+  if (entry && entry.done) waiting.delete(key);
   const run = await runGuard(["guard", "posttool"], {
     ...base(event, ctx, "PostToolUse"),
     tool_name: event.toolName,
     tool_input: judgedInput(event, ctx),
-    tool_use_id: answer === undefined || answer === "allow-once" ? id : "",
+    // T1.8: the id the call had before it ran (`toolCallId`, else the run's), which is the key the
+    // guard kept the call's written paths under; a refused call carries none.
+    tool_use_id: answer === undefined || answer === "allow-once" ? id || (typeof event.runId === "string" ? event.runId : "") : "",
     tool_response: modelVisible(event),
   }, program);
   if (run.failed || run.missing) {
@@ -306,7 +447,7 @@ export async function afterToolCall(event, ctx, program = PROGRAM) {
 // Lunchroom's labels, which only its own delivery turn carries.
 export function isTyped(event, ctx) {
   const kind = ctx && ctx.inputProvenance && ctx.inputProvenance.kind;
-  const trigger = ((ctx && ctx.trigger) || "").trim();
+  const trigger = field(ctx && ctx.trigger);
   return (
     event.senderIsOwner === true &&
     (trigger === "" || trigger === "user") &&
@@ -345,6 +486,55 @@ function blocked(text) {
   return { outcome: "block", reason: said, message: said };
 }
 
+// A call sent to OpenClaw's prompt with no report when the session's next turn starts is told as
+// Denied, since the turn ended with the call not run (D1.8). The plugin forgets every call of the
+// session then, so a report that comes later changes nothing.
+function endOrphans(session, program = PROGRAM) {
+  // A snapshot: the map changes while it is walked.
+  for (const [key, entry] of [...waiting]) {
+    if (entry.session !== session) continue;
+    waiting.delete(key);
+    reportEnd(entry, "denied", program);
+  }
+}
+
+// Whether a turn's text is a person's, for the notices a hook adds to it (T1, D1.8). The event of
+// `before_prompt_build` carries no `senderIsOwner` (docs/host-facts), so the turn is read from its
+// context as `personCanAnswer` reads a run: a user trigger with an initiating channel, from
+// neither another session nor the system (`inputProvenance.kind`; absent does not make a turn
+// no-person's), with none of Lunchroom's labels in its text.
+export function isPersonTurn(event, ctx) {
+  const kind = ctx && ctx.inputProvenance && ctx.inputProvenance.kind;
+  return (
+    personCanAnswer(ctx) &&
+    kind !== "inter_session" &&
+    kind !== "internal_system" &&
+    !ENVELOPE_LABELS.some((l) => String((event && event.prompt) || "").includes(l))
+  );
+}
+
+// before_prompt_build: the session's own notices, added to the start of a turn a person typed, as
+// context (`prependContext`) and nothing else. The text is Lunchroom's line, passed on byte for
+// byte as data: it is not read, run or acted on. A guard that cannot answer, or answers with
+// anything but text, adds nothing and never stops the turn.
+export async function beforePromptBuild(event, ctx, program = PROGRAM) {
+  try {
+    if (!sessionOf(ctx) || !isPersonTurn(event, ctx)) return undefined;
+    const run = await runGuard(NOTICES_MODE, {
+      ...base(event, ctx, "UserPromptSubmit"),
+      prompt_id: runOf(ctx),
+      user_typed: true,
+      can_show_user: false,
+    }, program);
+    if (run.status !== 0) return undefined;
+    const out = JSON.parse(run.stdout.trim() || "{}");
+    const text = out && out.hookSpecificOutput && out.hookSpecificOutput.additionalContext;
+    return typeof text === "string" && text !== "" ? { prependContext: text } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // before_agent_run: the turn's prompt reaches the guard. Lunchroom's delivery is confirmed here
 // and a repeated one is blocked; the user's own turn clears HELD; another session's text holds.
 // When the guard cannot judge it, or its program is missing, a prompt that is not the user's own
@@ -360,14 +550,15 @@ function blocked(text) {
 // agent nothing here (`can_show_user: false`, `can_tell_agent: false`): it takes no notice that
 // would be lost, and `lunchroom status` shows what waits.
 export async function beforeAgentRun(event, ctx, program = PROGRAM) {
-  if (ctx && ctx.runId) surfaces.set(ctx.runId, personCanAnswer(ctx));
+  if (runOf(ctx)) surfaces.set(runOf(ctx), personCanAnswer(ctx));
   if (!sessionOf(ctx)) return { outcome: "pass" };
+  endOrphans(sessionOf(ctx), program);
   const prompt = event.prompt || "";
   const typed = isTyped(event, ctx);
   const run = await runGuard(["guard", "prompt"], {
     ...base(event, ctx, "UserPromptSubmit"),
     prompt,
-    prompt_id: (ctx && ctx.runId) || "",
+    prompt_id: runOf(ctx),
     user_typed: typed,
     can_show_user: false,
     can_tell_agent: false,
@@ -392,7 +583,7 @@ export async function beforeAgentRun(event, ctx, program = PROGRAM) {
 // nothing to show from this hook: its handler has no result (`src/plugins/hook-types.ts:830-833`,
 // `:865`), so the listener's text is not read.
 export async function agentEnd(event, ctx, program = PROGRAM) {
-  if (ctx && ctx.runId) surfaces.delete(ctx.runId);
+  if (runOf(ctx)) surfaces.delete(runOf(ctx));
   if (!sessionOf(ctx)) return;
   await runGuard(
     ["listen", "--once"],
@@ -424,12 +615,20 @@ export default {
     jsonSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   register(api) {
-    api.on("before_tool_call", failClosed(beforeToolCall, (event, ctx, e) => ({
+    // A hook OpenClaw refuses (a conversation hook without its grant) does not stop the others.
+    const on = (name, handler) => {
+      try {
+        api.on(name, handler);
+      } catch {
+        // Refused: that hook runs nothing.
+      }
+    };
+    on("before_tool_call", failClosed(beforeToolCall, (event, ctx, e) => ({
       block: true,
       blockReason: `Lunchroom could not check this call: ${e && e.message}. This call is DENIED.`,
     })));
-    api.on("after_tool_call", failClosed(afterToolCall, () => undefined));
-    api.on("before_agent_run", failClosed(beforeAgentRun, (event, ctx, e) => {
+    on("after_tool_call", failClosed(afterToolCall, () => undefined));
+    on("before_agent_run", failClosed(beforeAgentRun, (event, ctx, e) => {
       // The user's own typing still goes on (H1.5); any other text is blocked.
       let typed = false;
       try {
@@ -441,7 +640,8 @@ export default {
         ? { outcome: "pass" }
         : blocked(`Lunchroom could not check this prompt: ${e && e.message}. Lunchroom blocked it because it did not come from you.`);
     }));
-    api.on("agent_end", failClosed(agentEnd, () => undefined));
-    api.on("resolve_exec_env", (event, ctx) => resolveExecEnv(event, ctx));
+    on("before_prompt_build", (event, ctx) => beforePromptBuild(event, ctx));
+    on("agent_end", failClosed(agentEnd, () => undefined));
+    on("resolve_exec_env", (event, ctx) => resolveExecEnv(event, ctx));
   },
 };

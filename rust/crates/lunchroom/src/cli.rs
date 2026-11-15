@@ -9,6 +9,12 @@
 /// sources, and the version alone when built with no git history (`build.rs`).
 pub const VERSION: &str = env!("LUNCHROOM_VERSION");
 
+/// The one place that says how to open the console (F2 design, "Finding and starting the
+/// console", item 3). It ends the install's report, follows `console` in `lunchroom help`, and
+/// follows the start line of a joined session while the console is set up and none runs.
+pub(crate) const OPEN_CONSOLE_LINE: &str =
+    "Open the console any time: type lunchroom console in a terminal of your own.";
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read as _;
@@ -20,7 +26,7 @@ use lunchroom_core::store::Store;
 use lunchroom_core::vocab::{AgentState, MessageState, Reason, Verdict, Word};
 use lunchroom_core::{cards, secrets};
 
-use crate::evidence::{Assessment, assess, evidence};
+use crate::evidence::{Assessment, assess};
 use crate::home::Env;
 use crate::process;
 use crate::terminal::System;
@@ -233,32 +239,25 @@ pub fn send(args: &[String], env: &Env) -> Outcome {
         Err(e) => store_unusable(&e, &format!("the message to {to}"), "updated"),
         Ok(Ok(accepted)) => {
             let mut out = format!("{} {}\n", MessageState::Queued.word(), accepted.id);
-            if accepted.halted {
-                out.push_str(&cards::loop_halted());
+            // §16 item 12 (channel S): the sender of the eighth message hears the halt now.
+            if let Some(line) = &accepted.halted_line {
+                out.push_str(line);
                 out.push('\n');
             }
-            // R3.2: a message to an UNGUARDED or STOPPED agent stays QUEUED, and the sender is told.
-            if let Ok(mail) = store.read() {
-                let told = match mail
-                    .agent_state(&accepted.to, evidence(&mail, &accepted.to, &env.home))
-                {
-                    AgentState::Unguarded => {
-                        let _ = writeln!(out, "{}", cards::unguarded(to));
-                        true
-                    }
-                    AgentState::Stopped => {
-                        let _ = writeln!(out, "{}", cards::stopped(to));
-                        true
-                    }
-                    _ => false,
-                };
+            // R3.2, §16 item 20 (channel S): a message to an UNGUARDED or STOPPED agent stays
+            // QUEUED, and the sender is told at once, with the reason an agent may read.
+            let unguarded = crate::send_lines::unguarded(env, &store, &accepted, to);
+            if let Some(lines) = &unguarded {
+                out.push_str(lines);
                 // G2-20: the reason the check below notes for this message is told to the user
                 // only; the sender has just been told it.
-                if told {
-                    let _ = store.update(|m| m.sender_told_reason(&accepted.id));
-                }
+                let _ = store.update(|m| m.sender_told_reason(&accepted.id));
             }
             hand_over_now(env, &store, &accepted, &mut out);
+            // §16 items 2 and 5 (channel S): a guarded recipient is HELD or will be.
+            if unguarded.is_none() {
+                out.push_str(&crate::send_lines::held(env, &store, &accepted, to));
+            }
             // D1.7: every `lunchroom send` checks every QUEUED message's time limits.
             // D1.1: the check runs in the sender's process, so it offers only the sender's own.
             let offers = crate::checks::Offers::From(accepted.from.clone());
@@ -270,27 +269,150 @@ pub fn send(args: &[String], env: &Env) -> Outcome {
             }
             Outcome::ok(out)
         }
-        Ok(Err(Ok((SendRefusal::UnknownName, _, _)))) => unknown_name(&store, to),
-        Ok(Err(Ok((refusal, held_by, from)))) => refused(
-            &refusal,
-            &Refused {
-                to,
-                from: &from,
-                text: &text,
-                held_by: &held_by,
-            },
+        // V1.4: a DENIED send reaches the agent in the output of `send`, and the user as a notice
+        // of the user's list (and so on the console).
+        Ok(Err(Ok((SendRefusal::UnknownName, _, _)))) => crate::send_lines::denied(
+            env,
+            &store,
+            &SendRefusal::UnknownName,
+            "",
+            to,
+            &text,
+            unknown_name(&store, to),
         ),
-        Ok(Err(Err(NoSender::Unseen))) => refused(
-            &SendRefusal::UnseenSender,
-            &Refused {
-                to,
-                from: "",
-                text: &text,
-                held_by: &[],
-            },
-        ),
+        Ok(Err(Ok((refusal, held_by, from)))) => {
+            let out = refused(
+                &refusal,
+                &Refused {
+                    to,
+                    from: &from,
+                    text: &text,
+                    held_by: &held_by,
+                },
+            );
+            crate::send_lines::denied(env, &store, &refusal, &from, to, &text, out)
+        }
+        Ok(Err(Err(NoSender::Unseen))) => {
+            let refusal = SendRefusal::UnseenSender;
+            let out = refused(
+                &refusal,
+                &Refused {
+                    to,
+                    from: "",
+                    text: &text,
+                    held_by: &[],
+                },
+            );
+            crate::send_lines::denied(env, &store, &refusal, "", to, &text, out)
+        }
         Ok(Err(Err(NoSender::Forged))) => forged(to),
     }
+}
+
+/// Why `lunchroom read` stops.
+enum ReadStop {
+    /// The session it runs in cannot be established (I1.2).
+    Sender(NoSender),
+    /// No message, and no approval line, with this id is addressed to the session.
+    NotYours,
+    /// The message FAILED: it was never delivered, and its sender was told so (D1.4).
+    Failed,
+}
+
+/// `lunchroom read <id>` (D1.1, `§10::27-30`, `§7::24`): prints the envelope of the message `id`, which
+/// must be addressed to the session this command runs in, found as `send` finds its sender (I1.2);
+/// any other id, an id of no message and the id of a FAILED message are DENIED alike, so the answer
+/// tells nothing of another session's messages. The output is a tool's output that carries the
+/// message's label, so the session is HELD by the message (T1.7): this command records that hold
+/// itself, as a harness that does not scan a tool's output would not. The message is marked read
+/// (`lunchroom status` shows it), and a QUEUED message handed over by its id line is DELIVERED
+/// now, since the recipient's own process asked for it by id. The id of an approval line handed to
+/// this session returns that line (`§7::24`).
+#[must_use]
+pub fn read(args: &[String], env: &Env) -> Outcome {
+    let [id] = args else {
+        return read_usage();
+    };
+    let store = match store(env, "lunchroom read") {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let result = store.update(|m| {
+        let me = sender(m, env).map_err(ReadStop::Sender)?;
+        // §7::24: the line of an approval or a refusal told to this session, label-free so that
+        // reading it holds nothing (T1.7).
+        if let Some(line) = m.tell_line_for(&me, id) {
+            return Ok(format!("{line}\n"));
+        }
+        let message = m
+            .message(id)
+            .filter(|message| message.to == me)
+            .ok_or(ReadStop::NotYours)?;
+        if matches!(message.status, lunchroom_core::mail::Status::Failed { .. }) {
+            return Err(ReadStop::Failed);
+        }
+        let _ = m.confirm_at(&me, id, env.now);
+        m.hold_by_reading(&me, id);
+        m.mark_read(id, env.now);
+        let mode = m.hold_mode();
+        let message = m.message(id).cloned().ok_or(ReadStop::NotYours)?;
+        Ok(crate::delivery::envelope(m, &message, mode, env.now))
+    });
+    match result {
+        Err(e) => store_unusable(&e, "lunchroom read", "updated"),
+        Ok(Ok(text)) => Outcome::ok(text),
+        Ok(Err(ReadStop::Sender(NoSender::Forged))) => stopped_with(
+            "the session id in this command's environment is not the session it runs in",
+            &format!("lunchroom read {id}"),
+            "Lunchroom finds the session a message is addressed to from the process that started \
+             this command, and does not take another session's id from the environment",
+            &[
+                "The agent: run `lunchroom read` again without setting a session id in the \
+                 command's environment."
+                    .to_owned(),
+            ],
+            7,
+        ),
+        Ok(Err(ReadStop::Sender(NoSender::Unseen))) => stopped_with(
+            "Lunchroom cannot tell which session this command runs in",
+            &format!("lunchroom read {id}"),
+            "a message is read only by the session it is addressed to, and no guard hook has seen \
+             a session above this command",
+            &[
+                "The agent: run it from your own session, the one the message was handed to."
+                    .to_owned(),
+                "The user: your own terminal has no messages; `lunchroom status` lists them."
+                    .to_owned(),
+            ],
+            7,
+        ),
+        Ok(Err(ReadStop::NotYours)) => stopped_with(
+            "no message addressed to this session has that id",
+            &format!("lunchroom read {id}"),
+            "a session reads only the messages addressed to it; this id is of no message, or of \
+             a message to another session",
+            &["The agent: use the id on the line that was handed to you.".to_owned()],
+            7,
+        ),
+        Ok(Err(ReadStop::Failed)) => stopped_with(
+            "that message FAILED and was never delivered",
+            &format!("lunchroom read {id}"),
+            "its sender was told it FAILED, so its text is not let into this session",
+            &["The agent: ask the sender to send it again.".to_owned()],
+            7,
+        ),
+    }
+}
+
+/// What `lunchroom read` says when it is not given exactly one id.
+fn read_usage() -> Outcome {
+    stopped_with(
+        "lunchroom read needs the id of one message",
+        "the command",
+        "a message is read by its id, which the line that was handed to the session names",
+        &["The agent: write `lunchroom read <id>`.".to_owned()],
+        2,
+    )
 }
 
 /// What `lunchroom send` says when it is given no name or no text.
@@ -500,18 +622,6 @@ pub(crate) fn too_long(to: &str) -> Outcome {
     )
 }
 
-/// A message with more lines than one command argument can carry once each line is labelled.
-fn too_many_lines(to: &str, text: &str) -> Outcome {
-    stopped_with(
-        "the message has too many lines",
-        &format!("the message to {to} ({} lines)", text.lines().count()),
-        "each line of a message is labelled, and the labelled message must fit in one command \
-         argument",
-        &["The agent: send fewer, longer lines, or split the message into several.".to_owned()],
-        2,
-    )
-}
-
 /// What a refused message's explanation is built from (V1.4).
 pub(crate) struct Refused<'a> {
     /// The name the sender gave.
@@ -554,7 +664,6 @@ pub(crate) fn refused(refusal: &SendRefusal, r: &Refused<'_>) -> Outcome {
     let what = format!("the message to {} ({} bytes)", r.to, r.text.len());
     match refusal {
         SendRefusal::TooLong => too_long(r.to),
-        SendRefusal::TooManyLines => too_many_lines(r.to, r.text),
         SendRefusal::UnknownName => stopped_with(
             &format!("no agent is named {}", r.to),
             &what,
@@ -836,6 +945,7 @@ fn agent_lines(
 
 /// `lunchroom status`: each named agent, whether it is HELD, and its QUEUED messages.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one status: each section of it, one after another
 pub fn status(env: &Env) -> Outcome {
     // C1.1: a held store is waited for 10 seconds in all, not 10 seconds for each of the reads and
     // writes below; past that each one reports the store busy at once.
@@ -868,6 +978,22 @@ pub fn status(env: &Env) -> Outcome {
             (name, who, state, judged)
         })
         .collect();
+    // F2 design, "The agents on the console": what status found of each agent is kept for the
+    // console, which cannot read it itself. A store that cannot be written changes nothing shown.
+    let found: Vec<(Identity, lunchroom_core::mail::Judged)> = agents
+        .iter()
+        .map(|(_, who, _, judged)| {
+            (
+                (*who).clone(),
+                crate::evidence::kept(&mail, who, judged, env.now),
+            )
+        })
+        .collect();
+    let _ = store.update(|m| {
+        for (who, judged) in &found {
+            m.set_judged(who, judged.clone());
+        }
+    });
     agents.sort_by_key(|(_, _, state, _)| *state == AgentState::Stopped);
     let mut lines = String::new();
     // C1.1: one line first, how many agents and how many in each state.
@@ -926,6 +1052,15 @@ pub fn status(env: &Env) -> Outcome {
         }
     }
     queued_lines(&mut lines, &mail, env.now, checked.as_deref());
+    // D1.1 (§10::30): whether each message handed over by its id has been read.
+    read_lines(&mut lines, &mail);
+    // T1.8 (§5::46): the recorded paths, with the agent that wrote each and its holders.
+    marked_lines(&mut lines, &mail);
+    // H1.4 (§13::77): Codex threads with a session record and no guard hook record.
+    for (thread, why) in unguarded_threads(&mail, env, !by_agent) {
+        let _ = writeln!(lines, "{thread}\t{}", AgentState::Unguarded.word());
+        let _ = writeln!(lines, "  why: {why}");
+    }
     // An agent whose session cannot be established (`sender` fails) reads no notices.
     let reader: Option<Option<Identity>> = if by_agent {
         sender(&mail, env).ok().map(Some)
@@ -959,17 +1094,27 @@ pub fn status(env: &Env) -> Outcome {
 /// The user, running `status` in a terminal of their own, reads the notices waiting for them; an
 /// agent reads those waiting for its own session as a sender (its messages), never the user's.
 /// Reading marks nothing told: the next prompt or listener that can show them still tells them.
-fn notice_lines(lines: &mut String, mail: &Mail, agent: Option<&Identity>) {
+pub(crate) fn notice_lines(lines: &mut String, mail: &Mail, agent: Option<&Identity>) {
     let notices: &[lunchroom_core::mail::Notice] = match agent {
         Some(me) => mail.notices(me),
         None => mail.user_notices(),
     };
-    if notices.is_empty() {
-        return;
+    if !notices.is_empty() {
+        let _ = writeln!(lines, "notices not yet told:");
+        for n in notices {
+            let _ = writeln!(lines, "  {}", n.text);
+        }
     }
-    let _ = writeln!(lines, "notices not yet told:");
-    for n in notices {
-        let _ = writeln!(lines, "  {}", n.text);
+    // §16 item 2 (channel N): "`lunchroom status` run in the session lists a line not yet
+    // shown" in an envelope, the lines of an UNGUARDED or STOPPED agent among them (K1.29).
+    if let Some(me) = agent {
+        let pending = mail.pending_envelope_lines(me);
+        if !pending.is_empty() {
+            let _ = writeln!(lines, "lines not yet shown in an envelope:");
+            for l in pending {
+                let _ = writeln!(lines, "  {}", l.text);
+            }
+        }
     }
 }
 
@@ -1100,6 +1245,11 @@ pub(crate) struct Host<'a> {
     pub openclaw_config: std::path::PathBuf,
     /// The folder the system's package records are under (`/`).
     pub root: std::path::PathBuf,
+    /// The store wall and the console as found on disk (1.1 only, feature `console`).
+    #[cfg(feature = "console")]
+    pub wall: crate::wall::Facts,
+    /// The owner and modes of a file a `sudo` rule names, for the classifier of §17.8.
+    pub path_facts: &'a dyn Fn(&str) -> Option<lunchroom_core::sudoers::PathFacts>,
 }
 
 /// The lines of `lunchroom doctor`, and how many checks failed.
@@ -1139,6 +1289,12 @@ impl Checks {
                 let _ = writeln!(self.text, "FAIL {line}");
             }
         }
+    }
+
+    /// A line that is neither a PASS nor a FAIL: it says what the user should know and leaves the
+    /// exit code as it was (C1.4).
+    fn note(&mut self, line: &str) {
+        let _ = writeln!(self.text, "NOTE {line}");
     }
 }
 
@@ -1182,20 +1338,33 @@ fn record_agent(mail: Option<&Mail>, session: &str) -> String {
 /// what the user does; a record older than 24 hours, or one that was only slow, does not FAIL. Each
 /// slow decision is a PASS line of its own; with no undecided call, one PASS line says so. A FAIL
 /// line names the agent and says when it clears (24 hours after the call).
-/// The doctor lines about the guard's records of the last 24 hours, as text, for the console
-/// (1.1, feature `console`).
-#[cfg(feature = "console")]
-pub(crate) fn guard_record_text(env: &Env, mail: Option<&Mail>) -> String {
-    let mut checks = Checks {
-        text: String::new(),
-        failed: 0,
-        explained_held: false,
-    };
-    guard_record_lines(&mut checks, env, mail);
-    checks.text
+/// The size past which the file of the fields 1.1 adds (the file that holds every line of
+/// Lunchroom's) is noted by `lunchroom doctor`: 64 MiB (§16 item 1).
+pub(crate) const LINES_FILE_NOTE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// §16 item 1: "Lunchroom removes no line, as it removes no message, and `lunchroom doctor` prints
+/// a line that is not a FAIL and leaves the exit code as it was when the file of the lines passes
+/// 64 MiB." The line is a NOTE, counted as neither a PASS nor a FAIL.
+pub(crate) fn lines_file_note(store_dir: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::metadata(store_dir.join("state.side.json"))
+        .ok()?
+        .len();
+    (bytes > LINES_FILE_NOTE_BYTES).then(|| {
+        format!(
+            "NOTE the file of Lunchroom's lines, notices and calls is {} MiB, past {} MiB. \
+             Lunchroom removes no line, as it removes no message, so the file only grows; this \
+             is not a failure, and the user decides what to do about its size.",
+            bytes / (1024 * 1024),
+            LINES_FILE_NOTE_BYTES / (1024 * 1024)
+        )
+    })
 }
 
 fn guard_record_lines(checks: &mut Checks, env: &Env, mail: Option<&Mail>) {
+    // §16 item 1: a line that is not a FAIL, and no change to the exit code.
+    if let Some(note) = lines_file_note(&env.store_dir()) {
+        let _ = writeln!(checks.text, "{note}");
+    }
     let all = crate::records::read(&env.lunchroom_home);
     let recent = crate::records::recent(&all, env.now);
     let mut undecided = 0;
@@ -1232,6 +1401,198 @@ fn guard_record_lines(checks: &mut Checks, env: &Env, mail: Option<&Mail>) {
         checks.line(Ok(
             "the guard decided every call in the last 24 hours".to_owned()
         ));
+    }
+}
+
+/// How many Codex threads with no guard hook record are listed one by one; the older ones are
+/// counted in one more line.
+const THREADS_SHOWN: usize = 20;
+
+/// `§13::77-78`, `§4::42`: each Codex thread that has a session record in `<CODEX_HOME>/sessions` and
+/// that no guard hook has recorded, as the name of the thread and why it is UNGUARDED, newest
+/// last. The user's form names the session record; the form an agent reads names no path
+/// (`§4::31`). Past [`THREADS_SHOWN`] the older ones are counted in the first entry.
+fn unguarded_threads(mail: &Mail, env: &Env, user: bool) -> Vec<(String, String)> {
+    let all = crate::evidence::unrecorded_codex_threads(mail, &env.codex_home);
+    let older = all.len().saturating_sub(THREADS_SHOWN);
+    let reason = crate::evidence::CODEX_NO_HOOK_RAN;
+    let mut out = Vec::new();
+    if older > 0 {
+        out.push((
+            format!("{older} older Codex threads"),
+            format!(
+                "they have a session record and no guard hook record: {reason}. Each is \
+                 UNGUARDED for the same reason and has the same way out as the ones listed after \
+                 this line"
+            ),
+        ));
+    }
+    for thread in all.iter().skip(older) {
+        let record = if user {
+            format!(
+                " (session record {})",
+                crate::records::clean(&thread.file.display().to_string())
+            )
+        } else {
+            String::new()
+        };
+        out.push((
+            format!("Codex thread {}", thread.thread),
+            format!(
+                "{reason}{record}. Lunchroom delivers it nothing and cannot check what it does \
+                 until a guard hook runs in it: check that Lunchroom is installed for Codex \
+                 (`lunchroom doctor` shows each check), then use the thread, which runs one"
+            ),
+        ));
+    }
+    out
+}
+
+/// D1.1 (`§10::30`): the messages handed over by the line that names the id and `lunchroom read
+/// <id>`, each with whether its recipient has read it.
+fn read_lines(lines: &mut String, mail: &Mail) {
+    let handed = mail.handed_by_id();
+    if handed.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        lines,
+        "messages handed over by their id (the recipient reads one with `lunchroom read <id>`):"
+    );
+    for m in handed {
+        let state = mail.read_at(&m.id).map_or_else(
+            || "not read".to_owned(),
+            |at| format!("read at {}", crate::delivery::utc(at)),
+        );
+        let _ = writeln!(
+            lines,
+            "  {}\tto {}\t{state}",
+            m.id,
+            crate::records::clean(&m.to_name)
+        );
+    }
+}
+
+/// T1.8 (`§5::46`): the paths recorded as written by a HELD session, each with the agent that wrote
+/// it and its holders; they stay until the user clears one with `lunchroom clear <path>`.
+fn marked_lines(lines: &mut String, mail: &Mail) {
+    let marked = mail.marked();
+    if marked.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        lines,
+        "recorded paths (written by an agent that was HELD; the user clears one with `lunchroom \
+         clear <path>`):"
+    );
+    for m in marked {
+        let paths: Vec<String> = m.paths.iter().map(|p| crate::records::clean(p)).collect();
+        let writer = if m.writer_name.is_empty() {
+            &m.writer.session
+        } else {
+            &m.writer_name
+        };
+        let holders: Vec<String> = m
+            .holders
+            .iter()
+            .map(|h| format!("{} ({})", crate::records::clean(&h.from_name), h.message))
+            .collect();
+        let _ = writeln!(
+            lines,
+            "  {}\twritten by {}\tholders: {}",
+            paths.join(" = "),
+            crate::records::clean(writer),
+            holders.join(", ")
+        );
+    }
+}
+
+/// C1.4 (1.1 only, feature `console`): the store wall's lines, what `sudo -n -l` shows and the
+/// console.
+#[cfg(feature = "console")]
+fn wall_lines(checks: &mut Checks, host: &Host<'_>, mail: Option<&Mail>) {
+    for line in crate::wall::lines(&host.wall) {
+        checks.line(line);
+    }
+    sudo_lines(checks, host, mail);
+    match crate::wall::console_line(&host.wall) {
+        crate::wall::ConsoleLine::Pass(text) => checks.line(Ok(text)),
+        crate::wall::ConsoleLine::Fail(text) => checks.line(Err(text)),
+        crate::wall::ConsoleLine::Note(text) => checks.note(&text),
+    }
+}
+
+/// C1.4, §17.8: doctor reads `sudo -n -l` for the user and judges the answer Lunchroom kept at the
+/// install. No password-free rule is a PASS. A password-free rule is a line that leaves the exit
+/// code, saying that the passphrase check does not hold on the account until it is removed, and,
+/// where a rule is wide, that the store wall and the console's wall do not hold either. An answer
+/// that differs from the one kept is a FAIL that says to run `lunchroom install console` again.
+#[cfg(feature = "console")]
+fn sudo_lines(checks: &mut Checks, host: &Host<'_>, mail: Option<&Mail>) {
+    use lunchroom_core::sudoers::{self, Kept};
+    let fresh = match host.sys.sudo_list_shared() {
+        Ok(text) => text,
+        Err(why) => {
+            checks.note(&format!(
+                "`sudo -n -l` could not be read ({why}), so it is not shown whether a rule that \
+                 runs a command without a password stands on this account"
+            ));
+            return;
+        }
+    };
+    let kept = mail.and_then(Mail::sudo_answer);
+    if let Some(k) = &kept
+        && !k.same_rules_as(&fresh)
+    {
+        checks.line(Err(format!(
+            "the rules `sudo -n -l` shows for your account now differ from the ones Lunchroom kept \
+             when it read them at {}: in a terminal of your own, run `lunchroom install console` \
+             again, which reads them again and keeps the answer",
+            crate::delivery::utc(k.read_at)
+        )));
+    }
+    let basis = kept.unwrap_or_else(|| Kept {
+        read_at: 0,
+        own: fresh,
+        others: std::collections::BTreeMap::new(),
+    });
+    let account = host.wall.account.clone().unwrap_or_default();
+    let verdict = basis.verdict(&account, host.path_facts);
+    let listing = sudoers::parse(&basis.own);
+    if let sudoers::Status::Unreadable(why) = &listing.status {
+        checks.note(&format!(
+            "`sudo -n -l` printed text Lunchroom cannot read as a listing ({why}), so it is not \
+             shown whether a rule that runs a command without a password stands on this account"
+        ));
+    } else if !verdict.password_free() {
+        checks.line(Ok(
+            "`sudo -n -l` shows no rule that runs a command without a password".to_owned(),
+        ));
+    } else {
+        let rules: Vec<String> = listing
+            .password_free()
+            .map(sudoers::Rule::describe)
+            .collect();
+        let rules = if rules.is_empty() {
+            "lines Lunchroom cannot read".to_owned()
+        } else {
+            rules.join("; ")
+        };
+        if verdict.wide() {
+            checks.note(&format!(
+                "`sudo -n -l` shows a rule that lets your account run a command without a \
+                 password: {rules}. The passphrase check and the store wall do not hold on this \
+                 account until that rule is removed (A1.3, K1.10, §17.8): {}",
+                verdict.wide_lines().join("; ")
+            ));
+        } else {
+            checks.note(&format!(
+                "`sudo -n -l` shows a rule that lets your account run a command without a \
+                 password: {rules}. The passphrase check does not hold on this account until that \
+                 rule is removed (A1.3, K1.10); every such rule is narrow (§17.8), so the store \
+                 wall and the console's wall stand"
+            ));
+        }
     }
 }
 
@@ -1283,6 +1644,9 @@ pub(crate) fn doctor_text(env: &Env, sys: &dyn System) -> Outcome {
         managed: std::path::PathBuf::from(crate::evidence::MANAGED_SETTINGS),
         openclaw_config: crate::evidence::openclaw_config_from(&var, &env.home),
         root: std::path::PathBuf::from("/"),
+        #[cfg(feature = "console")]
+        wall: crate::wall::read(std::path::Path::new("/"), sys.uid()),
+        path_facts: &lunchroom_core::sudoers::facts_from_disk,
     };
     doctor_on(env, &host)
 }
@@ -1312,6 +1676,8 @@ pub(crate) fn doctor_on(env: &Env, host: &Host<'_>) -> Outcome {
     #[cfg(feature = "console")]
     if console_program.is_file() || lunchroom_core::setgid::active() {
         checks.line(crate::console::mode_check(env, host.sys.uid()));
+        // decision of 2026-11-14 ("Add the check"): no one but root can replace the program.
+        checks.line(crate::console::program_place_check());
     }
     // Lunchroom's program, where `lunchroom install` puts it (in console mode, the setgid program
     // `lunchroom install console` puts in place), and the one run by name from PATH.
@@ -1368,6 +1734,10 @@ pub(crate) fn doctor_on(env: &Env, host: &Host<'_>) -> Outcome {
     // Lunchroom's records, read without creating or locking anything: Hermes's reported release
     // and the running agents come from them.
     let stored = Store::<Mail>::read_without_change(&env.store_dir());
+    // 1.1 only (feature `console`): the store wall, one line for each part (§14::30), what `sudo
+    // -n -l` shows (§14::31-32, §17.8) and the console (§14::33-35).
+    #[cfg(feature = "console")]
+    wall_lines(&mut checks, host, stored.as_ref().ok());
     // Each supported harness whose folder exists, found as `lunchroom install` finds it (H1.4).
     for (word, _) in crate::install::found_harnesses_in(env, &host.claude_config) {
         let Some(harness) = harness_of(word) else {
@@ -1384,7 +1754,7 @@ pub(crate) fn doctor_on(env: &Env, host: &Host<'_>) -> Outcome {
             Harness::OpenClaw => ev::openclaw_fault(&host.openclaw_config).or_else(|| {
                 ev::plugin_setup_fault(
                     harness,
-                    &env.lunchroom_home.join("plugins/openclaw/index.mjs"),
+                    &crate::install::openclaw_plugin_dir(env).join("index.mjs"),
                 )
             }),
             Harness::Hermes => ev::hermes_fault(&env.hermes_home).or_else(|| {
@@ -1475,6 +1845,13 @@ pub(crate) fn doctor_on(env: &Env, host: &Host<'_>) -> Outcome {
                     ))),
                 }
             }
+            // §13::78: a Codex thread with a session record and no guard hook record is UNGUARDED.
+            for (thread, why) in unguarded_threads(&mail, env, true) {
+                checks.line(Err(format!(
+                    "{thread} is {}: {why}",
+                    AgentState::Unguarded.word()
+                )));
+            }
         }
     }
     Outcome {
@@ -1523,6 +1900,9 @@ fn held_by_text(mail: &Mail, who: &Identity) -> String {
 pub const SLIP: &str =
     "read any file except the paths Lunchroom denies or protects; reply with lunchroom send";
 
+#[cfg(all(test, feature = "console"))]
+mod tests_u10;
+
 #[cfg(test)]
 mod tests_f1_doctor;
 
@@ -1566,8 +1946,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// The passphrase check as the system reports it; nothing is asked.
-    struct Verifier(Result<String, String>);
+    /// What `sudo -n -l` prints on an account whose `sudo` asks for a password.
+    pub(crate) const SUDO_ASKS: &str = "sudo: a password is required\n";
+
+    /// The passphrase check as the system reports it, and what `sudo -n -l` printed; nothing is
+    /// asked.
+    struct Verifier(Result<String, String>, Result<String, String>);
 
     impl System for Verifier {
         fn ancestors(&self) -> Vec<(Option<String>, String)> {
@@ -1596,6 +1980,9 @@ pub(crate) mod tests {
         }
         fn install_verifier(&mut self, _line: &str) -> Result<(), String> {
             Err("nothing is installed in this test".to_owned())
+        }
+        fn sudo_list_shared(&self) -> Result<String, String> {
+            self.1.clone()
         }
     }
 
@@ -1714,10 +2101,19 @@ pub(crate) mod tests {
             let program = self.program().display().to_string();
             let mut hooks = serde_json::Map::new();
             for (event, mode) in events {
-                hooks.insert(
-                    (*event).to_owned(),
-                    serde_json::json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}]),
-                );
+                // As the install writes it (H1.5): the tool-call hook fails closed.
+                let mut hook = serde_json::json!({"type": "command", "command": if *mode == "pretool" {
+                    crate::install::pretool_command(
+                        &program,
+                        &self.env.home.join(".claude/settings.json"),
+                    )
+                } else {
+                    format!("{program} guard {mode}")
+                }});
+                if *mode == "pretool" {
+                    hook["onFailure"] = serde_json::json!("block");
+                }
+                hooks.insert((*event).to_owned(), serde_json::json!([{"hooks": [hook]}]));
             }
             let _ = std::fs::write(
                 self.env.home.join(".claude/settings.json"),
@@ -1732,13 +2128,21 @@ pub(crate) mod tests {
             let file = self.env.codex_home.join("hooks.json");
             let mut hooks = serde_json::Map::new();
             for (event, _, mode) in CODEX_GUARD {
+                let command = if mode == "pretool" {
+                    crate::install::pretool_command(&program, &file)
+                } else {
+                    format!("{program} guard {mode}")
+                };
                 hooks.insert(
                     event.to_owned(),
-                    serde_json::json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}]),
+                    serde_json::json!([{"hooks": [{"type": "command", "command": command}]}]),
                 );
             }
             let _ = std::fs::write(&file, serde_json::json!({ "hooks": hooks }).to_string());
-            let mut config = format!("[features]\nunified_exec_tty = {}\n", !tty_off);
+            let mut config = format!(
+                "web_search = \"disabled\"\n[features]\nunified_exec_tty = {}\n",
+                !tty_off
+            );
             for state in trusted {
                 let _ = write!(
                     config,
@@ -1781,7 +2185,7 @@ pub(crate) mod tests {
                 self.env.home.join(".openclaw/openclaw.json"),
                 "{plugins: {entries: {lunchroom: {enabled: true, hooks: {allowConversationAccess: true}}}}}",
             );
-            let plugins = self.env.lunchroom_home.join("plugins/openclaw");
+            let plugins = crate::install::openclaw_plugin_dir(&self.env);
             let _ = std::fs::create_dir_all(&plugins);
             let _ = std::fs::write(
                 plugins.join("index.mjs"),
@@ -1825,8 +2229,16 @@ pub(crate) mod tests {
             assert!(recorded.is_ok(), "{recorded:?}");
         }
 
-        pub(crate) fn doctor_with(&self, verifier: Result<String, String>) -> Outcome {
-            let sys = Verifier(verifier);
+        /// Doctor with the passphrase check `verifier`, what `sudo -n -l` printed (`sudo`), the
+        /// store wall `wall` as found on disk, and `facts` for the files rules name.
+        pub(crate) fn doctor_full(
+            &self,
+            verifier: Result<String, String>,
+            sudo: Result<String, String>,
+            wall: crate::wall::Facts,
+            facts: &dyn Fn(&str) -> Option<lunchroom_core::sudoers::PathFacts>,
+        ) -> Outcome {
+            let sys = Verifier(verifier, sudo);
             let host = Host {
                 sys: &sys,
                 path: Some(self.path_dir.clone().into_os_string()),
@@ -1836,8 +2248,19 @@ pub(crate) mod tests {
                 managed: self.root.join("managed-settings.json"),
                 openclaw_config: self.env.home.join(".openclaw/openclaw.json"),
                 root: self.root.join("sysroot"),
+                wall,
+                path_facts: facts,
             };
             doctor_on(&self.env, &host)
+        }
+
+        pub(crate) fn doctor_with(&self, verifier: Result<String, String>) -> Outcome {
+            self.doctor_full(
+                verifier,
+                Ok(SUDO_ASKS.to_owned()),
+                crate::wall::tests::good(),
+                &|_| None,
+            )
         }
 
         pub(crate) fn doctor(&self) -> Outcome {
@@ -1892,10 +2315,20 @@ pub(crate) mod tests {
         assert_eq!(out.code, 0, "{}", out.stdout);
         assert_eq!(fails(&out), Vec::<&str>::new());
         let lines: Vec<&str> = out.stdout.lines().collect();
-        // C1.4 gained the guard's records: one PASS line with none undecided.
-        assert_eq!(lines.len(), 8, "{}", out.stdout);
+        // C1.4 gained the guard's records: one PASS line with none undecided; 1.1 gained the five
+        // parts of the store wall, the `sudo -n -l` line and the console's line, which is a NOTE
+        // (no console installed), not a PASS or a FAIL.
+        assert_eq!(lines.len(), 15, "{}", out.stdout);
         assert!(
-            lines.iter().all(|l| l.starts_with("PASS ")),
+            lines
+                .iter()
+                .all(|l| l.starts_with("PASS ") || l.starts_with("NOTE ")),
+            "{}",
+            out.stdout
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("NOTE ")).count(),
+            1,
             "{}",
             out.stdout
         );
@@ -1923,9 +2356,11 @@ pub(crate) mod tests {
         let out = s.doctor();
         assert_eq!(out.code, 0, "{}", out.stdout);
         let lines: Vec<&str> = out.stdout.lines().collect();
-        assert_eq!(lines.len(), 12, "{}", out.stdout);
+        assert_eq!(lines.len(), 19, "{}", out.stdout);
         assert!(
-            lines.iter().all(|l| l.starts_with("PASS ")),
+            lines
+                .iter()
+                .all(|l| l.starts_with("PASS ") || l.starts_with("NOTE ")),
             "{}",
             out.stdout
         );
@@ -2588,17 +3023,6 @@ pub(crate) mod tests {
              Ways forward:\n\
              - The agent: send a shorter message, and send what remains as further messages.\n"
         );
-        let out = too_many_lines("alice", "a\nb\nc");
-        assert_eq!(out.code, 2);
-        assert_eq!(
-            out.stderr,
-            "DENIED · the message has too many lines\n\
-             What was DENIED: the message to alice (3 lines).\n\
-             Why: each line of a message is labelled, and the labelled message must fit in one \
-             command argument.\n\
-             Ways forward:\n\
-             - The agent: send fewer, longer lines, or split the message into several.\n"
-        );
         let out = store_unusable(&"disk full", "the message to alice", "updated");
         assert_eq!(out.code, 1);
         assert_eq!(
@@ -2764,7 +3188,10 @@ pub(crate) mod tests {
         let elsewhere = s.root.join("claude-config");
         let _ = std::fs::remove_dir_all(s.env.home.join(".claude"));
         let _ = std::fs::create_dir_all(&elsewhere);
-        let sys = Verifier(Ok(crate::terminal::fake::verifier()));
+        let sys = Verifier(
+            Ok(crate::terminal::fake::verifier()),
+            Ok(SUDO_ASKS.to_owned()),
+        );
         let host = |claude_config: std::path::PathBuf| Host {
             sys: &sys,
             path: Some(s.path_dir.clone().into_os_string()),
@@ -2774,6 +3201,8 @@ pub(crate) mod tests {
             managed: s.root.join("managed-settings.json"),
             openclaw_config: s.env.home.join(".openclaw/openclaw.json"),
             root: s.root.join("sysroot"),
+            wall: crate::wall::tests::good(),
+            path_facts: &|_| None,
         };
         let skipped = doctor_on(&s.env, &host(s.env.home.join(".claude")));
         assert!(
@@ -2906,6 +3335,34 @@ pub(crate) mod tests {
     }
 
     // G3-11: `lunchroom status` prints the total of the calls waiting for the user, the number
+    // F2 design, "The agents on the console": `lunchroom status` keeps what it found of each named
+    // agent for the console, and nothing of a session with no name.
+    #[test]
+    fn status_keeps_what_it_found_of_each_agent_for_the_console() {
+        use lunchroom_core::mail::{Found, Origin};
+        let s = Setup::new("status-judged");
+        let Ok(store) = Store::<Mail>::open(&s.env.store_dir()) else {
+            unreachable!("the store opens");
+        };
+        let named = Identity::new(Harness::Codex, "n1");
+        let unnamed = Identity::new(Harness::Codex, "u1");
+        let stored = store.update(|m| {
+            m.observe(&named);
+            m.observe(&unnamed);
+            let _ = m.register("alpha", &named, Origin::User, None);
+        });
+        assert!(stored.is_ok());
+        let out = status(&s.env);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let mail = store.read().unwrap_or_default();
+        let judged = mail.judged(&named);
+        assert!(judged.is_some(), "alpha was judged");
+        let Some(judged) = judged else { return };
+        assert_eq!(judged.found, Found::NotRunning);
+        assert_eq!(judged.at, s.env.now);
+        assert!(mail.judged(&unnamed).is_none());
+    }
+
     // `lunchroom approve` lists, whoever asked.
     #[test]
     fn status_prints_every_call_waiting_for_the_user() {

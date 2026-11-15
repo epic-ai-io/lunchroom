@@ -70,12 +70,26 @@ impl Live {
         json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}])
     }
 
+    /// The tool-call hook as the install writes it into `file` (H1.5): the install's own
+    /// `pretool_command`, which names the file it is in, and in Claude Code `"onFailure": "block"`.
+    fn pretool_hook(&self, file: &Path, claude: bool) -> serde_json::Value {
+        let program = self.root.join("bin/lunchroom").display().to_string();
+        let mut hook = json!({
+            "type": "command",
+            "command": crate::install::pretool_command(&program, file),
+        });
+        if claude {
+            hook["onFailure"] = json!("block");
+        }
+        json!([{"hooks": [hook]}])
+    }
+
     /// Claude Code's user settings holding the whole guard.
     fn write_claude_guard(&self) {
         let dir = self.home.join(".claude");
         let _ = std::fs::create_dir_all(&dir);
         let settings = json!({"hooks": {
-            "PreToolUse": self.hook("pretool"),
+            "PreToolUse": self.pretool_hook(&dir.join("settings.json"), true),
             "PostToolUse": self.hook("posttool"),
             "PostToolUseFailure": self.hook("posttool"),
             "UserPromptSubmit": self.hook("prompt"),
@@ -90,7 +104,9 @@ impl Live {
     /// Codex's `config.toml` with terminals off, the setting a guarded session needs.
     fn write_codex_terminals_off(&self) {
         let _ = std::fs::create_dir_all(self.codex_home());
-        let off = "[features]\nunified_exec_tty = false\n";
+        // As the install writes it (H1.4): `web_search = "disabled"` at the top, then the table.
+        let off =
+            format!("{CODEX_WEB} = \"{CODEX_WEB_DISABLED}\"\n[features]\n{CODEX_TTY} = false\n");
         let _ = std::fs::write(self.codex_home().join("config.toml"), off);
     }
 
@@ -99,7 +115,7 @@ impl Live {
         self.write_codex_terminals_off();
         let file = self.codex_home().join("hooks.json");
         let hooks = json!({"hooks": {
-            "PreToolUse": self.hook("pretool"),
+            "PreToolUse": self.pretool_hook(&file, false),
             "PostToolUse": self.hook("posttool"),
             "UserPromptSubmit": self.hook("prompt"),
             "SessionStart": self.hook("start"),
@@ -120,13 +136,23 @@ impl Live {
         })
         .collect();
         let trusted = trusted.concat();
-        let config = format!("[features]\nunified_exec_tty = false\n{trusted}");
+        let config = format!(
+            "{CODEX_WEB} = \"{CODEX_WEB_DISABLED}\"\n[features]\n{CODEX_TTY} = false\n{trusted}"
+        );
         let _ = std::fs::write(self.codex_home().join("config.toml"), config);
     }
 
     /// A guard hook ran in the session with the configuration now in place.
     fn record_codex_guard_ran(&mut self) {
-        let fingerprint = codex_guard_in(&self.codex_home(), std::process::id(), &self.root).ok();
+        // What Codex's guard hook records when it runs (claude.rs, R3.1 and H1.4): the settings
+        // line, then the trusted guard.
+        let previous = self.mail.guard_fingerprint(&self.who).map(str::to_owned);
+        let fingerprint = crate::evidence::codex_guard_fingerprint(
+            std::process::id(),
+            &self.root,
+            &self.home,
+            previous.as_deref(),
+        );
         self.mail.record_guard_fingerprint(&self.who, fingerprint);
     }
 

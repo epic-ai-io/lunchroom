@@ -1,7 +1,7 @@
 #!/bin/bash
 # Proof 10 (hookfields): which hook output field Claude Code shows by default.
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/hookfields/prove.sh | tee hookfields.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/hookfields/prove.sh | tee hookfields.txt
 
 . "$(dirname "$0")/../common/host.sh"
 

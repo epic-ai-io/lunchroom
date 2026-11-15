@@ -28,6 +28,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The folder under which each user's store folder is made.
 pub const STORE_ROOT: &str = "/var/lib/lunchroom";
 
+/// The folder under which each user's delivery folder for controller approvals is made (§17.9).
+pub const APPROVALS_ROOT: &str = "/var/lib/lunchroom-approvals";
+
+/// The folder of the `sudo` rule file of §17.8, and the start of its name
+/// (`/etc/sudoers.d/zz-lunchroom-<uid>`).
+pub const SUDOERS_DIR: &str = "/etc/sudoers.d";
+
+/// The start of the name of the rule file of §17.8.
+pub const SUDOERS_PREFIX: &str = "zz-lunchroom-";
+
 /// The folder the installed program is in.
 pub const PROGRAM_DIR: &str = "/usr/local/lib/lunchroom";
 
@@ -73,17 +83,55 @@ pub const fn is_setgid(ids: Ids) -> bool {
     ids.egid != ids.gid
 }
 
-/// The ids of this process, read once from `/proc/self/status`; `None` when they cannot be read.
+/// The ids of this process, from the system calls `getuid`, `geteuid`, `getgid` and `getegid`: no
+/// `/proc` is needed, so a process with none still knows it runs setgid (a `LUNCHROOM_HOME` it is
+/// given is then still ignored). Always `Some`.
 #[must_use]
 pub fn current() -> Option<Ids> {
-    static IDS: OnceLock<Option<Ids>> = OnceLock::new();
-    *IDS.get_or_init(|| parse_status(&std::fs::read_to_string("/proc/self/status").ok()?))
+    static IDS: OnceLock<Ids> = OnceLock::new();
+    Some(*IDS.get_or_init(|| Ids {
+        uid: rustix::process::getuid().as_raw(),
+        euid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getgid().as_raw(),
+        egid: rustix::process::getegid().as_raw(),
+    }))
 }
 
 /// This process runs setgid.
 #[must_use]
 pub fn active() -> bool {
     current().is_some_and(is_setgid)
+}
+
+/// Runs `read` with this thread's effective group (and so its filesystem group) set back to the
+/// real group, and sets it back to the effective group after, a panic in `read` included. A setgid
+/// program cannot read another process's `/proc/<pid>/exe`, `cwd` or `environ` as it is:
+/// `proc_pid_exe(5)` puts each behind "a ptrace access mode `PTRACE_MODE_READ_FSCREDS` check", and
+/// `ptrace(2)` rule 3 denies it unless "the real, effective, and saved-set group IDs of the target
+/// match the caller's group ID" (the filesystem group, for FSCREDS). With the group `lunchroom`
+/// they never match a process of the user's (2026-11-14 real-world kit: every Codex session was
+/// UNGUARDED, its program path unreadable). The saved group stays `lunchroom`, so the switch back
+/// is allowed; the change is the calling thread's alone (Linux keeps group ids per thread). Where
+/// the switch back fails the process stops at once rather than go on with a group it did not
+/// choose. A process that does not run setgid runs `read` as it is.
+pub fn as_own_group<T>(read: impl FnOnce() -> T) -> T {
+    struct Back(rustix::process::Gid);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            if rustix::thread::set_thread_res_gid(None, self.0, None).is_err() {
+                std::process::abort();
+            }
+        }
+    }
+    let Some(ids) = current().filter(|ids| is_setgid(*ids)) else {
+        return read();
+    };
+    let own_group = rustix::process::Gid::from_raw(ids.gid);
+    if rustix::thread::set_thread_res_gid(None, own_group, None).is_err() {
+        return read();
+    }
+    let _back = Back(rustix::process::Gid::from_raw(ids.egid));
+    read()
 }
 
 /// The store folder of user `uid` in setgid mode: `/var/lib/lunchroom/<uid>`.
@@ -143,6 +191,59 @@ pub fn gid_from_group(group: &str, name: &str) -> Option<u32> {
             .then(|| fields[2].parse().ok())
             .flatten()
     })
+}
+
+/// The name of the primary group of user `uid`: the group number on its line of the account
+/// database, named by the group database.
+#[must_use]
+pub fn primary_group_name(passwd: &str, group: &str, uid: u32) -> Option<String> {
+    let gid = passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid))
+            .then(|| fields[3].parse::<u32>().ok())
+            .flatten()
+    })?;
+    group.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.len() >= 3 && fields[2].parse::<u32>().ok() == Some(gid) && !fields[0].is_empty())
+            .then(|| fields[0].to_owned())
+    })
+}
+
+/// The folder of the verifiers and of the console's keys (A1.3, §17.9).
+pub const KEY_DIR: &str = "/etc/lunchroom";
+
+/// The console's private key for user `uid` (§17.9): `/etc/lunchroom/<uid>.console.key`.
+#[must_use]
+pub fn console_key(uid: u32) -> PathBuf {
+    Path::new(KEY_DIR).join(format!("{uid}.console.key"))
+}
+
+/// The console's public key for user `uid` (§17.9): `/etc/lunchroom/<uid>.console.pub`. Its
+/// presence is the controller's signal that the console is installed.
+#[must_use]
+pub fn console_pub(uid: u32) -> PathBuf {
+    Path::new(KEY_DIR).join(format!("{uid}.console.pub"))
+}
+
+/// The record of why the console was not set up for user `uid`, which `lunchroom doctor` reads
+/// (§17.8): `/etc/lunchroom/<uid>.console.state`, root's, so no process of the user's can change
+/// it.
+#[must_use]
+pub fn console_state(uid: u32) -> PathBuf {
+    Path::new(KEY_DIR).join(format!("{uid}.console.state"))
+}
+
+/// The delivery folder for controller approvals of user `uid` (§17.9).
+#[must_use]
+pub fn approvals_home(uid: u32) -> PathBuf {
+    Path::new(APPROVALS_ROOT).join(uid.to_string())
+}
+
+/// The rule file of §17.8 for user `uid`: `/etc/sudoers.d/zz-lunchroom-<uid>`.
+#[must_use]
+pub fn rule_file(uid: u32) -> PathBuf {
+    Path::new(SUDOERS_DIR).join(format!("{SUDOERS_PREFIX}{uid}"))
 }
 
 /// `mode` with the group given what the owner has: `0o600` becomes `0o660`, `0o700` `0o770`.
@@ -345,5 +446,63 @@ mod tests {
     #[test]
     fn the_test_process_is_not_setgid() {
         assert!(!active());
+    }
+
+    // Fable L7: the ids come from the system calls, not from `/proc`, so they are always known and
+    // agree with `/proc/self/status` where that is there.
+    #[test]
+    fn the_ids_come_from_the_system_calls() {
+        let ids = current();
+        assert!(ids.is_some());
+        if let Some(from_proc) = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| parse_status(&s))
+        {
+            assert_eq!(ids, Some(from_proc));
+        }
+    }
+
+    // §17.9: the delivery folder's group is the developer's primary group by name; a user with no
+    // line, or a group number with no name, gives none.
+    #[test]
+    fn the_primary_group_is_named_from_the_two_databases() {
+        let passwd = "root:x:0:0::/root:/bin/sh\ndev:x:1000:2000:Dev:/home/dev:/bin/bash\nodd:x:1001:3000::/h:/bin/sh\n";
+        let group = "root:x:0:\nstaff:x:2000:dev\ndev:x:1000:\n";
+        assert_eq!(
+            primary_group_name(passwd, group, 1000).as_deref(),
+            Some("staff")
+        );
+        assert_eq!(
+            primary_group_name(passwd, group, 0).as_deref(),
+            Some("root")
+        );
+        assert_eq!(primary_group_name(passwd, group, 1001), None);
+        assert_eq!(primary_group_name(passwd, group, 4242), None);
+        assert_eq!(primary_group_name("", group, 1000), None);
+    }
+
+    // §17.8, §17.9: the paths the console install makes, by user id.
+    #[test]
+    fn the_console_paths_are_the_spec_ones() {
+        assert_eq!(
+            console_key(1000),
+            Path::new("/etc/lunchroom/1000.console.key")
+        );
+        assert_eq!(
+            console_pub(1000),
+            Path::new("/etc/lunchroom/1000.console.pub")
+        );
+        assert_eq!(
+            console_state(7),
+            Path::new("/etc/lunchroom/7.console.state")
+        );
+        assert_eq!(
+            approvals_home(1000),
+            Path::new("/var/lib/lunchroom-approvals/1000")
+        );
+        assert_eq!(
+            rule_file(1000),
+            Path::new("/etc/sudoers.d/zz-lunchroom-1000")
+        );
     }
 }

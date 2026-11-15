@@ -150,19 +150,25 @@ fn rule_2_signalling_the_console_is_denied() {
     }
 }
 
-// Rule 3: gdb, strace, ltrace and ptrace through python or perl are DENIED, alone or behind a
+// Rule 3 (§17.5): gdb, strace and ltrace given a process id that is not written in the call or is
+// not in the agent's own subtree, and ptrace through python or perl, are DENIED, alone or behind a
 // wrapper; `/proc/<pid>/{mem,environ,fd,maps}` of a process outside the agent's own subtree is
-// DENIED, and one inside it (the harness, its children) is not.
+// DENIED, and one inside it (the harness, its children) is not. A debugger that starts a program
+// of its own runs.
 #[test]
 fn rule_3_debuggers_and_tracing_are_denied() {
     for command in [
         "gdb -p 1234",
         "strace -p 1",
-        "ltrace ls",
-        "sudo strace -f ls",
-        "env FOO=1 gdb --batch",
+        "strace -f -p 1",
+        "ltrace -p 1",
+        "sudo strace -fp 1",
+        "env FOO=1 gdb --batch -p 1",
+        "gdb --batch -ex 'attach 1'",
         "python3 -c 'import ctypes; ctypes.CDLL(None).ptrace(16, 1234, 0, 0)'",
         "perl -e 'require \"syscall.ph\"; syscall(&SYS_ptrace, 16, 1234, 0, 0)'",
+        "perl -e 'syscall(101, 16, 1234, 0, 0)'",
+        "python3 -c 'import ctypes; ctypes.CDLL(None).syscall(117, 16, 1234, 0, 0)'",
     ] {
         assert_eq!(bash(false, command), CONFIG, "{command}");
         denied(command);
@@ -170,8 +176,14 @@ fn rule_3_debuggers_and_tracing_are_denied() {
     for command in [
         "python3 -c 'print(1)'",
         "perl -e 'print 1'",
+        "perl -e 'syscall(39)'",
         "ps aux",
         "git diff",
+        // §17.5: one that starts a program of its own runs.
+        "ltrace ls",
+        "sudo strace -f ls",
+        "strace -o /tmp/t.out ls -p x",
+        "gdb --batch ./prog",
     ] {
         allowed(command);
     }

@@ -1,0 +1,18 @@
+# Proof 17 (echokill): the terminal's echo comes back after the program is killed while the
+# passphrase is typed (spec section 7 A1.3; GAPS addendum 2: a watchdog process restores it).
+#
+# Lunchroom 1.1 on Ubuntu 24.04 with a real sudo, no Claude Code needed.
+#
+# Build context: made by ../prove.sh.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sudo python3 procps util-linux \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY lunchroom lib.sh ptyrun.py plaintext.py echokill.py inner.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/plaintext.py \
+      /opt/proof/echokill.py
+
+CMD ["/opt/proof/inner.sh"]

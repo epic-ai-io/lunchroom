@@ -1,5 +1,154 @@
 # Changelog
 
+## 1.2.0
+
+Lunchroom 1.2 adds the console, the store wall, a check of your `sudo` rules and approvals for the Agent Execution Controller, and a run-time test that no command or hook opens a network connection. 1.1.3 is superseded by 1.2.0.
+
+Upgrade: download and unpack the new release, then run its program by its path, in your own terminal, from the unpacked folder: `./lunchroom install`. Its last step sets up the console; it also sets your passphrase check to root's, group `lunchroom`, mode 0640. If that step stops, `lunchroom install console` runs it again. Then start each agent session anew.
+
+### The console
+
+- `lunchroom install` sets the console up as its last step (`lunchroom install console` runs only
+  that step again), and `lunchroom console` starts it. It is a
+  full-screen terminal screen (built with Ratatui) that runs as the user `lunchroom`, in a terminal
+  of your own that you own. It shows the agents, the QUEUED and FAILED messages with their reasons,
+  the notices for you (including those OpenClaw and Hermes cannot show), the calls waiting for
+  approval with their age, the counts of DENIED decisions, the guard's timeouts and slow decisions,
+  and the checks of `lunchroom doctor`.
+- An alert strip of six cells stays at the top of the screen: `CALLS WAIT`, `PROBING`,
+  `FAILED MSG`, `UNGUARDED`, `GUARD SLOW` and `CHECKS`. Each carries its count or word, so colour is
+  never the only sign, and it stays drawn and live while the console is locked.
+- The main screen shows one line per item. Select an item, by a click or by the arrow keys and
+  Enter, and a panel opens with its whole text; Esc, or a click outside the panel, closes it. Text
+  an agent chose is drawn with each control character and direction mark replaced by a visible
+  mark, so an agent cannot change the screen's layout.
+- From a panel you can approve or refuse a waiting call, release a hold, resend or discard a failed
+  message, hold or unregister an agent, dismiss a probing alert, see the command that repairs an
+  UNGUARDED or STOPPED agent, and clear a marked path. Every action has a key and every key a click.
+- The console asks your passphrase when it starts, and again for every `approve`, every loosening
+  action (`mode balanced`, `mode relaxed`, `yolo`) and every approval for the controller, a second
+  `approve` a minute after the first included. After 15 minutes without a key it locks, and asks
+  the passphrase again before it does or shows anything but the alert strip. An `unregister`
+  within those 15 minutes rides on the passphrase last typed.
+- The guard now keeps each DENIED decision (time, session, reason word, and the call with its
+  secrets replaced, cut at 64 KiB and marked `cut`), up to 1,000 beside the 200 records of undecided or slow calls. Five or more DENIED decisions in
+  10 minutes from one agent raise a probing alert, shown on the console and given to you as a
+  notice.
+- New guard rules, so an agent cannot reach the console or the store by the side: a read or write
+  of `/dev/pts/*`, `/dev/tty*` or `/dev/vcs*` other than the agent's own terminal is DENIED; `kill`,
+  `pkill` or `killall` naming the console or `lunchroom` is DENIED; `gdb`, `strace` and `ltrace`
+  given a process id, and reads of `/proc/<pid>/mem`, `environ`, `fd` and `maps`, are DENIED unless
+  the process is written in the call and is in the agent's own subtree; ptrace through `python` or
+  `perl` is DENIED; the keystroke, pane-capture and pane-pipe commands of `tmux`, and the `stuff`
+  and `hardcopy` commands of `screen`, are PROTECTED while the agent is HELD and DENIED when the
+  target is not its own pane; `sudo`, `su`, `runuser`, `machinectl shell`, `pkexec`, `doas` and
+  `run0` to the user `lunchroom`, and any write to Lunchroom's store, program, `/etc/lunchroom` or
+  the `sudo` rule file, are DENIED; running the program with `console` is DENIED.
+- A read of `/etc/lunchroom`, where the passphrase checks are, is DENIED in every build.
+- The console runs as the user `lunchroom`, which cannot read your home folder or your agents'
+  processes. It tells a STOPPED agent itself and shows each other agent's state as your own
+  Lunchroom program last found it: each guard hook of a named agent has its session judged again,
+  after it has answered, at most every 30 seconds. An agent shows AVAILABLE only from a finding of
+  the last 2 minutes; an older one shows as not known, with the time it was last found guarded and
+  `lunchroom status` to judge it now. A STOPPED agent's panel shows the command that repairs it.
+- The alerts box lists what you act on first (PROBING alerts, QUEUED and FAILED messages, failing
+  checks, marked paths); on a full box the newest notices stay on the screen, with a line counting
+  the rest. A HELD agent's panel shows the text of an arrival Lunchroom did not deliver (an OpenClaw
+  or Hermes prompt you did not type, a harness's own cross-session message), kept with every secret
+  replaced while it holds the session.
+- A HELD agent's `gdb` that starts a program of its own runs when it takes `-nx` and only `run`,
+  `r`, `bt`, `backtrace`, `continue`, `c`, `quit` or `q` as `-ex`, then `--args` and the program;
+  any other `gdb` call goes to you (stated limit 27).
+
+### The store wall
+
+- `lunchroom install` creates the system user and group `lunchroom`. The store moves to
+  `/var/lib/lunchroom/<uid>/` (group `lunchroom`, mode 2770) and the program is installed at
+  `/usr/local/lib/lunchroom/lunchroom`, setgid `lunchroom`. Your user is not in that group, so no
+  process of yours, an agent's included, can enter the store or read the passphrase check; only the
+  program can, through its own logic. That program ignores `LUNCHROOM_HOME` and every other
+  variable that sets a path, and drops the group before it runs any other program.
+- The install moves an existing store into the new folder, every QUEUED message with it, writes
+  hooks that run the program at its new path, and says which sessions to start anew. Before it
+  moves the store it stops your running 1.0.1 listeners; where one does not stop, it moves nothing,
+  names that process and exits with a failure.
+- `lunchroom install` with no harness named and none found changes nothing, the store wall
+  included, and says that a harness's folder is made the first time it runs: start it once, or name
+  it (`lunchroom install claude-code`).
+- On an account with neither `~/.local/bin` nor `~/bin`, the install makes `~/.local/bin` and links
+  `lunchroom` there, and says when that folder is not on your PATH yet.
+- `lunchroom doctor` and the console fail when `/usr/local/lib/lunchroom` or the program in it can
+  be written by anyone but root, and an error about a store that cannot be reached names the folder
+  or file.
+
+### The wide and narrow `sudo` check
+
+- The store wall and the console's wall hold only where your account needs a password for `sudo`.
+  `lunchroom install`, `lunchroom install console` and `lunchroom doctor` read `sudo -n -l` and
+  sort each rule that runs without a password as wide or narrow. A rule is wide when it runs as
+  root or any user with any command, runs as the user or group `lunchroom`, names a command with a
+  wildcard, names a shell or a program that runs other programs, names a file or a folder that a
+  user other than root can change, or runs as another user whose own rules are wide. Any other rule
+  is narrow, and leaves the walls standing.
+- With a wide rule, `lunchroom install` still sets the store wall up and says plainly that it does
+  not hold on this account until the rule is removed; `lunchroom doctor` says the same on a line
+  that leaves its exit code as it was. Setting the console up (the install's last step, or
+  `lunchroom install console`) stops before it sets anything up and asks whether to make `sudo` ask your account for its password. On a typed `yes` it writes the
+  one rule `#<uid> ALL=(ALL:ALL) PASSWD: ALL` as `/etc/sudoers.d/zz-lunchroom-<uid>`, checks it with
+  `visudo`, and keeps it only when `sudo` then asks for a password; otherwise it removes the file,
+  sets nothing up, says why, and `lunchroom doctor` shows a FAIL. From then on every `sudo` command
+  of your account asks that password, an agent's included. The guard still DENIES only an agent's
+  command that runs as `lunchroom` or names Lunchroom's paths.
+- `lunchroom uninstall console` leaves that rule file in place and names it, since removing it
+  would give your account its password-free `sudo` back.
+
+### Approvals for the Agent Execution Controller
+
+- The console approves a phase of a controller run: you give the run and the phase, the console
+  reads the plan hash from the approval request the controller wrote, shows the run, the phase and
+  the hash, and asks `y/N` and then your passphrase. It writes one signed record, bound to that run,
+  that phase and that plan hash, to `/var/lib/lunchroom-approvals/<uid>/`. The signature is Ed25519
+  (RFC 8032). `lunchroom install console` makes the key pair once for each developer; the private
+  key is readable by the user `lunchroom` only, and the public key, whose presence tells the
+  controller that the console is installed, is written last and removed by
+  `lunchroom uninstall console`.
+
+### Limits fixed in 1.2
+
+The limits below were listed for 1.0.1 and are rewritten or fixed in 1.1; the full list is in
+`rust/README.md`, "Stated limits".
+
+- Fixed: limits 11, 13, 19, 23 and 24 of the stated limits.
+- Rewritten to say what Lunchroom does and does not do now: limits 2, 3, 4, 7, 8, 9, 10, 12, 14,
+  15, 16, 17, 18, 20, 21, 22 and 26. Among them, limit 9 names the two cases in which the harness
+  runs a call although the guard failed, and limit 10 says the store wall and the passphrase check
+  do not hold where your account has a `sudo` rule that needs no password.
+- Every release now publishes these limits in its documentation, together with the console's own
+  (a person who walks away from an unlocked console for under 15 minutes leaves `unregister` and
+  what it shows open to whoever is at its keyboard; the developer's outer terminal is owned by the
+  developer, and a process that opens it can race to read keystrokes, the passphrase included).
+
+### Commands
+
+- `lunchroom read <id>` prints the envelope of a message addressed to the session that runs it, and
+  DENIES any other id.
+- `lunchroom clear <path>` clears a path Lunchroom recorded as written by a HELD agent. You type it
+  in a terminal of your own, and an agent's `lunchroom clear` is DENIED.
+- `lunchroom uninstall console` removes the console's public key, the controller's sign that the
+  console is installed, and leaves the `sudo` rule file in place (see above).
+
+### New dependencies and their licences
+
+- `ratatui` (MIT) and `crossterm` (MIT): the console's screen.
+- `signal-hook` (MIT or Apache-2.0).
+- `ed25519-dalek` (BSD-3-Clause): the signature of controller approvals. Its dependencies
+  `curve25519-dalek` and `subtle` are also BSD-3-Clause.
+- `rustix` (Apache-2.0 or MIT).
+
+### No network connection, tested at run time
+
+- Every command and hook of Lunchroom's is now run under a trace of network system calls in the test suite, which fails if any is made; the existing check of the source and dependencies stays.
+
 ## 1.1.3
 
 Fixes to 1.1.2. 1.1.2 is superseded by 1.1.3.

@@ -1,0 +1,64 @@
+# The card kits: one image holding all four harnesses, so that one container can play a card with a live
+# session of each.
+#
+#   Claude Code   Anthropic's apt repository (https://code.claude.com/docs/en/setup.md, the apt tab; the
+#                 key's fingerprint is checked by the build). The release is the stable one; the kit
+#                 prints it and fails on one older than 2.1.309. CLAUDE_CODE_PACKAGE pins another.
+#   Codex         npm @openai/codex, pinned to 0.166.0 (the kit accepts 0.163.0 or later).
+#   OpenClaw      npm openclaw, pinned to 2026.10.7 (needs Node 24).
+#   Hermes        NousResearch/hermes-agent at commit 9976f4857b72439d79016354d7b6e1a3ee952e2f, with the
+#                 dependencies of its own uv.lock (its core dependencies are marked for Python 3.14, which
+#                 uv installs).
+#
+# Build context: made by run-cards-1.1.sh (the static program as `lunchroom`, the files of the shared
+# folder and of this folder, and the console proof's pty driver and screen reader).
+FROM docker.io/library/node:24
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG CLAUDE_CODE_PACKAGE=claude-code
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      curl gnupg ca-certificates sudo python3 python3-pip python3-pyte python3-cryptography procps psmisc util-linux git \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /etc/apt/keyrings/claude-code.asc \
+ && gpg --show-keys --with-colons /etc/apt/keyrings/claude-code.asc | grep -q '^fpr:::::::::31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE:' \
+ && echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
+      > /etc/apt/sources.list.d/claude-code.list \
+ && apt-get update \
+ && apt-get install -y "$CLAUDE_CODE_PACKAGE" \
+ && rm -rf /var/lib/apt/lists/* \
+ && claude --version
+
+RUN npm install -g @openai/codex@0.166.0 openclaw@2026.10.7 \
+ && codex --version | tee /tmp/codex.version \
+ && grep -qx 'codex-cli 0.166.0' /tmp/codex.version \
+ && openclaw --version | tee /tmp/openclaw.version \
+ && grep -q '^OpenClaw 2026.10.7 ' /tmp/openclaw.version
+
+ENV UV_NO_CACHE=1
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN mkdir /opt/hermes-agent && cd /opt/hermes-agent \
+ && git init -q . \
+ && git remote add origin https://github.com/NousResearch/hermes-agent.git \
+ && git fetch -q --depth 1 origin 9976f4857b72439d79016354d7b6e1a3ee952e2f \
+ && git checkout -q FETCH_HEAD \
+ && test "$(git -C /opt/hermes-agent rev-parse HEAD)" = 9976f4857b72439d79016354d7b6e1a3ee952e2f \
+ && pip install -q --no-cache-dir --break-system-packages uv \
+ && cd /opt/hermes-agent && uv sync --frozen \
+ && ln -s /opt/hermes-agent/.venv/bin/hermes /usr/local/bin/hermes \
+ && chmod -R a+rX /opt/hermes-agent /opt/uv-python \
+ && hermes --version | head -1
+
+COPY lunchroom lib.sh ptyrun.py sessionpty.py plaintext.py screen.py /opt/proof/
+COPY cardmock.py cardtool.py lib-cards.sh inner.sh fakeprog.sh consolepty.py lastscreen.py /opt/proof/
+COPY card1.sh card2.sh card3.sh card4.sh card5.sh card6.sh /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/inner.sh /opt/proof/ptyrun.py /opt/proof/sessionpty.py \
+      /opt/proof/plaintext.py /opt/proof/screen.py /opt/proof/cardmock.py /opt/proof/cardtool.py \
+      /opt/proof/fakeprog.sh /opt/proof/consolepty.py /opt/proof/lastscreen.py \
+ && ln -s /opt/proof/fakeprog.sh /usr/local/bin/gh \
+ && ln -s /opt/proof/fakeprog.sh /usr/local/bin/alembic \
+ && ln -s /opt/proof/fakeprog.sh /usr/local/bin/terraform
+
+CMD ["/opt/proof/inner.sh"]

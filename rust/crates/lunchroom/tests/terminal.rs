@@ -200,13 +200,27 @@ impl Verifier {
             earlier,
             made_folder,
         };
-        this.set(line, 0o644)?;
+        // A1.3: root's, group `lunchroom`, mode 0640, as the install writes it.
+        this.set(line, 0o640)?;
         Some(this)
     }
 
     /// Replaces the file's text and mode.
     fn set(&self, line: &str, mode: u32) -> Option<()> {
         std::fs::write(&self.file, format!("{line}\n")).ok()?;
+        let name = lunchroom_core::setgid::SYSTEM_USER;
+        let gid_of = || {
+            let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+            lunchroom_core::setgid::gid_from_group(&groups, name)
+        };
+        if gid_of().is_none() {
+            // The group the install makes; this test runs as root.
+            let _ = Command::new("/usr/sbin/groupadd")
+                .args(["--system", name])
+                .status();
+        }
+        let gid = gid_of();
+        std::os::unix::fs::chown(&self.file, Some(0), gid).ok()?;
         std::fs::set_permissions(&self.file, std::fs::Permissions::from_mode(mode)).ok()
     }
 }

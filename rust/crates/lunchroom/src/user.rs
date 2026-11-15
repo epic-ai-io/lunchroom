@@ -9,7 +9,9 @@
 
 use std::fmt::Write as _;
 
-use lunchroom_core::approvals::{APPROVAL_SECS, visible};
+use lunchroom_core::approvals::{
+    APPROVAL_SECS, Request, TellKind, call_key, call_shown_hash, visible,
+};
 use lunchroom_core::cards;
 use lunchroom_core::identity::{Harness, Identity};
 use lunchroom_core::jcs::shown;
@@ -76,6 +78,54 @@ pub fn approve(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     let Some(request) = mail.requests().get(index).cloned() else {
         return Outcome::denied("no call with that number is waiting", 2);
     };
+    approve_at(index, &request, &mail, &store, env, sys)
+}
+
+/// The console's approve: approves the exact call the user was shown, found by the store's own
+/// name for it ([`call_key`]) and only if it is still shown as it was (`shown`, from
+/// [`call_shown_hash`]). A call that is gone, or is now shown differently, approves nothing: the
+/// position it had in the list when it was shown is never used.
+#[must_use]
+pub fn approve_call(key: &str, shown: &str, env: &Env, sys: &mut dyn System) -> Outcome {
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let _ = store.update(|m| m.expire_requests(env.now));
+    let mail = match read(&store) {
+        Ok(m) => m,
+        Err(o) => return o,
+    };
+    let Some((index, request)) = mail
+        .requests()
+        .iter()
+        .enumerate()
+        .find(|(_, r)| call_key(r) == key)
+        .map(|(i, r)| (i, r.clone()))
+    else {
+        return Outcome::denied(
+            "the call is no longer waiting, so nothing was approved: look at the list again",
+            2,
+        );
+    };
+    if call_shown_hash(&request) != shown {
+        return Outcome::denied(
+            "the call is shown differently now, so nothing was approved: look at it again",
+            3,
+        );
+    }
+    approve_at(index, &request, &mail, &store, env, sys)
+}
+
+/// Asks the user about the waiting call `request` (at `index` in `mail`) and approves it.
+fn approve_at(
+    index: usize,
+    request: &Request,
+    mail: &Mail,
+    store: &Store<Mail>,
+    env: &Env,
+    sys: &mut dyn System,
+) -> Outcome {
     // A2.2: what the user confirms is this text; the approval covers nothing else.
     let shown = mail.approval_prompt(
         &request.session,
@@ -90,12 +140,12 @@ pub fn approve(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
         &span(env.now.saturating_sub(request.at)),
         &clock(request.at.saturating_add(APPROVAL_SECS)),
     );
-    if let Err(reason) = confirm(&mail, sys, &question) {
+    if let Err(reason) = confirm(mail, sys, &question) {
         return Outcome::denied(&reason, 3);
     }
     // The waiting list or the messages holding the session may have changed while the user read
     // the prompt: the approval is given only if the same call would still be shown the same way.
-    let approved = store.update(|m| m.approve_request(index, &request, &shown, env.now));
+    let approved = store.update(|m| m.approve_request(index, request, &shown, env.now));
     match approved {
         // Card 4: "Granted. Codex can merge.", with the agent and the call of the real event.
         Ok(Ok(id)) => {
@@ -103,9 +153,8 @@ pub fn approve(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
                 &request.agent,
                 &cards::action_of(&request.tool, &request.input),
             );
-            let told = (request.session.harness == Harness::Codex)
-                .then(|| crate::codex::tell_approved(env, &store, &request, &id))
-                .and_then(Result::err)
+            let told = tell_decision(env, store, request, &id, TellKind::Approved)
+                .err()
                 .map_or_else(String::new, |reason| {
                     format!(
                         "The session was not told: {reason}. The call runs if the agent tries it \
@@ -118,6 +167,326 @@ pub fn approve(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             "what you were shown changed while you confirmed (a message may have arrived, or the \
              list of waiting calls changed); nothing was approved. Run `lunchroom approve` again.",
             3,
+        ),
+        Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
+    }
+}
+
+/// Tells the agent of `request` of the user's decision `id`, through the channel A1.2 names for an
+/// approval of its harness: Codex, through `codex queue`, and OpenClaw, through the hand-over of
+/// D1.1 (`openclaw agent`), each one line naming only the id, which the agent reads with
+/// `lunchroom read <id>`; Hermes, at the start of its next turn, through the context the plugin's
+/// `pre_llm_call` returns (the line waits in the store, kept when the decision was made). Claude
+/// Code has no channel in A1.2: its retry's reason tells it (§17.10), so there is nothing to send.
+/// The line adds no hold and clears none (A2.1).
+///
+/// # Errors
+/// Why the session could not be told; the decision stands whether or not the session was told.
+pub fn tell_decision(
+    env: &Env,
+    store: &Store<Mail>,
+    request: &Request,
+    id: &str,
+    kind: TellKind,
+) -> Result<(), String> {
+    match request.session.harness {
+        Harness::Codex => crate::codex::tell(env, store, request, id, kind),
+        Harness::OpenClaw => crate::openclaw::tell(env, store, request, id, kind),
+        Harness::Hermes | Harness::ClaudeCode => Ok(()),
+    }
+}
+
+/// §17.10: the user refuses the waiting call `request`. The call is DENIED, a retry of that exact
+/// call is DENIED with the reason that the user refused it, and the agent is told through
+/// [`tell_decision`]. Returns the refusal's id, or why nothing was refused. The console's refuse
+/// key calls it; nothing here asks for a passphrase, since a refusal only denies.
+///
+/// # Errors
+/// The call is no longer waiting, the store cannot be used, or (the refusal then stands) the
+/// session could not be told.
+pub fn refuse(env: &Env, store: &Store<Mail>, request: &Request) -> Result<String, String> {
+    let id = store
+        .update(|m| {
+            let at = m.requests().iter().position(|r| r == request)?;
+            m.refuse_request(at, request, env.now).ok()
+        })
+        .map_err(crate::cli::unwritten)?
+        .ok_or("that call is no longer waiting")?;
+    tell_decision(env, store, request, &id, TellKind::Refused)
+        .map_err(|reason| format!("{id} declined; the session was not told: {reason}"))?;
+    Ok(id)
+}
+
+/// F2-AC52 (§17.10): the console declines the waiting call it showed as `key` and `shown`, found
+/// as [`approve_call`] finds it. The call is refused through [`refuse`] (DENIED, its exact retry
+/// DENIED with the user's reason, the agent told), and the user is told the outcome as D1.8 words
+/// it: "Denied. <agent>'s call <id> was not approved."
+pub fn refuse_call(key: &str, shown: &str, env: &Env) -> Outcome {
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let _ = store.update(|m| m.expire_requests(env.now));
+    let mail = match read(&store) {
+        Ok(m) => m,
+        Err(o) => return o,
+    };
+    let Some(request) = mail.requests().iter().find(|r| call_key(r) == key).cloned() else {
+        return Outcome::denied(
+            "the call is no longer waiting, so nothing was declined: look at the list again",
+            2,
+        );
+    };
+    if call_shown_hash(&request) != shown {
+        return Outcome::denied(
+            "the call is shown differently now, so nothing was declined: look at it again",
+            3,
+        );
+    }
+    match refuse(env, &store, &request) {
+        Ok(id) => Outcome::ok(format!(
+            "Denied. {}'s call {id} was not approved.\n",
+            request.agent
+        )),
+        Err(reason) => Outcome::denied(&reason, 3),
+    }
+}
+
+/// The words of the line of Lunchroom's that records a hold the user ended from the console
+/// (F2-AC53; F2 design "Lists").
+pub const RELEASE_WORDS: &str = "The user ended this agent's hold from the console.";
+
+/// F2-AC53 (§17.10): the console releases the hold on the agent named `name`. The hold ends as when
+/// the user types in that session ([`Mail::user_typed`]) and is recorded as a line of Lunchroom's
+/// (§16 item 1). The console asked the passphrase before this.
+pub fn release_hold(name: &str, env: &Env) -> Outcome {
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let released = store.update(|m| {
+        let who = m.named(name)?.clone();
+        if m.holding(&who).is_empty() {
+            return Some(false);
+        }
+        m.user_typed(&who);
+        m.record_line(
+            env.now,
+            RELEASE_WORDS,
+            lunchroom_core::mail::lines::Who::Agents(&[name]),
+            std::slice::from_ref(&who),
+            &[],
+        );
+        Some(true)
+    });
+    match released {
+        Ok(Some(true)) => Outcome::ok(format!(
+            "{name}'s hold ended, as when you type in its session.\n"
+        )),
+        Ok(Some(false)) => {
+            Outcome::denied(&format!("{name} is not HELD, so nothing was released"), 3)
+        }
+        Ok(None) => Outcome::denied(
+            &format!("{name} is not a registered name, so nothing was released"),
+            2,
+        ),
+        Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
+    }
+}
+
+/// F2-AC54 (§17.10): the console resends the FAILED message `id` as a new message, from the same
+/// sender to the same recipient with the same text, under every rule of D1 ([`Mail::send`]); it
+/// holds its recipient when it is delivered, as any message does. The FAILED message stays as it
+/// was. A message that is not FAILED, or a send that D1 refuses, resends nothing.
+pub fn resend_failed(id: &str, env: &Env) -> Outcome {
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let sent = store.update(|m| {
+        let old = m
+            .message(id)
+            .filter(|old| old.status.state() == lunchroom_core::vocab::MessageState::Failed)
+            .cloned()?;
+        let result = m
+            .send(&old.from, &old.from_name, &old.to_name, &old.text, env.now)
+            .map(|accepted| accepted.id);
+        Some((old, result))
+    });
+    match sent {
+        Ok(Some((_, Ok(new)))) => Outcome::ok(format!("{id} was resent as {new}, QUEUED.\n")),
+        // D1 refused the new message: said as `lunchroom send` says it (the text never shown).
+        Ok(Some((old, Err(refusal)))) => crate::cli::refused(
+            &refusal,
+            &crate::cli::Refused {
+                to: &old.to_name,
+                from: &old.from_name,
+                text: &old.text,
+                held_by: &[],
+            },
+        ),
+        Ok(None) => Outcome::denied(
+            &format!("{id} is not a FAILED message, so nothing was resent"),
+            3,
+        ),
+        Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
+    }
+}
+
+/// F2-AC54: the line of Lunchroom's that records a discard, and what its sender is told.
+pub fn discard_words(id: &str) -> String {
+    format!("The user discarded message {id} from the console.")
+}
+/// F2-AC54: what the sender of a discarded message is told.
+pub fn discard_notice(id: &str, to: &str) -> String {
+    format!("Your message {id} to {to} was discarded by the user.")
+}
+/// F2-AC55: the line that records a hold by the user.
+pub const HOLD_WORDS: &str = "The user held this agent from the console.";
+/// F2-AC55: the line that records a dismissed PROBING alert.
+pub const DISMISS_WORDS: &str = "The user dismissed the PROBING alert for this agent.";
+/// F2-AC57: the line that records a stale hold released.
+pub const STALE_WORDS: &str = "The user released a hold whose message is gone.";
+
+/// F2-AC54, F2-AC57 (§17.10): the console discards the QUEUED or FAILED message `id`
+/// ([`Mail::discard_message`]) and records it as a line of Lunchroom's. A DELIVERED message, or an
+/// id the store does not hold, discards nothing.
+pub fn discard_message(id: &str, env: &Env) -> Outcome {
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let done = store.update(|m| {
+        let to = m
+            .message(id)
+            .map(|msg| msg.to_name.clone())
+            .unwrap_or_default();
+        let result = m.discard_message(id, &discard_notice(id, &to), env.now);
+        if let Ok(gone) = &result {
+            m.record_line(
+                env.now,
+                &discard_words(id),
+                lunchroom_core::mail::lines::Who::Agents(&[gone.to_name.as_str()]),
+                std::slice::from_ref(&gone.to),
+                &[],
+            );
+        }
+        result
+    });
+    match done {
+        Ok(Ok(_)) => Outcome::ok(format!("{id} was discarded and recorded in the log.\n")),
+        Ok(Err(lunchroom_core::mail::Refused::Delivered)) => {
+            Outcome::denied(&format!("{id} was DELIVERED, so it cannot be discarded"), 3)
+        }
+        Ok(Err(lunchroom_core::mail::Refused::Unknown)) => Outcome::denied(
+            &format!("there is no message {id}, so nothing was discarded"),
+            2,
+        ),
+        Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
+    }
+}
+
+/// F2-AC55 (§17.10): the console holds the agent named `name` as HELD by the user
+/// ([`Mail::hold_by_user`]) and records it as a line of Lunchroom's.
+pub fn hold_agent(name: &str, env: &Env) -> Outcome {
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let held = store.update(|m| {
+        let who = m.named(name)?.clone();
+        m.hold_by_user(&who, env.now);
+        m.record_line(
+            env.now,
+            HOLD_WORDS,
+            lunchroom_core::mail::lines::Who::Agents(&[name]),
+            std::slice::from_ref(&who),
+            &[],
+        );
+        Some(())
+    });
+    match held {
+        Ok(Some(())) => Outcome::ok(format!(
+            "{name} is HELD by you; typing in its session, or releasing it here, ends the hold.\n"
+        )),
+        Ok(None) => Outcome::denied(
+            &format!("{name} is not a registered name, so nothing was held"),
+            2,
+        ),
+        Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
+    }
+}
+
+/// F2-AC55 (§17.10): the console dismisses the PROBING alert `alert` (`probing:<session id>`)
+/// ([`Mail::dismiss_probe`]); it stays dark until that agent's next DENIED decision. Any other
+/// alert dismisses nothing.
+pub fn dismiss_probe(alert: &str, env: &Env) -> Outcome {
+    let Some(session) = alert.strip_prefix("probing:") else {
+        return Outcome::denied("only a PROBING alert can be dismissed here", 2);
+    };
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let done = store.update(|m| {
+        m.dismiss_probe(session, env.now);
+        let agents: Vec<(String, lunchroom_core::identity::Identity)> = m
+            .names()
+            .filter(|(_, who)| who.session == session)
+            .map(|(n, who)| (n.to_owned(), who.clone()))
+            .collect();
+        let names: Vec<&str> = agents.iter().map(|(n, _)| n.as_str()).collect();
+        let ids: Vec<lunchroom_core::identity::Identity> =
+            agents.iter().map(|(_, w)| w.clone()).collect();
+        m.record_line(
+            env.now,
+            DISMISS_WORDS,
+            lunchroom_core::mail::lines::Who::Agents(&names),
+            &ids,
+            &[],
+        );
+    });
+    match done {
+        Ok(()) => {
+            Outcome::ok("The alert was dismissed until that agent's next DENIED call.\n".to_owned())
+        }
+        Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
+    }
+}
+
+/// F2-AC57 (§17.10): the console ends the holds on the agent named `name` whose message the store
+/// no longer holds ([`Mail::release_stale`]), and records it as a line of Lunchroom's. A live hold
+/// stays.
+pub fn release_stale(name: &str, env: &Env) -> Outcome {
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let released = store.update(|m| {
+        let who = m.named(name)?.clone();
+        let n = m.release_stale(&who);
+        if n > 0 {
+            m.record_line(
+                env.now,
+                STALE_WORDS,
+                lunchroom_core::mail::lines::Who::Agents(&[name]),
+                std::slice::from_ref(&who),
+                &[],
+            );
+        }
+        Some(n)
+    });
+    match released {
+        Ok(Some(0)) => Outcome::denied(
+            &format!("{name} has no hold whose message is gone, so nothing was released"),
+            3,
+        ),
+        Ok(Some(n)) => Outcome::ok(format!(
+            "{n} hold(s) on {name} whose message is gone ended.\n"
+        )),
+        Ok(None) => Outcome::denied(
+            &format!("{name} is not a registered name, so nothing was released"),
+            2,
         ),
         Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
     }
@@ -412,6 +781,106 @@ pub fn rate(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     }
 }
 
+/// `path` made absolute against `cwd` and lexically normal: `.` and `..` are resolved by name, no
+/// link is followed.
+fn lexical(path: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let joined = cwd.join(path);
+    let mut out = std::path::PathBuf::new();
+    for part in joined.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The recorded spellings (T1.8: each spelling the guard resolved a word to) that are the path the
+/// user typed: the same name once made absolute and normal, or the same file once links are
+/// followed.
+fn recorded_spellings(mail: &Mail, typed: &str, cwd: &std::path::Path) -> Vec<String> {
+    let named = lexical(typed, cwd);
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    let typed_real = real(&named);
+    let mut found: Vec<String> = Vec::new();
+    for marked in mail.marked() {
+        for p in &marked.paths {
+            let path = std::path::Path::new(p);
+            let same = path == named
+                || typed_real
+                    .as_ref()
+                    .is_some_and(|t| path == t || real(path).as_ref() == Some(t));
+            if same && !found.contains(p) {
+                found.push(p.clone());
+            }
+        }
+    }
+    found
+}
+
+/// `lunchroom clear <path>` (T1.8, `§5::45`, `§5::49`): a recorded path stays recorded
+/// until the user clears it, here, on their passphrase in a terminal outside every guarded session
+/// (A1.3). An agent's `clear` is DENIED, before anything is read, and the path stays recorded. A
+/// path that is not recorded is said not to be, and nothing is asked or changed. Clearing takes the
+/// path (every spelling of it) out of the record, so reading it no longer holds a session; a
+/// session already HELD stays HELD until the user types in it.
+#[must_use]
+pub fn clear(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
+    let [typed] = args else {
+        return Outcome::failed("usage: lunchroom clear <path>", 2);
+    };
+    let store = match store(env) {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let mail = match read(&store) {
+        Ok(m) => m,
+        Err(o) => return o,
+    };
+    // A1.3: an agent's `clear` stops here, whatever the path is.
+    if let Err(reason) = check(&mail, sys) {
+        return Outcome::denied(&reason, 3);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| env.home.clone());
+    if recorded_spellings(&mail, typed, &cwd).is_empty() {
+        return Outcome::failed(
+            &format!(
+                "{typed} is not a recorded path, so nothing was cleared: `lunchroom status` lists \
+                 the recorded paths, and `lunchroom clear <path>` takes one of those"
+            ),
+            1,
+        );
+    }
+    let question = format!(
+        "Lunchroom: clear the recorded path {typed}? A session that reads it is then not HELD by \
+         what held the agent that wrote it.\n"
+    );
+    if let Err(reason) = confirm(&mail, sys, &question) {
+        return Outcome::denied(&reason, 3);
+    }
+    // The spellings are found again inside the update, so a record that changed since is judged
+    // as it is now.
+    match store.update(|m| {
+        let spellings = recorded_spellings(m, typed, &cwd);
+        (m.clear_marked(&spellings), spellings.len())
+    }) {
+        Ok((0, _)) => Outcome::failed(
+            &format!("{typed} is no longer a recorded path, so nothing was cleared"),
+            1,
+        ),
+        Ok((_, spellings)) => Outcome::ok(format!(
+            "cleared {typed} ({spellings} spelling{} of it): reading it no longer holds a \
+             session. A session that is HELD stays HELD until you type in it.\n",
+            if spellings == 1 { "" } else { "s" }
+        )),
+        Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
+    }
+}
+
 /// `lunchroom passphrase`: the user sets the passphrase every command of this file asks for (A1.3).
 /// With one already set, the current one is asked for first.
 #[must_use]
@@ -488,7 +957,12 @@ pub fn set_passphrase(sys: &mut dyn System) -> Outcome {
             code: 1,
         };
     }
-    let _ = writeln!(report, "put it at {shown}, owned by root");
+    let _ = writeln!(
+        report,
+        "put it at {shown}, owned by root, group {group}, mode 0640: only Lunchroom's program, \
+         which runs with group {group}, reads it",
+        group = lunchroom_core::setgid::SYSTEM_USER
+    );
     match trusted_verifier(sys) {
         Ok(back) if back.matches(&first) => {
             let _ = writeln!(
@@ -544,9 +1018,25 @@ pub fn slip(args: &[String]) -> Outcome {
     }
 }
 
-/// Harnesses whose adapter has passed its test of turning YOLO on and off (R2.2, H1.1): Claude
-/// Code, by the binary test `yolo_turns_harness_yolo_on_until_its_end`.
-const YOLO_TESTED: [Harness; 1] = [Harness::ClaudeCode];
+/// Harnesses whose adapter has passed its YOLO test (R2.2, H1.1): that a call the guard frees under
+/// a `lunchroom yolo` runs in that harness, and that the guard asks again after the end time. All
+/// four pass in 1.1, each by its test in `tests/yolo.rs` (`yolo_tested_names_every_harness` keeps
+/// this list and the `Harness` enum together).
+const YOLO_TESTED: [Harness; 4] = [
+    Harness::ClaudeCode,
+    Harness::Codex,
+    Harness::OpenClaw,
+    Harness::Hermes,
+];
+
+/// The names among `chosen` whose harness is not in `tested` (R2.2: `lunchroom yolo` refuses them).
+fn untested<'a>(chosen: &'a [(String, Identity)], tested: &[Harness]) -> Vec<&'a str> {
+    chosen
+        .iter()
+        .filter(|(_, w)| !tested.contains(&w.harness))
+        .map(|(n, _)| n.as_str())
+        .collect()
+}
 
 /// Days since the Unix epoch of a civil date (proleptic Gregorian), after H. Hinnant's
 /// `days_from_civil`.
@@ -563,7 +1053,12 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// The end time `till` names, after `now`: `HH:MM` (UTC, the next time that comes) or
 /// `YYYY-MM-DDTHH:MM[:SS]Z`.
 fn parse_till(till: &str, now: u64) -> Option<u64> {
-    let num = |s: &str| s.parse::<i64>().ok();
+    // Digits only: `parse` alone takes a leading `+`, which is no part of a time.
+    let num = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
     let clock = |s: &str| -> Option<i64> {
         let mut parts = s.split(':');
         let (h, m) = (num(parts.next()?)?, num(parts.next()?)?);
@@ -605,6 +1100,7 @@ fn parse_till(till: &str, now: u64) -> Option<u64> {
 /// until that time (R2.2). It always has an end time, and refuses an agent whose harness adapter
 /// has not passed its YOLO test.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one command: arguments, the agents, the yes, the end, the lines
 pub fn yolo(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     let (Some(targets), Some(till)) = (
         args.first(),
@@ -620,9 +1116,16 @@ pub fn yolo(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             2,
         );
     };
-    let Some(end) = parse_till(till, env.now) else {
+    // `till now` ends a YOLO at once (R2.2 "set, extend or end"): the end time is this instant,
+    // and a YOLO covers only while `now < end` (`Mail::yolo_until`).
+    let ending = till == "now";
+    let end = if ending {
+        env.now
+    } else if let Some(end) = parse_till(till, env.now) {
+        end
+    } else {
         return Outcome::denied(
-            "the end time must be HH:MM (UTC) or YYYY-MM-DDTHH:MMZ, after now",
+            "the end time must be HH:MM (UTC) or YYYY-MM-DDTHH:MMZ, after now, or `now` to end it",
             2,
         );
     };
@@ -651,63 +1154,123 @@ pub fn yolo(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     if chosen.is_empty() {
         return Outcome::denied("no agent is named", 2);
     }
-    let untested: Vec<&str> = chosen
-        .iter()
-        .filter(|(_, w)| !YOLO_TESTED.contains(&w.harness))
-        .map(|(n, _)| n.as_str())
-        .collect();
-    if !untested.is_empty() {
-        // `yolo all` and a list of names alike turn it on for every one named or for none, so the
-        // refusal says which agents can be named.
-        let tested: Vec<&str> = chosen
-            .iter()
-            .filter(|(_, w)| YOLO_TESTED.contains(&w.harness))
-            .map(|(n, _)| n.as_str())
-            .collect();
-        let can = if tested.is_empty() {
-            "no agent can have it turned on yet".to_owned()
-        } else {
-            format!(
-                "to turn it on for the others, name just them: lunchroom yolo {} till <HH:MM>",
-                tested.join(",")
-            )
-        };
-        return Outcome::denied(
-            &format!(
-                "{} cannot have {} turned on yet: Lunchroom has not passed its test of starting \
-                 and ending {} in that agent's program, and it works for Claude Code agents \
-                 only. {} turns it on for every agent named or for none; {can}",
-                untested.join(", "),
-                Word::Yolo.text(),
-                Word::Yolo.text(),
-                if targets == "all" {
-                    "`yolo all`"
-                } else {
-                    "`yolo`"
-                },
-            ),
-            3,
-        );
+    if let Some(refused) = refuse_untested(&chosen, targets == "all", &YOLO_TESTED) {
+        return refused;
     }
     let names: Vec<&str> = chosen.iter().map(|(n, _)| n.as_str()).collect();
-    let question = format!(
-        "Lunchroom: turn {} on for {} until {} UTC ({})?\n",
-        Word::Yolo.text(),
-        names.join(", "),
-        hhmm(end),
-        crate::delivery::utc(end)
-    );
+    let question = if ending {
+        format!(
+            "Lunchroom: end {} for {} now?\n",
+            Word::Yolo.text(),
+            names.join(", ")
+        )
+    } else {
+        format!(
+            "Lunchroom: turn {} on for {} until {} UTC ({})?\n",
+            Word::Yolo.text(),
+            names.join(", "),
+            hhmm(end),
+            crate::delivery::utc(end)
+        )
+    };
     if let Err(reason) = confirm(&mail, sys, &question) {
         return Outcome::denied(&reason, 3);
     }
+    // §16 item 17: whether each agent's harness has a guard hook that can tell it (channel D) is
+    // judged from the read above, before the store's lock is taken.
+    let guarded: Vec<bool> = chosen
+        .iter()
+        .map(|(_, who)| {
+            crate::evidence::evidence(&mail, who, &env.home)
+                == lunchroom_core::mail::Evidence::Guarded
+        })
+        .collect();
+    let at = env.now;
     match store.update(|m| {
         for (_, who) in &chosen {
             m.set_yolo(who, end);
         }
+        // §16 item 17: the line is told to the user (the terminal where it was typed, and U),
+        // to each agent by D when its harness has a hook and by N in its next envelope, and to
+        // each sender with a message holding or QUEUED for a covered agent, by D, when the YOLO
+        // is set after its message (the sender hears it by S in each later `send`).
+        let names: Vec<&str> = chosen.iter().map(|(n, _)| n.as_str()).collect();
+        let ids: Vec<Identity> = chosen.iter().map(|(_, w)| w.clone()).collect();
+        let mut hearers: Vec<lunchroom_core::mail::calls::Hearer> = chosen
+            .iter()
+            .zip(&guarded)
+            .map(|((_, who), g)| lunchroom_core::mail::calls::Hearer {
+                who: who.clone(),
+                d: *g,
+                n: true,
+            })
+            .collect();
+        for (_, who) in &chosen {
+            for sender in m.senders_waiting_on(who) {
+                if !ids.contains(&sender) {
+                    hearers.push(lunchroom_core::mail::calls::Hearer {
+                        who: sender,
+                        d: true,
+                        n: false,
+                    });
+                }
+            }
+        }
+        m.tell_line(
+            at,
+            &cards::yolo_until(end),
+            lunchroom_core::mail::lines::Who::Agents(&names),
+            &ids,
+            &[],
+            &hearers,
+            true,
+        )
+        .text
     }) {
-        Ok(()) => Outcome::ok(format!("{}\n", cards::yolo_until(end))),
+        Ok(_) if ending => Outcome::ok(format!("{} ended.\n", Word::Yolo.text())),
+        // R2.2: the line, at once, in the terminal where the user typed it.
+        Ok(line) => Outcome::ok(format!("{line}\n")),
         Err(e) => Outcome::failed(&crate::cli::unwritten(e), 1),
     }
+}
+
+/// The refusal (R2.2, R2.7) when any agent in `chosen` has a harness not in `tested`: `yolo all`
+/// and a list of names alike turn it on for every one named or for none, so the refusal says
+/// which agents can be named. `None` when every harness has passed.
+fn refuse_untested(
+    chosen: &[(String, Identity)],
+    all: bool,
+    tested: &[Harness],
+) -> Option<Outcome> {
+    let untested = untested(chosen, tested);
+    if untested.is_empty() {
+        return None;
+    }
+    let passed: Vec<&str> = chosen
+        .iter()
+        .filter(|(_, w)| tested.contains(&w.harness))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let can = if passed.is_empty() {
+        "no agent can have it turned on yet".to_owned()
+    } else {
+        format!(
+            "to turn it on for the others, name just them: lunchroom yolo {} till <HH:MM>",
+            passed.join(",")
+        )
+    };
+    Some(Outcome::denied(
+        &format!(
+            "{} cannot have {} turned on yet: Lunchroom has not passed its test of starting \
+             and ending {} in that agent's program. {} turns it on for every agent named or \
+             for none; {can}",
+            untested.join(", "),
+            Word::Yolo.text(),
+            Word::Yolo.text(),
+            if all { "`yolo all`" } else { "`yolo`" },
+        ),
+        3,
+    ))
 }
 
 /// `HH:MM` of a time, in UTC.
@@ -715,6 +1278,9 @@ fn hhmm(secs: u64) -> String {
     let day = secs % 86_400;
     format!("{:02}:{:02}", day / 3600, day % 3600 / 60)
 }
+
+#[cfg(test)]
+mod tests_u10;
 
 #[cfg(test)]
 mod tests {
@@ -1355,7 +1921,15 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
         let out = yolo(&args(&["deepseek", "till", "14:00"]), &s.0, &mut user);
         assert_eq!(out.code, 0, "{}", out.stderr);
-        assert_eq!(out.stdout, "YOLO authorized until 14:00 UTC.\n");
+        // §16 item 1 and item 17: the line in the form `<HH:MM> UTC Lunchroom: <words>
+        // (<agents>)`, its time the time it was typed, in the terminal where it was typed.
+        assert!(
+            out.stdout
+                .ends_with(" UTC Lunchroom: YOLO authorized until 14:00 UTC. (deepseek)\n"),
+            "{}",
+            out.stdout
+        );
+        assert_eq!(out.stdout.as_bytes()[2], b':', "{}", out.stdout);
         let d1 = Identity::new(Harness::ClaudeCode, "d1");
         let mail = s.store().and_then(|st| st.read().ok());
         assert_eq!(
@@ -1382,11 +1956,11 @@ mod tests {
             (args(&["deepseek"]), 2),
             (args(&["deepseek", "till"]), 2),
             (args(&["deepseek", "for", "14:00"]), 2),
-            (args(&["codex", "till", "14:00"]), 3),
-            (args(&["claw", "till", "14:00"]), 3),
-            (args(&["hermes", "till", "14:00"]), 3),
-            (args(&["all", "till", "14:00"]), 3),
+            (args(&["codex", "till"]), 2),
+            (args(&["claw", "for", "14:00"]), 2),
+            (args(&["hermes"]), 2),
             (args(&["nobody", "till", "14:00"]), 2),
+            (args(&["codex,nobody", "till", "14:00"]), 2),
         ] {
             let mut user = UserAt {
                 answer: "yes\n",
@@ -1407,26 +1981,530 @@ mod tests {
     // harness has passed, and the command that turns it on for them.
     #[test]
     fn yolo_all_refusal_says_which_agents_can_be_named() {
-        let s = Scratch::new();
-        named(&s, "deepseek", "claude-code:d1");
-        named(&s, "codex", "codex:x1");
-        let mut user = UserAt {
-            answer: "yes\n",
-            asked: Vec::new(),
+        // All four harnesses have passed, so no real agent reaches the refusal; it is proven with
+        // a list of tested harnesses that leaves Codex out (R2.7, C6-A07).
+        let chosen = |agents: &[(&str, &str)]| -> Vec<(String, Identity)> {
+            agents
+                .iter()
+                .filter_map(|(n, w)| Identity::parse(w).map(|i| ((*n).to_owned(), i)))
+                .collect()
         };
-        let a = ["all", "till", "14:00"].map(str::to_owned);
-        let out = yolo(&a, &s.0, &mut user);
+        let both = chosen(&[("deepseek", "claude-code:d1"), ("codex", "codex:x1")]);
+        let out = refuse_untested(&both, true, &[Harness::ClaudeCode]);
+        assert!(
+            out.is_some(),
+            "a harness outside the tested list is refused"
+        );
+        let Some(out) = out else { return };
         assert_eq!(out.code, 3, "{}", out.stderr);
         // G2/G3-14: plain words, the one way of writing the command, and what to do.
         for part in [
             "codex cannot have YOLO turned on yet: Lunchroom has not passed its test of starting \
-             and ending YOLO in that agent's program, and it works for Claude Code agents only.",
+             and ending YOLO in that agent's program.",
             "`yolo all` turns it on for every agent named or for none; to turn it on for the \
              others, name just them: lunchroom yolo deepseek till <HH:MM>",
         ] {
             assert!(out.stderr.contains(part), "{part}: {}", out.stderr);
         }
-        assert_eq!(user.asked, Vec::<String>::new());
+        assert!(
+            !out.stderr.contains("Claude Code agents only"),
+            "{}",
+            out.stderr
+        );
+        // A list of names says `yolo`, and none tested says so.
+        let out = refuse_untested(&both[1..], false, &[Harness::ClaudeCode]);
+        assert!(out.is_some(), "refused");
+        let Some(out) = out else { return };
+        assert!(out.stderr.contains("`yolo` turns it on for every agent named or for none; no agent can have it turned on yet"), "{}", out.stderr);
+        // Every harness in the list: nothing is refused, whatever is named.
+        assert!(refuse_untested(&both, true, &YOLO_TESTED).is_none());
+        assert!(refuse_untested(&[], true, &[]).is_none());
+        for harness in [
+            Harness::ClaudeCode,
+            Harness::Codex,
+            Harness::OpenClaw,
+            Harness::Hermes,
+        ] {
+            let one = [("a".to_owned(), Identity::new(harness, "i"))];
+            assert!(
+                refuse_untested(&one, false, &[harness]).is_none(),
+                "{harness:?}"
+            );
+            assert!(refuse_untested(&one, false, &[]).is_some(), "{harness:?}");
+        }
+    }
+
+    // §3::2: `YOLO_TESTED` and the `Harness` enum stay together: a harness added to
+    // the enum fails to compile here until it is placed in the tested list or deliberately left out.
+    #[test]
+    fn yolo_tested_names_every_harness() {
+        for harness in [
+            Harness::ClaudeCode,
+            Harness::Codex,
+            Harness::OpenClaw,
+            Harness::Hermes,
+        ] {
+            // Exhaustive: a new variant is a compile error in this match.
+            match harness {
+                Harness::ClaudeCode | Harness::Codex | Harness::OpenClaw | Harness::Hermes => {}
+            }
+            assert!(YOLO_TESTED.contains(&harness), "{harness:?}");
+        }
+        assert_eq!(YOLO_TESTED.len(), 4);
+    }
+
+    /// Four agents, one of each harness, and the key forms their harnesses give.
+    fn four_agents(s: &Scratch) {
+        named(s, "claude", "claude-code:c1");
+        named(s, "codex", "codex:x1");
+        named(s, "claw", "openclaw:agent:main:a");
+        named(s, "hermes", "hermes:h1");
+    }
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|x| (*x).to_owned()).collect()
+    }
+
+    fn end_of(s: &Scratch, who: &Identity, at: u64) -> Option<u64> {
+        s.store()
+            .and_then(|st| st.read().ok())
+            .and_then(|m| m.yolo_until(who, at))
+    }
+
+    fn ids() -> [(&'static str, Identity); 4] {
+        [
+            ("claude", Identity::new(Harness::ClaudeCode, "c1")),
+            ("codex", Identity::new(Harness::Codex, "x1")),
+            ("claw", Identity::new(Harness::OpenClaw, "agent:main:a")),
+            ("hermes", Identity::new(Harness::Hermes, "h1")),
+        ]
+    }
+
+    // §3::2 (C6-A01..A04, A11): `lunchroom yolo` is accepted for an agent of each
+    // harness, prints card 5's line, sets exactly that agent's end time, and writes nothing
+    // without the user's yes.
+    #[test]
+    fn yolo_is_set_for_each_harness() {
+        for (name, who) in ids() {
+            let s = Scratch::new();
+            four_agents(&s);
+            let mut no = UserAt {
+                answer: "no\n",
+                asked: Vec::new(),
+            };
+            let out = yolo(&argv(&[name, "till", "14:00"]), &s.0, &mut no);
+            assert_eq!(out.code, 3, "{name}: {}", out.stderr);
+            assert_eq!(
+                end_of(&s, &who, 1000),
+                None,
+                "{name}: nothing without a yes"
+            );
+            let mut user = UserAt {
+                answer: "yes\n",
+                asked: Vec::new(),
+            };
+            let out = yolo(&argv(&[name, "till", "14:00"]), &s.0, &mut user);
+            assert_eq!(out.code, 0, "{name}: {}", out.stderr);
+            // §16 item 1 and item 17: the line in the form `<HH:MM> UTC Lunchroom: <words> (<agents>)`.
+            let line = format!(" UTC Lunchroom: YOLO authorized until 14:00 UTC. ({name})\n");
+            assert!(out.stdout.ends_with(&line), "{name}: {}", out.stdout);
+            assert_eq!(user.asked.len(), 1, "{name}");
+            for (other, id) in ids() {
+                let want = (other == name).then_some(14 * 3600);
+                assert_eq!(end_of(&s, &id, 1000), want, "{name} set, {other} read");
+            }
+        }
+    }
+
+    // §3::2 (C6-A05, A06, A14): `yolo all` covers all four; a list covers exactly the
+    // named agents, an empty element and a repeated name are harmless, and an empty list is refused.
+    #[test]
+    fn yolo_all_and_lists_cover_exactly_the_named() {
+        let s = Scratch::new();
+        four_agents(&s);
+        let mut user = UserAt {
+            answer: "yes\n",
+            asked: Vec::new(),
+        };
+        let out = yolo(&argv(&["all", "till", "14:00"]), &s.0, &mut user);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        for (n, id) in ids() {
+            assert_eq!(end_of(&s, &id, 1000), Some(14 * 3600), "{n}");
+        }
+        let s = Scratch::new();
+        four_agents(&s);
+        named(&s, "codex2", "codex:x2");
+        let out = yolo(
+            &argv(&["codex,,hermes,codex", "till", "15:00"]),
+            &s.0,
+            &mut user,
+        );
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let x2 = Identity::new(Harness::Codex, "x2");
+        assert_eq!(
+            end_of(&s, &x2, 1000),
+            None,
+            "an unnamed agent of the same harness"
+        );
+        assert_eq!(end_of(&s, &ids()[1].1, 1000), Some(15 * 3600));
+        assert_eq!(end_of(&s, &ids()[3].1, 1000), Some(15 * 3600));
+        assert_eq!(end_of(&s, &ids()[0].1, 1000), None);
+        assert_eq!(end_of(&s, &ids()[2].1, 1000), None);
+        for list in [",", ",,", ""] {
+            let out = yolo(&argv(&[list, "till", "15:00"]), &s.0, &mut user);
+            assert_eq!(out.code, 2, "{list:?}: {}", out.stderr);
+        }
+    }
+
+    /// A user (or something posing as one) at a terminal, typing `secret` for the passphrase; with
+    /// `tty` 0 there is no terminal, and `secret` `None` is an end of input.
+    struct Typist {
+        tty: u64,
+        secret: Option<String>,
+        asked: usize,
+    }
+
+    impl System for Typist {
+        fn ancestors(&self) -> Vec<(Option<String>, String)> {
+            vec![(Some("100:5".to_owned()), "bash".to_owned())]
+        }
+        fn own_tty(&self) -> u64 {
+            self.tty
+        }
+        fn tty_of(&self, _key: &str) -> Option<u64> {
+            None
+        }
+        fn ask(&mut self, _question: &str) -> Option<String> {
+            self.asked += 1;
+            self.secret.clone()
+        }
+        fn uid(&self) -> Option<u32> {
+            Some(1000)
+        }
+        fn verifier(&self) -> Result<String, String> {
+            Ok(fake::verifier())
+        }
+        fn ask_secret(&mut self, _prompt: &str) -> Option<String> {
+            self.asked += 1;
+            self.secret.clone()
+        }
+        fn salt(&mut self) -> Result<[u8; passphrase::SALT_BYTES], String> {
+            Ok([3; passphrase::SALT_BYTES])
+        }
+        fn install_verifier(&mut self, _line: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    // §3::2, §7 A1.3 (C6-A11, A15, A16, S10): nothing is set, and no line of
+    // authorization is printed, when there is no terminal, when input ends, and when what is typed
+    // is not the passphrase: a refusal word, an empty line, a JSON-shaped value, a localized yes.
+    #[test]
+    fn yolo_writes_nothing_without_the_users_passphrase() {
+        for (name, who) in ids() {
+            let s = Scratch::new();
+            four_agents(&s);
+            let none: Vec<(&str, u64, Option<&str>)> = vec![
+                ("no terminal", 0, Some(fake::PASSPHRASE)),
+                ("end of input", 34816, None),
+                ("no", 34816, Some("no")),
+                ("n", 34816, Some("n")),
+                ("empty", 34816, Some("")),
+                ("null", 34816, Some("null")),
+                ("true", 34816, Some("true")),
+                ("zero", 34816, Some("0")),
+                ("object", 34816, Some("{}")),
+                ("array", 34816, Some("[]")),
+                ("turkish yes", 34816, Some("evet")),
+                ("japanese yes", 34816, Some("はい")),
+                ("arabic yes", 34816, Some("نعم")),
+                ("french yes", 34816, Some("oui")),
+                ("yes, not the passphrase", 34816, Some("yes")),
+                (
+                    "passphrase with a trailing letter",
+                    34816,
+                    Some("correct horse batterys"),
+                ),
+            ];
+            for (what, tty, secret) in none {
+                let mut user = Typist {
+                    tty,
+                    secret: secret.map(str::to_owned),
+                    asked: 0,
+                };
+                let out = yolo(&argv(&[name, "till", "14:00"]), &s.0, &mut user);
+                assert_ne!(out.code, 0, "{name} {what}: {}", out.stdout);
+                assert!(
+                    !out.stdout.contains("authorized"),
+                    "{name} {what}: {}",
+                    out.stdout
+                );
+                assert_eq!(end_of(&s, &who, 1000), None, "{name} {what}");
+            }
+            // The passphrase itself: set, then ended with the same proof.
+            let mut user = Typist {
+                tty: 34816,
+                secret: Some(fake::PASSPHRASE.to_owned()),
+                asked: 0,
+            };
+            let out = yolo(&argv(&[name, "till", "14:00"]), &s.0, &mut user);
+            assert_eq!(out.code, 0, "{name}: {}", out.stderr);
+            assert_eq!(end_of(&s, &who, 1000), Some(14 * 3600));
+        }
+    }
+
+    // §3::2 (C6-S03, A17): a store that cannot be written (the folder is read-only)
+    // makes the command fail with code 1 and no line of authorization; nothing covers the agent.
+    #[test]
+    fn yolo_that_cannot_be_written_is_not_announced() {
+        use std::os::unix::fs::PermissionsExt;
+        for (name, who) in ids() {
+            let s = Scratch::new();
+            four_agents(&s);
+            let dir = s.0.store_dir();
+            assert!(std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).is_ok());
+            let mut user = UserAt {
+                answer: "yes\n",
+                asked: Vec::new(),
+            };
+            let out = yolo(&argv(&[name, "till", "14:00"]), &s.0, &mut user);
+            let restored = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            assert!(restored.is_ok());
+            assert_ne!(out.code, 0, "{name}: {}", out.stdout);
+            assert!(!out.stdout.contains("authorized"), "{name}: {}", out.stdout);
+            assert_eq!(end_of(&s, &who, 1000), None, "{name}");
+        }
+    }
+
+    // §3::2, §3::7 (C6-A12, A13): the `yolo` command line with names of more than one
+    // kind in the same list: an unknown name among known ones refuses the whole command.
+    #[test]
+    fn yolo_refuses_the_whole_list_for_one_unknown_name() {
+        let s = Scratch::new();
+        four_agents(&s);
+        let mut user = UserAt {
+            answer: "yes\n",
+            asked: Vec::new(),
+        };
+        let out = yolo(
+            &argv(&["codex,hermes,ghost", "till", "14:00"]),
+            &s.0,
+            &mut user,
+        );
+        assert_eq!(out.code, 2, "{}", out.stderr);
+        for (n, id) in ids() {
+            assert_eq!(end_of(&s, &id, 1000), None, "{n}");
+        }
+    }
+
+    // §3::2 (C6-D06, D07, D09, I01..I03, I05): the end time is extended or shortened by a
+    // later command, per agent; `till now` ends it at once with the user's yes, for one agent or
+    // all, and only exactly `now` ends.
+    #[test]
+    fn yolo_extend_shorten_and_end() {
+        for (name, who) in ids() {
+            let s = Scratch::new();
+            four_agents(&s);
+            let mut user = UserAt {
+                answer: "yes\n",
+                asked: Vec::new(),
+            };
+            // The agent after this one in the list: another agent, and its name.
+            let next = ids()
+                .into_iter()
+                .cycle()
+                .skip_while(|(n, _)| *n != name)
+                .nth(1);
+            assert!(next.is_some());
+            let Some((other_name, other)) = next else {
+                return;
+            };
+            for (n, till) in [
+                (name, "14:00"),
+                (other_name, "20:00"),
+                (name, "16:00"),
+                (name, "13:00"),
+            ] {
+                let out = yolo(&argv(&[n, "till", till]), &s.0, &mut user);
+                assert_eq!(out.code, 0, "{name} {n} {till}: {}", out.stderr);
+            }
+            // Last writer's value: shortened to 13:00; the other agent's 20:00 is untouched.
+            assert_eq!(end_of(&s, &who, 1000), Some(13 * 3600), "{name}");
+            assert_eq!(end_of(&s, &other, 1000), Some(20 * 3600), "{name}");
+            // Ends at once: the very next read is off, the other agent's is not.
+            let mut asked = UserAt {
+                answer: "yes\n",
+                asked: Vec::new(),
+            };
+            let out = yolo(&argv(&[name, "till", "now"]), &s.0, &mut asked);
+            assert_eq!(
+                (out.code, out.stdout.as_str()),
+                (0, "YOLO ended.\n"),
+                "{name}: {}",
+                out.stderr
+            );
+            assert_eq!(asked.asked.len(), 1, "{name}: the user is asked first");
+            assert_eq!(end_of(&s, &who, 1000), None, "{name}");
+            assert_eq!(end_of(&s, &other, 1000), Some(20 * 3600), "{name}");
+            // Not confirmed: nothing changes.
+            let mut no = UserAt {
+                answer: "no\n",
+                asked: Vec::new(),
+            };
+            let out = yolo(&argv(&[other_name, "till", "now"]), &s.0, &mut no);
+            assert_eq!(out.code, 3, "{}", out.stderr);
+            assert_eq!(end_of(&s, &other, 1000), Some(20 * 3600), "{name}");
+        }
+        // For all, and with none set; other spellings are not `now`.
+        let s = Scratch::new();
+        four_agents(&s);
+        let mut user = UserAt {
+            answer: "yes\n",
+            asked: Vec::new(),
+        };
+        let out = yolo(&argv(&["all", "till", "now"]), &s.0, &mut user);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        for (n, id) in ids() {
+            assert_eq!(end_of(&s, &id, 1000), None, "{n}");
+        }
+        for spelling in ["NOW", "now ", " now", "\"now\"", "nowish", "n"] {
+            let out = yolo(&argv(&["codex", "till", spelling]), &s.0, &mut user);
+            assert_eq!(out.code, 2, "{spelling:?}: {}", out.stderr);
+        }
+    }
+
+    // §3::2 (C6-B01..B05, K04): the end time must be after now, whatever its spelling
+    // and whichever harness; nothing is set, nothing is asked, and nothing panics.
+    #[test]
+    fn yolo_hostile_times_and_sizes() {
+        let mut s = Scratch::new();
+        four_agents(&s);
+        s.0.now = 14 * 3600; // 14:00:00 UTC on 1970-01-01
+        let mut user = UserAt {
+            answer: "yes\n",
+            asked: Vec::new(),
+        };
+        let huge = "9".repeat(4096);
+        let long_name = "n".repeat(4096);
+        let many = vec!["codex"; 10_000].join(",");
+        for (till, code) in [
+            ("1970-01-01T14:00:00Z", 2),
+            ("1970-01-01T13:59:59Z", 2),
+            ("1970-01-01T14:00Z", 2),
+            ("1969-12-31T23:59Z", 2),
+            ("24:00", 2),
+            ("23:60", 2),
+            ("-1:00", 2),
+            ("1:2:3:4", 2),
+            ("14:00:60", 2),
+            ("99:99", 2),
+            ("", 2),
+            (" ", 2),
+            ("+14:00", 2),
+            ("١٤:٠٠", 2),
+            ("14:00Z", 2),
+            ("2026-02-31T10:00Z", 2),
+            ("2026-13-01T10:00Z", 2),
+            ("0000-01-01T10:00Z", 2),
+            ("10000-01-01T10:00Z", 2),
+            ("99999999999999999999-01-01T10:00Z", 2),
+            ("2026-1-1T10:00z", 2),
+            ("T10:00Z", 2),
+            ("2026-01-01T10:00+02:00", 2),
+            (huge.as_str(), 2),
+        ] {
+            for who in ["claude", "codex", "claw", "hermes"] {
+                let out = yolo(&argv(&[who, "till", till]), &s.0, &mut user);
+                assert_eq!(out.code, code, "{who} {till:.40?}: {}", out.stderr);
+            }
+        }
+        assert!(user.asked.is_empty(), "nothing is asked for a refused time");
+        for (n, id) in ids() {
+            assert_eq!(end_of(&s, &id, s.0.now), None, "{n}");
+        }
+        // The current minute rolls to tomorrow, never a zero-length YOLO (C6-B02).
+        let out = yolo(&argv(&["codex", "till", "14:00"]), &s.0, &mut user);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(end_of(&s, &ids()[1].1, s.0.now), Some(14 * 3600 + 86_400));
+        s.0.now = 14 * 3600 + 30;
+        let out = yolo(&argv(&["claw", "till", "14:00"]), &s.0, &mut user);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(end_of(&s, &ids()[2].1, s.0.now), Some(14 * 3600 + 86_400));
+        // Year 9999 is typed time, not an overflow, and shows (C6-B05).
+        let out = yolo(
+            &argv(&["hermes", "till", "9999-12-31T23:59:59Z"]),
+            &s.0,
+            &mut user,
+        );
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        // §16 item 1: the line in the form `<HH:MM> UTC Lunchroom: <words> (<agents>)`.
+        assert!(
+            out.stdout
+                .ends_with(" UTC Lunchroom: YOLO authorized until 23:59 UTC. (hermes)\n"),
+            "{}",
+            out.stdout
+        );
+        assert_eq!(end_of(&s, &ids()[3].1, s.0.now), Some(253_402_300_799));
+        // Hostile sizes (C6-K04): a long name, a 10,000-name list, a long list of unknown names.
+        let before = user.asked.len();
+        let out = yolo(
+            &argv(&[long_name.as_str(), "till", "15:00"]),
+            &s.0,
+            &mut user,
+        );
+        assert_eq!(out.code, 2, "{}", &out.stderr[..out.stderr.len().min(200)]);
+        let out = yolo(&argv(&[many.as_str(), "till", "15:00"]), &s.0, &mut user);
+        assert_eq!(out.code, 0, "{}", &out.stderr[..out.stderr.len().min(200)]);
+        assert_eq!(user.asked.len(), before + 1);
+        let unknown = vec!["nobody"; 10_000].join(",");
+        let out = yolo(&argv(&[unknown.as_str(), "till", "15:00"]), &s.0, &mut user);
+        assert_eq!(out.code, 2);
+    }
+
+    // §3::2 (C6-K01): extend, shorten and end for one agent, run at once from several
+    // threads through the real store, leave one of the written values and a readable store.
+    #[test]
+    fn concurrent_yolo_commands_for_one_agent() {
+        let s = Scratch::new();
+        four_agents(&s);
+        let written: [u64; 4] = [14 * 3600, 15 * 3600, 16 * 3600, 1000];
+        let who = ids()[1].1.clone();
+        std::thread::scope(|scope| {
+            for round in 0..5 {
+                for (i, till) in ["14:00", "15:00", "16:00", "now"].into_iter().enumerate() {
+                    let env = &s.0;
+                    scope.spawn(move || {
+                        let mut user = UserAt {
+                            answer: "yes\n",
+                            asked: Vec::new(),
+                        };
+                        let out = yolo(&argv(&["codex", "till", till]), env, &mut user);
+                        // On a loaded machine a writer can wait past the store's 10-second limit
+                        // (store.rs, LOCK_WAIT) and is then refused as busy, which is the product's
+                        // answer, not a fault (2026-11-14: it failed this test under a parallel
+                        // build). Any other failure still fails it.
+                        assert!(
+                            out.code == 0 || out.stderr.contains("held the store"),
+                            "{round} {i}: {}",
+                            out.stderr
+                        );
+                    });
+                }
+            }
+        });
+        // Whatever finished last, the stored end is exactly one of the four written times: it
+        // covers the second before it and not that second.
+        let mail = s.store().and_then(|st| st.read().ok());
+        assert!(mail.is_some(), "the store stays readable");
+        let ends: Vec<u64> = written
+            .into_iter()
+            .filter(|e| {
+                mail.as_ref().is_some_and(|m| {
+                    m.yolo_until(&who, e - 1).is_some() && m.yolo_until(&who, *e).is_none()
+                })
+            })
+            .collect();
+        assert_eq!(ends.len(), 1, "{ends:?}");
     }
 
     /// A user setting a passphrase: types each secret in turn, and the system puts a verifier in
@@ -1524,7 +2602,8 @@ mod tests {
         assert_eq!(made.map(|v| v.matches(fake::PASSPHRASE)), Ok(false));
         for step in [
             "made the passphrase check",
-            "put it at /etc/lunchroom/1000.verifier, owned by root",
+            "put it at /etc/lunchroom/1000.verifier, owned by root, group lunchroom, mode 0640: \
+             only Lunchroom's program, which runs with group lunchroom, reads it",
             "read it back: it is owned by root and holds the passphrase just typed",
             "`sudo rm /etc/lunchroom/1000.verifier` removes the check",
         ] {
@@ -1923,3 +3002,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests_u6;

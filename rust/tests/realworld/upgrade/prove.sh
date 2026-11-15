@@ -1,9 +1,9 @@
 #!/bin/bash
 # Proof 2 (upgrade): in an Ubuntu container with Anthropic's apt package claude-code, a real
-# session runs while the package is upgraded (and, separately, reinstalled). Lunchroom 1.1.0 must
+# session runs while the package is upgraded (and, separately, reinstalled). Lunchroom 1.1 must
 # say "program replaced while running", not "release cannot be read".
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/upgrade/prove.sh | tee upgrade.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/upgrade/prove.sh | tee upgrade.txt
 
 . "$(dirname "$0")/../common/host.sh"
 

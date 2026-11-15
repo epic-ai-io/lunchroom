@@ -44,14 +44,19 @@ fn hand_over(m: &mut Mail, id: &str, at: u64) {
     m.handed_over(id);
 }
 
-fn last_text(list: &[Notice]) -> String {
-    list.last().map(|n| n.text.clone()).unwrap_or_default()
-}
-
 /// The latest notice the sender and the user each have, which must be the same text.
 fn told_both(m: &Mail, sender: &Identity) -> String {
-    let to_sender = last_text(m.notices(sender));
-    let to_user = last_text(m.user_notices());
+    // The console line posts a HELD notice after a delivery that begins a hold; the notice about
+    // the message is the latest one of each list that is not that HELD notice.
+    let latest = |list: &[Notice]| {
+        list.iter()
+            .rev()
+            .find(|n| !n.text.contains(" is HELD."))
+            .map(|n| n.text.clone())
+            .unwrap_or_default()
+    };
+    let to_sender = latest(m.notices(sender));
+    let to_user = latest(m.user_notices());
     assert!(!to_sender.is_empty(), "the sender was told nothing");
     assert_eq!(to_sender, to_user, "the user and the sender differ");
     to_sender

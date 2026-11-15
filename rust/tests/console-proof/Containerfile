@@ -1,23 +1,30 @@
 # The proof of the Lunchroom console (1.1) on Ubuntu 24.04: real users, a real sudo, real
-# pseudo-terminals. Build and run (the build context holds the static `lunchroom` binary, named
-# `lunchroom`, next to the files of this folder):
+# pseudo-terminals. run-all-1.1.sh makes the build context (the static `lunchroom` binary, named
+# `lunchroom`, the files of this folder, and hold.py and plaintext.py of ../realworld/common) and
+# runs, from this one image:
 #
-#   podman build -t lunchroom-console-proof -f Containerfile <context>
-#   podman run --rm lunchroom-console-proof | tee console-proof-<date>.txt
+#   podman run --rm IMAGE                                  prove.sh: the account whose sudo asks a password
+#   podman run --rm -e WIDE=yes IMAGE /opt/proof/wide.sh   password-free sudo, answer yes
+#   podman run --rm -e WIDE=no IMAGE /opt/proof/wide.sh    password-free sudo, answer no
+#   podman run --rm -e WIDE=later IMAGE /opt/proof/wide.sh a later rule wins
 #
-# `prove.sh` prints PASS or FAIL for each check and exits non-zero on any FAIL.
+# Each script prints PASS or FAIL for each check and exits non-zero on any FAIL.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+# python3-pyte reads the console's Ratatui screen; python3-cryptography is the Ed25519 verifier
+# other than Lunchroom's (spec section 17 item 9); gdb, strace, tmux and screen are the programs
+# the guard's rules (item 5) are tried on; perl names the second language of the ptrace rule.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      sudo python3 procps psmisc util-linux gdb strace tmux screen ca-certificates \
+      sudo python3 python3-pyte python3-cryptography procps psmisc util-linux gdb strace tmux screen perl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 COPY lunchroom /opt/proof/lunchroom
-COPY prove.sh ptyrun.py hook.py lastscreen.py /opt/proof/
-RUN chmod 0755 /opt/proof/lunchroom /opt/proof/prove.sh /opt/proof/ptyrun.py \
-      /opt/proof/hook.py /opt/proof/lastscreen.py
+COPY common.sh prove.sh wide.sh ptyrun.py hook.py lastscreen.py ed25519_verify.py hold.py plaintext.py /opt/proof/
+RUN chmod 0755 /opt/proof/lunchroom /opt/proof/prove.sh /opt/proof/wide.sh /opt/proof/ptyrun.py \
+      /opt/proof/hook.py /opt/proof/lastscreen.py /opt/proof/ed25519_verify.py /opt/proof/hold.py \
+      /opt/proof/plaintext.py
 
-# The checks run as root; the script makes the user `dev` itself.
+# The checks run as root; the scripts make the user `dev` themselves.
 CMD ["/opt/proof/prove.sh"]

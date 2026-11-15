@@ -31,11 +31,14 @@ pub enum Word {
     ReasonHalted,
     ReasonLoop,
     ReasonRateLimit,
+    ReasonTooManyPaths,
+    /// A merge, a deploy or a migration, or a call Lunchroom cannot read to the end (P1.4).
+    Gated,
 }
 
 /// The one table of states, verdicts, the party, and reason codes (V1.2). Row `i` holds the word
 /// for the `Word` whose discriminant is `i`; a test checks the order.
-pub const TABLE: [(Word, &str); 22] = [
+pub const TABLE: [(Word, &str); 24] = [
     (Word::Available, "AVAILABLE"),
     (Word::Held, "HELD"),
     (Word::Yolo, "YOLO"),
@@ -58,6 +61,8 @@ pub const TABLE: [(Word, &str); 22] = [
     (Word::ReasonHalted, "halted"),
     (Word::ReasonLoop, "loop"),
     (Word::ReasonRateLimit, "rate limit"),
+    (Word::ReasonTooManyPaths, "too many paths"),
+    (Word::Gated, "GATED"),
 ];
 
 impl Word {
@@ -123,6 +128,9 @@ pub enum Reason {
     Loop,
     /// The pair passed the rate limit (spec §2 R1.6).
     RateLimit,
+    /// A call, other than the reply, with more path-like strings than the guard resolves (spec §11
+    /// L1.1).
+    TooManyPaths,
 }
 
 impl AgentState {
@@ -178,6 +186,7 @@ impl Reason {
             Self::Halted => Word::ReasonHalted,
             Self::Loop => Word::ReasonLoop,
             Self::RateLimit => Word::ReasonRateLimit,
+            Self::TooManyPaths => Word::ReasonTooManyPaths,
         }
         .text()
     }
@@ -220,6 +229,10 @@ impl Reason {
             ),
             Self::Loop => "this pair repeated itself; send something new.".into(),
             Self::RateLimit => "this pair passed the rate limit; wait, then send again.".into(),
+            // L1.1.
+            Self::TooManyPaths => "this call has more path-like strings than Lunchroom checks in \
+                                   one call; split it into smaller calls."
+                .into(),
         }
     }
 }
@@ -278,6 +291,11 @@ impl Reason {
                 "these two agents passed the rate limit {user} set for messages between two \
                  agents"
             ),
+            // L1.1.
+            Self::TooManyPaths => "Lunchroom resolves at most 1,000 path-like strings in one \
+                                   call; a call with more, other than a reply, is DENIED in every \
+                                   session"
+                .into(),
         }
     }
 }
@@ -459,6 +477,7 @@ mod tests {
             Reason::Halted,
             Reason::Loop,
             Reason::RateLimit,
+            Reason::TooManyPaths,
         ] {
             let step = reason.next_step();
             assert!(step.ends_with('.') && step.len() > 20, "{}", reason.word());
@@ -526,6 +545,7 @@ mod tests {
             Reason::Halted,
             Reason::Loop,
             Reason::RateLimit,
+            Reason::TooManyPaths,
         ] {
             assert_eq!(find_retired_word(r.word()), None, "{r:?}");
         }
@@ -640,6 +660,13 @@ mod tests {
                 "this pair passed the rate limit; wait, then send again.",
                 "these two agents passed the rate limit the user set for messages between two \
                  agents",
+            ),
+            (
+                Reason::TooManyPaths,
+                "this call has more path-like strings than Lunchroom checks in one call; split \
+                 it into smaller calls.",
+                "Lunchroom resolves at most 1,000 path-like strings in one call; a call with \
+                 more, other than a reply, is DENIED in every session",
             ),
         ];
         for (reason, step, rule) in table {

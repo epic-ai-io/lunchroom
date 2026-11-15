@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proof 9, inside the container: the real Hermes Agent (commit 9976f48), Lunchroom 1.1.0 installed for
+# Proof 9, inside the container: the real Hermes Agent (commit 9976f48), Lunchroom 1.1 installed for
 # it with `lunchroom install hermes`, the plugin enabled the way the install tells the user, and the
 # model's API answered by chatmock.py so that a one-shot turn becomes a real tool call whose real
 # pre_tool_call hook runs the plugin, which runs the guard.
@@ -20,7 +20,8 @@ export MOCK_LOG="$SESS/mock.log"
 SHELL_TOOL=terminal SHELL_ARG=command python3 "$PROOF/chatmock.py" &
 sleep 1
 install_lunchroom hermes
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install hermes finished" \
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install hermes finished" \
     || { fail "lunchroom install hermes did not finish"; sed 's/^/    /' "$RUN/install.log" | head; finish; }
 sed 's/^/    install: /' < <(python3 "$PROOF/plaintext.py" "$RUN/install.log" | tail -14)
 
@@ -71,6 +72,21 @@ measured "the terminal tool, 'ls /opt/proof': the model was given back: $(echo "
 case "$C" in *lib.sh*) pass "the control call ran (its output lists /opt/proof)" ;;
     *) fail "the control call did not run: '${C:-nothing}'" ;; esac
 grep -h '"tools"' "$MOCK_LOG.requests" | head -1 | cut -c1-400 | sed 's/^/MEASURED the tools Hermes offered: /'
+
+heading "2b. the plugin with Lunchroom's program gone: the call is not run (1.1, spec section 13 item 5, H1.5)"
+# "The OpenClaw and Hermes plugins treat a guard program that is missing or fails as a guard that could
+# not decide: the call goes to the user, or is DENIED where nobody can be asked." A one-shot turn has
+# nobody to ask. The program is moved aside, then put back.
+mv "$LR" "$LR.gone"
+turn "CONTROLTEST c2" >/dev/null
+F=$(await_result CONTROLTEST c2)
+mv "$LR.gone" "$LR"
+measured "the terminal tool with the program gone: the model was given back: $(echo "$F" | head -c 400)"
+case "$F" in
+    *lib.sh*) fail "the control call RAN with Lunchroom's program gone: the plugin failed open" ;;
+    "") fail "no result came back for the call made with the program gone" ;;
+    *) pass "the control call did not run with Lunchroom's program gone (the plugin did not fail open)" ;;
+esac
 
 heading "3. the checkout owned by another user who is not root"
 # Hermes keeps the version information it read once in the gateway process it starts for one-shot turns,

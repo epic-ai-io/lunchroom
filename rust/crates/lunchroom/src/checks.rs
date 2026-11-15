@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lunchroom_core::cards;
 use lunchroom_core::identity::{Harness, Identity};
-use lunchroom_core::mail::Mail;
+use lunchroom_core::mail::{Evidence, Mail};
 use lunchroom_core::store::Store;
 
 use crate::codex::{Delivered, FailedAs};
@@ -129,13 +129,31 @@ fn run_with(
     // lock is taken, once for each recipient: the judgment reads files and processes, and the lock
     // holds every other Lunchroom program up while it is held.
     let judged = judge_recipients(env, store)?;
+    // D1.8: the sessions that asked for a call still waiting and are STOPPED (R3), judged the same
+    // way, outside the lock.
+    let stopped: std::collections::BTreeSet<Identity> = {
+        let mail = store.read().map_err(crate::cli::unread)?;
+        mail.waiting_calls()
+            .iter()
+            .map(|c| c.session.clone())
+            .filter(|s| assess(&mail, s, &env.home).evidence() == Evidence::NotRunning)
+            .collect()
+    };
     let again = store
         .update(|m| {
             // The clock is read under the lock: this process may have waited for it.
             let now = clock_now(env);
+            // D1.8: a kept call lapses 10 minutes after it was asked; a call whose session is
+            // STOPPED is closed.
+            m.sweep_calls(now, &|_, who| stopped.contains(who));
             m.expire_handovers(now);
             m.fail_unnamed(now);
             note_unreachable(m, &judged);
+            // F2 design, "The agents on the console": what was found of each recipient is kept.
+            for (who, found) in &judged {
+                let kept = crate::evidence::kept(m, who, found, now);
+                m.set_judged(who, kept);
+            }
             m.tell_waiting(now);
             if offers.offers() {
                 m.to_offer_again(now)
@@ -631,6 +649,40 @@ mod tests {
             ])
         );
         let _ = id;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // F2 design, "The agents on the console": what the checks found of each recipient of a QUEUED
+    // message is kept for the console, with the time it was found.
+    #[test]
+    fn what_a_check_found_of_a_recipient_is_kept_for_the_console() {
+        let dir = scratch("kept");
+        let made = queued(&dir.join("store"));
+        assert!(made.is_some());
+        let Some((store, _)) = made else { return };
+        let env = Env {
+            home: dir.join("home"),
+            lunchroom_home: dir.clone(),
+            claude_pid: None,
+            attended: None,
+            entrypoint: None,
+            claude_session: None,
+            codex_thread: None,
+            codex_home: dir.join("home/.codex"),
+            claude_home: dir.join("home/.claude"),
+            hermes_home: dir.join("home/.hermes"),
+            hermes_session: None,
+            lunchroom_session: None,
+            now: 1000,
+        };
+        assert!(store.read().is_ok_and(|m| m.judged(&codex()).is_none()));
+        assert!(run(&env, &store, &Offers::Nobody).is_ok());
+        let mail = store.read().unwrap_or_default();
+        let kept = mail.judged(&codex());
+        assert!(kept.is_some(), "the recipient was judged");
+        let Some(kept) = kept else { return };
+        assert_eq!(kept.found, lunchroom_core::mail::Found::NotRunning);
+        assert!(kept.at >= 1000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -18,7 +18,8 @@ make_user
 export MOCK_API=1
 seed_claude
 install_lunchroom
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install claude-code finished" || { fail "install did not finish"; finish; }
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install claude-code finished" || { fail "install did not finish"; finish; }
 
 # bypassPermissions asks "WARNING: Claude Code running in Bypass Permissions mode ... No, exit / Yes, I
 # accept" at start. The setting that records the user's acceptance is set, as a person who accepted once

@@ -23,10 +23,11 @@ make_user
 mkdir -p "$SESS"
 chmod 777 "$SESS"
 export MOCK_LOG="$SESS/mock.log"
-UPDATE_TARGET=/home/dev/.lunchroom/store/state.json SHELL_TOOL=exec SHELL_ARG=command python3 "$PROOF/chatmock.py" &
+UPDATE_TARGET=$(store_state) SHELL_TOOL=exec SHELL_ARG=command python3 "$PROOF/chatmock.py" &
 sleep 1
 install_lunchroom openclaw
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install openclaw finished" || { fail "install did not finish"; finish; }
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install openclaw finished" || { fail "install did not finish"; finish; }
 
 OC=(as_dev env OPENCLAW_GATEWAY_TOKEN=proof-token openclaw)
 "${OC[@]}" config set models.providers.mock '{"baseUrl":"http://127.0.0.1:8099/v1","apiKey":"sk-mock","api":"openai-completions","models":[{"id":"mock-1","name":"Mock 1","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":128000,"maxTokens":4096}]}' --strict-json >/dev/null 2>&1
@@ -49,7 +50,9 @@ n=0; until status | grep -q "^alpha	" || [ $n -ge 40 ]; do sleep 0.5; n=$((n + 1
 status | grep "^alpha	" | grep -q AVAILABLE && pass "alpha joined and is AVAILABLE" || fail "alpha is not AVAILABLE"
 
 WS=$DEVHOME/.openclaw/workspace
-STORE=$DEVHOME/.lunchroom/store
+# 1.1, spec section 17 item 2: the store is /var/lib/lunchroom/<uid>/store. dev cannot enter it, so the
+# links below point at a place dev cannot reach, and the proof reads the store as root.
+STORE=$(store_dir)
 measured "workspace: $WS ($( [ -d "$WS" ] && echo exists || echo missing))"
 as_dev mkdir -p "$WS"
 as_dev ln -s "$STORE/state.json" "$WS/ws-link"

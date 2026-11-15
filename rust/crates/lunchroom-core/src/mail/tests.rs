@@ -532,7 +532,10 @@ fn message_asking_for_secret_tells_the_recipient() {
     assert_eq!(
         told,
         [
-            "Denied. Asked for a secret. codex asked you for a secret; the message was not delivered."
+            // §16 item 1 and item 8: a line of Lunchroom's, `<HH:MM> UTC Lunchroom: <words>
+            // (<agents>)`, naming the two agents (sender, `to`, recipient) and carrying no text of
+            // the message.
+            "00:00 UTC Lunchroom: Denied. Asked for a secret. (codex to claude)"
         ]
     );
     assert_eq!(m.take_notices(&claude("c1")).len(), 0);
@@ -1433,44 +1436,6 @@ fn the_recipients_own_hand_over_offers_the_oldest_from_anyone() {
     );
 }
 
-// §10::1 (D1.1) — a message within the byte limit whose labelled envelope would not fit
-// one command argument is refused and nothing is stored; one with the same bytes in longer lines
-// is accepted. Failure classes: all newlines (the most labels per byte); many short lines; the
-// boundary of line count; long names (the header grows); a single maximum-length line.
-#[test]
-fn a_message_whose_envelope_would_not_fit_one_argument_is_refused() {
-    let mut m = pair();
-    let before = m.clone();
-    for text in [
-        "\n".repeat(MAX_MESSAGE_BYTES),
-        "ab\n".repeat(MAX_MESSAGE_BYTES / 3),
-    ] {
-        assert_eq!(
-            send(&mut m, &claude("c1"), "claude", "codex", &text),
-            Err(SendRefusal::TooManyLines)
-        );
-        assert_eq!(m, before);
-    }
-    // The same size in 100-byte lines fits.
-    let long_lines = format!("{}\n", "a".repeat(99)).repeat(MAX_MESSAGE_BYTES / 100);
-    assert!(long_lines.len() <= MAX_MESSAGE_BYTES);
-    let sent = send(&mut m, &claude("c1"), "claude", "codex", &long_lines);
-    assert!(sent.is_ok(), "{sent:?}");
-    // The line count that fits is exact at the boundary.
-    let id_len = "lr-00000001".len();
-    let fits = |lines: usize| envelope_fits(id_len, "claude", "codex", &"a\n".repeat(lines));
-    let most = (0..MAX_ARG_BYTES).take_while(|n| fits(*n)).count();
-    assert!(most > 1000 && most < MAX_ARG_BYTES);
-    assert!(fits(most - 1) && !fits(most));
-    // Longer names leave less room.
-    assert!(!envelope_fits(
-        id_len,
-        &"n".repeat(32),
-        &"n".repeat(32),
-        &"a\n".repeat(most - 1)
-    ));
-}
-
 // §10 D1.7, D1.10: a message to an agent that left (its name taken away) is FAILED at
 // once, with that reason, and the user and the sender are told; a message to a named agent is not
 // touched.
@@ -1603,7 +1568,13 @@ fn waiting_blocked_and_delivered_are_each_told_once() {
     );
     // DELIVERED after being told of: told.
     assert_eq!(m.confirm(&x1, &id), Confirmation::Show);
-    let told = m.take_user_notices();
+    // §16 item 5: the hold began with this message, so "codex is HELD." is a line of its own (no
+    // message id) for the user and the sender; the notices of the message are counted here.
+    let told: Vec<Notice> = m
+        .take_user_notices()
+        .into_iter()
+        .filter(|n| !n.message.is_empty())
+        .collect();
     assert_eq!(told.len(), 1);
     assert!(
         told[0]
@@ -1612,7 +1583,8 @@ fn waiting_blocked_and_delivered_are_each_told_once() {
         "{told:?}"
     );
     let sender = m.take_notices(&claude("c1"));
-    assert_eq!(sender.len(), 3);
+    assert_eq!(sender.len(), 4);
+    assert_eq!(sender.iter().filter(|n| n.message.is_empty()).count(), 1);
     // A message nothing was told of is DELIVERED without a notice.
     let quiet = send(&mut m, &claude("c1"), "claude", "codex", "quiet")
         .map(|a| a.id)
@@ -1650,4 +1622,52 @@ fn a_check_offers_again_only_what_failed_before() {
         .unwrap_or_default();
     assert!(m.attempt_failed(&id, "no confirmation", 20).is_some());
     assert!(!m.to_offer_again(1_000_000).contains(&claude("c1")));
+}
+
+// §17.10 (the console shows each message that holds an agent, whole): the text of an arrival
+// Lunchroom did not deliver is kept, cut at 64 KiB on a character boundary and marked cut, and is
+// forgotten once no hold names it.
+#[test]
+fn the_text_of_an_undelivered_arrival_is_kept_while_it_holds() {
+    let who = Identity::new(Harness::OpenClaw, "o1");
+    let mut mail = Mail::default();
+    mail.observe(&who);
+    mail.hold_unrecorded_text(&who, "not-typed", "p1", "hello", 7);
+    let kept = mail.unrecorded("not-typed:p1").cloned();
+    assert_eq!(
+        kept,
+        Some(Unrecorded {
+            text: "hello".to_owned(),
+            cut: false,
+            at: 7
+        })
+    );
+    // Over the limit, with a two-byte character across it: cut before that character.
+    let long = format!("{}é", "a".repeat(UNRECORDED_MAX - 1));
+    mail.hold_unrecorded_text(&who, "not-typed", "p2", &long, 8);
+    let kept = mail
+        .unrecorded("not-typed:p2")
+        .cloned()
+        .unwrap_or(Unrecorded {
+            text: String::new(),
+            cut: false,
+            at: 0,
+        });
+    assert!(kept.cut);
+    assert_eq!(kept.text.len(), UNRECORDED_MAX - 1);
+    // decision of 2026-11-14 ("Keep, secrets replaced"): a secret in it is replaced before it is kept.
+    let key = format!("ghp_{}", "a".repeat(36));
+    mail.hold_unrecorded_text(&who, "not-typed", "p3", &format!("use {key} now"), 9);
+    let kept = mail
+        .unrecorded("not-typed:p3")
+        .map(|u| u.text.clone())
+        .unwrap_or_default();
+    assert!(!kept.contains(&key), "{kept}");
+    assert!(kept.contains(crate::secrets::REMOVED), "{kept}");
+    // The user types in the session: its holds end, and the next prune forgets the texts.
+    mail.user_typed(&who);
+    mail.prune(9, |_| false);
+    assert!(mail.unrecorded("not-typed:p1").is_none());
+    assert!(mail.unrecorded("not-typed:p2").is_none());
+    assert!(mail.unrecorded("not-typed:p3").is_none());
 }

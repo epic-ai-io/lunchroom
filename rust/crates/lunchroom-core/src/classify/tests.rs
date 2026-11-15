@@ -15,6 +15,14 @@ use crate::policy::{
     decide_call,
 };
 
+mod c2;
+mod marks;
+mod u2;
+mod u2_cross;
+mod u2_enum;
+mod u2_proc;
+mod u2_wall;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// A home folder holding Lunchroom's stores and program, harness transcripts and settings,
@@ -268,14 +276,43 @@ fn reply_is_inside_every_slip() {
         // A link on `PATH` whose real path is Lunchroom's program.
         "lrlink send codex hi".to_owned(),
     ] {
-        let c = h.bash(true, &cmd);
-        assert_eq!(c, CallClass::InSlip, "{cmd}");
+        // P1.1: a reply is inside the slip (the class), and PROTECTED as a reply (the kind), which
+        // only the Strict hold mode acts on: it runs in the Balanced and Relaxed modes, and goes
+        // to the user in the Strict mode, also under a `lunchroom yolo`.
+        let call = h.call(true, &cmd);
+        assert_eq!(call.class, CallClass::InSlip, "{cmd}");
+        assert!(call.kinds.contains(ProtectedKind::Reply), "{cmd}");
+        for (mode, want) in [
+            (HoldMode::Strict, Decision::AskUser),
+            (HoldMode::Balanced, Decision::Run),
+            (HoldMode::Relaxed, Decision::Run),
+        ] {
+            for yolo in [
+                YoloSource::Off,
+                YoloSource::HarnessOnly,
+                YoloSource::Lunchroom,
+            ] {
+                let s = Situation {
+                    held: true,
+                    yolo,
+                    approval_channel: true,
+                    mode,
+                };
+                assert_eq!(decide_call(call, s), want, "{cmd} {mode:?} {yolo:?}");
+                assert_eq!(
+                    decide(call.folded(), s),
+                    want,
+                    "{cmd} {mode:?} {yolo:?} folded"
+                );
+            }
+        }
+        // An agent that is not HELD: nothing to decide.
+        assert_eq!(h.call(false, &cmd).class, CallClass::InSlip, "{cmd}");
         assert_eq!(
-            decide(c, held_under(YoloSource::Off)),
+            decide_call(h.call(false, &cmd), NOT_HELD),
             Decision::Run,
             "{cmd}"
         );
-        assert_eq!(h.bash(false, &cmd), CallClass::InSlip, "{cmd}");
     }
     for cmd in [
         format!("{program} send codex hi; ls"),
@@ -927,12 +964,7 @@ fn unparseable_command_naming_f1_program_denied_everywhere() {
 #[test]
 fn unparseable_command_reason_is_unparsed_not_injection() {
     let h = Fixture::new();
-    for cmd in [
-        "echo $PATH",
-        "ls `pwd`",
-        "for f in a; do echo $f; done",
-        "echo {a,b}",
-    ] {
+    for cmd in ["echo $PATH", "for f in a; do echo $f; done", "echo {a,b}"] {
         assert_eq!(h.bash(true, cmd), UNPARSED, "{cmd}");
         assert_eq!(h.bash(false, cmd), CallClass::Ordinary, "{cmd}");
         assert_eq!(
@@ -940,12 +972,51 @@ fn unparseable_command_reason_is_unparsed_not_injection() {
             Decision::AskUser
         );
     }
+    // P1.4: a command that parses and is built at run time (a backquote, `$(...)`) is GATED only,
+    // not PROTECTED, and runs under a covering `lunchroom yolo`.
+    for cmd in ["ls `pwd`", "echo $(date)"] {
+        let call = h.call(true, cmd);
+        assert_eq!(call.class, CallClass::Ordinary, "{cmd}");
+        assert!(call.kinds.contains(ProtectedKind::Gated), "{cmd}");
+        assert!(!call.kinds.contains(ProtectedKind::Unparsed), "{cmd}");
+        assert_eq!(
+            decide_call(call, held_under(YoloSource::Lunchroom)),
+            Decision::Run,
+            "{cmd}"
+        );
+    }
     assert_eq!(ProtectedKind::Unparsed.reason(), Some(DenyReason::Unparsed));
     assert_eq!(DenyReason::Unparsed.word(), "unparsed");
     // While HELD, an unparseable command that also reads a credential path goes to the user
     // showing `unparsed`, whichever rule ran first.
-    for cmd in ["echo $(true) ~/.ssh/id_rsa", "cat ~/.ssh/id_rsa $(true)"] {
+    for cmd in ["echo $PATH ~/.ssh/id_rsa", "cat ~/.ssh/id_rsa $PATH"] {
         assert_eq!(h.bash(true, cmd), UNPARSED, "{cmd}");
+    }
+    // P1.4: with a command substitution the call parses, so it is GATED and PROTECTED as a
+    // credential read, and goes to the user in every mode and under every YOLO.
+    for cmd in ["echo $(true) ~/.ssh/id_rsa", "cat ~/.ssh/id_rsa $(true)"] {
+        let call = h.call(true, cmd);
+        assert!(call.kinds.contains(ProtectedKind::Credential), "{cmd}");
+        assert!(call.kinds.contains(ProtectedKind::Gated), "{cmd}");
+        for mode in [HoldMode::Strict, HoldMode::Balanced, HoldMode::Relaxed] {
+            for yolo in [
+                YoloSource::Off,
+                YoloSource::HarnessOnly,
+                YoloSource::Lunchroom,
+            ] {
+                let at = Situation {
+                    held: true,
+                    yolo,
+                    approval_channel: true,
+                    mode,
+                };
+                assert_eq!(
+                    decide_call(call, at),
+                    Decision::AskUser,
+                    "{cmd} {mode:?} {yolo:?}"
+                );
+            }
+        }
     }
     // A parseable command DENIED under F1.2 for a script it cannot find shows `unparsed` too.
     assert_eq!(h.bash(false, "bash missing.sh"), DENIED_UNPARSED);
@@ -1690,14 +1761,22 @@ fn prose_naming_a_channel_is_not_a_command() {
         }
     }
     for cmd in [
-        "git commit -m \"fix $(git rev-parse --short HEAD): codex resume\"",
         // An unquoted heredoc with nothing the shell expands.
         "cat > f.md <<EOF\nNote: codex resume and claude --resume are documented.\nEOF",
         "cat > f.md <<EOF\ncodex queue\nEOF",
-        "echo $(true) codex queue",
     ] {
         assert_eq!(h.bash(false, cmd), CallClass::Ordinary, "{cmd}");
         assert_eq!(h.bash(true, cmd), UNPARSED, "{cmd}");
+    }
+    // P1.4: a command substitution parses; the call is GATED, not PROTECTED, and not DENIED.
+    for cmd in [
+        "git commit -m \"fix $(git rev-parse --short HEAD): codex resume\"",
+        "echo $(true) codex queue",
+    ] {
+        assert_eq!(h.bash(false, cmd), CallClass::Ordinary, "{cmd}");
+        let call = h.call(true, cmd);
+        assert_eq!(call.class, CallClass::Ordinary, "{cmd}");
+        assert!(call.kinds.contains(ProtectedKind::Gated), "{cmd}");
     }
     // Parsed commands whose arguments are prose.
     for cmd in [
@@ -1724,7 +1803,6 @@ fn text_that_runs_a_channel_is_still_denied() {
         "cat > s.sh <<'EOF'\ncodex queue o hi\nEOF\nbash s.sh",
         "cat > s.sh <<'EOF'\ncodex queue o hi\nEOF\nsource s.sh",
         "cat > s.py <<'EOF'\nclaude --resume x\nEOF\npython3 s.py",
-        "cat > s.sh <<'EOF'\nclaude --resume x\nEOF\nchmod +x s.sh && ./s.sh",
         // A substitution runs wherever it stands.
         "git commit -m \"$(codex queue o hi)\"",
         "git commit -m \"`claude --resume x`\"",
@@ -1886,10 +1964,8 @@ fn a_build_makes_the_program_a_later_command_runs() {
         "./app",
         "./app && cargo build",
         "ls && ./missing.sh",
-        // A script made by a redirection, a heredoc or a command that is no build.
-        "echo x > s.sh && sh s.sh",
-        "echo x > s.sh && ./s.sh",
-        "echo $(date) > s.sh && ./s.sh",
+        // (A script a redirection or a heredoc of the same call writes is judged on the text
+        // written, P1.4: see `a_file_the_call_writes_and_runs_is_judged_on_its_text`.)
         "printf 'make' && ./missing",
         "echo make && ./missing",
         "git status && ./missing",
@@ -2308,7 +2384,8 @@ fn guard_config_requirement_survives_every_other_reason() {
         }
     }
     // The reason shown still follows F1.2 where it names one: `unparsed`.
-    assert_eq!(h.call(true, &mixed[0]).class, UNPARSED);
+    // `$(...)` parses (P1.4) and is GATED; a variable the reader cannot settle does not parse.
+    assert_eq!(h.call(true, &mixed[2]).class, UNPARSED);
     // F1.2: a quoted `$(` leaves an unbalanced quote in the piece that starts a program, so the
     // guard reads a "program" path that does not exist and the call is DENIED `unparsed`. That is
     // stronger than the GuardConfig requirement in every mode, so the requirement is not lost.
@@ -2336,7 +2413,6 @@ fn guard_config_requirement_survives_every_other_reason() {
         mode: HoldMode::Relaxed,
     };
     for cmd in [
-        "echo \"$(date)\" > out.txt",
         "git push",
         "rm out.txt",
         "curl http://example.com",
@@ -2346,6 +2422,10 @@ fn guard_config_requirement_survives_every_other_reason() {
         assert!(!call.kinds.contains(ProtectedKind::GuardConfig), "{cmd}");
         assert_eq!(decide_call(call, relaxed), Decision::Run, "{cmd}");
     }
+    // P1.4, P1.6: a command substitution is GATED, which goes to the user in Relaxed too.
+    let call = h.call(true, "echo \"$(date)\" > out.txt");
+    assert!(!call.kinds.contains(ProtectedKind::GuardConfig));
+    assert_eq!(decide_call(call, relaxed), Decision::AskUser);
 }
 
 // §11 L1.1 "Paths are resolved (symlinks, wildcards) before checking" (review finding 2) — `..`
@@ -2725,9 +2805,16 @@ fn p1_4_a_held_agent_starting_a_new_session_is_protected() {
             "{cmd}: {call:?}"
         );
         assert!(!matches!(call.class, CallClass::Denied(_)), "{cmd}");
+        // P1.4: a program the guard cannot read to the end (`mywrap`, on no list) is also GATED,
+        // which goes to the user in the Relaxed mode too; a PROTECTED call alone runs there.
+        let relaxed = if call.kinds.contains(ProtectedKind::Gated) {
+            Decision::AskUser
+        } else {
+            Decision::Run
+        };
         assert_eq!(
             strict_balanced_relaxed(call),
-            [Decision::AskUser, Decision::AskUser, Decision::Run],
+            [Decision::AskUser, Decision::AskUser, relaxed],
             "{cmd}"
         );
         // Under a `lunchroom yolo` in Strict and Balanced it still goes to the user.
@@ -3187,8 +3274,16 @@ fn an_unknown_tool_with_a_long_text_is_decided_at_once() {
         );
     }
     let input = json!({ "patch": text });
-    assert_eq!(h.class(true, "mystery_tool", &input), UNPARSED);
-    assert_eq!(h.class(false, "mystery_tool", &input), CallClass::Ordinary);
+    // §11 L1.1: more than 1,000 path-like strings in a call that is no reply is DENIED in every
+    // session (before 1.1 a HELD call was PROTECTED as unparsed and any other call ran).
+    assert_eq!(
+        h.class(true, "mystery_tool", &input),
+        CallClass::Denied(DenyReason::TooManyPaths)
+    );
+    assert_eq!(
+        h.class(false, "mystery_tool", &input),
+        CallClass::Denied(DenyReason::TooManyPaths)
+    );
     // TF1-AC1: past the limit of strings looked up, more text makes no more looks at the file
     // system, held or not (the work, not the time, which a busy host changes).
     // Twice the lines, every one new (repeated words add no new string to look up).
@@ -3607,28 +3702,24 @@ fn a_script_the_guard_cannot_read_is_denied_in_every_session() {
     }
 }
 
-// 1.1.0, option A (decided 2026-11-03): the console ships switched off, and so do its guard rules.
-// An agent that is not HELD is not blocked from terminals, debuggers, signals, tmux or `ptrace`;
-// another process's folder in /proc (its memory, environment, descriptors) is, as in 1.0.1, a read
-// L1.1 DENIES while HELD (the lesson of the 2026 Hugging Face incident, already in place), and adds
-// nothing otherwise.
-#[cfg(not(feature = "console"))]
+// 1.1 (spec §17 C2 item 1: "The 1.1 build ships the console switched on"): the console's guard
+// rules are on. An agent that is not HELD is blocked from another terminal, a debugger, a signal to
+// Lunchroom and `ptrace`; another process's folder in /proc (its memory, environment, descriptors)
+// is, as in 1.0.1, a read L1.1 DENIES while HELD. The rules' allowed neighbours and the rest of
+// the rules are in console_tests.rs.
+#[cfg(feature = "console")]
 #[test]
-fn without_the_console_its_rules_block_nothing() {
+fn with_the_console_its_rules_block() {
     let h = Fixture::new();
     for cmd in [
         "echo hi > /dev/pts/7",
         "cat /dev/tty3",
-        "kill -0 4242",
         "pkill lunchroom",
         "strace -p 4242",
         "gdb -p 4242",
-        "tmux send-keys -t other ls Enter",
-        "tmux capture-pane -p -t other",
         "python3 -c 'import ctypes; ctypes.CDLL(None).ptrace(16, 4242, 0, 0)'",
-        "cat /proc/4242/environ",
     ] {
-        assert_eq!(h.bash(false, cmd), CallClass::Ordinary, "{cmd}");
+        assert_ne!(h.bash(false, cmd), CallClass::Ordinary, "{cmd}");
     }
     assert_eq!(h.bash(true, "cat /proc/4242/environ"), DENIED_PATH);
     assert_eq!(h.bash(true, "head -c 64 /proc/4242/mem"), DENIED_PATH);
@@ -3691,5 +3782,163 @@ fn every_shared_lunchroom_file_is_out_of_an_agents_reach() {
                 "{name}"
             );
         }
+    }
+}
+
+/// The real file system, except for what the time did to one call's looks: `out` says the time is
+/// out (for some other path), `cut` is the one path whose look was cut short, and `cut_real` says
+/// that look was the `real` of the path, not its resolution.
+struct TimedOut {
+    inner: OsFs,
+    out: bool,
+    cut: Option<PathBuf>,
+    cut_real: bool,
+    /// A part the guard has no permission to look at.
+    blind: Option<PathBuf>,
+}
+
+impl crate::fs::Fs for TimedOut {
+    fn real(&self, p: &Path) -> PathBuf {
+        self.inner.real(p)
+    }
+    fn node(&self, p: &Path) -> crate::fs::Node {
+        self.inner.node(p)
+    }
+    fn out_of_time(&self) -> bool {
+        self.out
+    }
+    fn cut(&self, p: &Path) -> bool {
+        self.cut.as_deref() == Some(p)
+    }
+    fn resolve(&self, p: &Path) -> crate::fs::Resolved {
+        if self.cut.as_deref() == Some(p) && !self.cut_real {
+            return crate::fs::Resolved {
+                path: p.to_path_buf(),
+                complete: false,
+            };
+        }
+        if self.blind.as_deref().is_some_and(|b| p.starts_with(b)) {
+            return crate::fs::Resolved {
+                path: p.to_path_buf(),
+                complete: false,
+            };
+        }
+        self.inner.resolve(p)
+    }
+    fn is_dir(&self, p: &Path) -> bool {
+        self.inner.is_dir(p)
+    }
+    fn exists(&self, p: &Path) -> bool {
+        self.inner.exists(p)
+    }
+    fn expand(&self, pattern: &Path) -> crate::fs::Expansion {
+        self.inner.expand(pattern)
+    }
+    fn walk(&self, dir: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> crate::fs::WalkEnd {
+        self.inner.walk(dir, visit)
+    }
+    fn script(&self, p: &Path) -> crate::fs::Script {
+        self.inner.script(p)
+    }
+    fn runs_as_script(&self, p: &Path) -> bool {
+        self.inner.runs_as_script(p)
+    }
+    fn which(&self, prog: &str) -> Option<PathBuf> {
+        self.inner.which(prog)
+    }
+}
+
+// §11::13 (Fable M9a) — what the time cut is known per path. A HELD session's read of a
+// path whose look the time cut goes to the user (PROTECTED); a read of a path that cannot be
+// followed at all is DENIED, whether or not the time ran out for another path of the call, so the
+// answer does not depend on the order of a call's paths.
+#[test]
+fn a_cut_look_is_protected_and_a_loop_is_denied_whatever_else_timed_out() {
+    let h = Fixture::new();
+    let project = h.home.join("project");
+    write(&project.join("plain.txt"), "data");
+    assert!(std::os::unix::fs::symlink(project.join("b"), project.join("a")).is_ok());
+    assert!(std::os::unix::fs::symlink(project.join("a"), project.join("b")).is_ok());
+    let read = |view: &TimedOut, file: &str| {
+        Guard {
+            layout: &h.layout,
+            fs: view,
+            held: true,
+        }
+        .classify("Read", &json!({ "file_path": h.path(file) }), &project)
+    };
+    let view = |out: bool, cut: Option<&str>, cut_real: bool| TimedOut {
+        inner: OsFs::with_path(BUDGET, Some(h.home.join("bin").into_os_string())),
+        out,
+        cut: cut.map(|c| h.home.join(c)),
+        cut_real,
+        blind: Some(project.join("blind")),
+    };
+    // The look at this path was cut: one Lunchroom could not check, PROTECTED.
+    assert_eq!(
+        read(
+            &view(true, Some("project/plain.txt"), false),
+            "project/plain.txt"
+        ),
+        CallClass::Protected(ProtectedKind::Credential)
+    );
+    // A link loop, while the time is out for some other path: still DENIED, not PROTECTED.
+    assert_eq!(read(&view(true, None, false), "project/a"), DENIED_PATH);
+    // The same loop with nothing cut: DENIED.
+    assert_eq!(read(&view(false, None, false), "project/a"), DENIED_PATH);
+    // Only the path's real path was cut (its resolution finished): still one that was not checked.
+    assert_eq!(
+        read(
+            &view(true, Some("project/plain.txt"), true),
+            "project/plain.txt"
+        ),
+        CallClass::Protected(ProtectedKind::Credential)
+    );
+    // A part the guard has no permission to look at, while the time is out for some other path:
+    // DENIED too (it cannot be followed), not PROTECTED.
+    assert_eq!(
+        read(&view(true, None, false), "project/blind/x"),
+        DENIED_PATH
+    );
+    // Control: nothing cut, a plain file in the project is in the slip.
+    assert_eq!(
+        read(&view(false, None, false), "project/plain.txt"),
+        CallClass::InSlip
+    );
+}
+
+// §17 item 5 (decision of 2026-11-14, "Follow spec, narrowly", "Your pick, as chosen"): a HELD agent's
+// gdb that starts a program of its own runs in the chosen form (-nx, only run/r/bt/backtrace/
+// continue/c/quit/q as -ex, then --args and the program), read through to that program; any other
+// gdb call is a program the guard cannot read to the end, GATED.
+#[test]
+fn gdb_that_starts_its_own_program_runs_in_the_chosen_form() {
+    let h = Fixture::new();
+    for cmd in [
+        "gdb -nx --batch -ex run --args /bin/true",
+        "gdb --nx -q -ex r -ex bt -ex quit --args /bin/true",
+        "gdb -n -batch --eval-command continue --args /bin/true x y",
+    ] {
+        let call = h.call(true, cmd);
+        assert!(
+            !call.kinds.contains(ProtectedKind::Gated),
+            "{cmd}: {call:?}"
+        );
+        assert!(!matches!(call.class, CallClass::Denied(_)), "{cmd}");
+    }
+    for cmd in [
+        // No -nx: a .gdbinit would be read.
+        "gdb --batch -ex run --args /bin/true",
+        // An -ex not on the list, a command file, the = spelling, no --args, no program.
+        "gdb -nx --batch -ex 'shell id' --args /bin/true",
+        "gdb -nx -x cmds.gdb --args /bin/true",
+        "gdb -nx --eval-command=run --args /bin/true",
+        "gdb -nx /bin/true",
+        "gdb -nx -ex run --args",
+        // The program it starts is read: one on no list stays GATED.
+        "gdb -nx --batch -ex run --args mywrap",
+    ] {
+        let call = h.call(true, cmd);
+        assert!(call.kinds.contains(ProtectedKind::Gated), "{cmd}: {call:?}");
     }
 }

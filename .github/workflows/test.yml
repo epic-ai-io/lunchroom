@@ -29,8 +29,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --release --locked --all-targets -- -D warnings
       - run: cargo deny check advisories licenses bans sources
+      # N4: the network test traces each command with strace, which the runner image lacks.
+      - run: sudo apt-get install -y strace
       - run: cargo test --release --locked
-      - run: node --test plugins/openclaw/index.test.mjs
+      - run: node --test plugins/openclaw/index.test.mjs plugins/openclaw/c5.test.mjs
       # The Hermes tests drive the release build; without it they would skip, so fail instead.
       - run: test -x ../../target/release/lunchroom && python3 -m unittest
         working-directory: rust/plugins/hermes

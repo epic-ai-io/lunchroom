@@ -98,13 +98,31 @@ fn safe(text: &str) -> String {
     lunchroom_core::secrets::redact(&clean(text))
 }
 
-/// `record` with every text in it made safe to keep and to print.
-fn sanitized(record: &Record) -> Record {
+/// `record` with every text in it made safe to keep and to print. `writing`: the record is about to
+/// be written, so a DENIED decision's call is still the agent's own text (§17 item 4: its secrets
+/// replaced, each control character, direction mark and the like shown as its mark, cut at 64 KiB
+/// with the mark `cut`); read back, that call is already kept, and is only checked again.
+fn sanitized(record: &Record, writing: bool) -> Record {
+    #[cfg(feature = "console")]
+    let call = if record.hook == DENIED_HOOK {
+        if writing {
+            lunchroom_core::shown::kept_call(&record.call)
+        } else {
+            lunchroom_core::shown::reread_call(&record.call)
+        }
+    } else {
+        safe(&record.call)
+    };
+    #[cfg(not(feature = "console"))]
+    let call = {
+        let _ = writing;
+        safe(&record.call)
+    };
     Record {
         at: record.at,
         session: safe(&record.session),
         hook: safe(&record.hook),
-        call: safe(&record.call),
+        call,
         step: safe(&record.step),
         step_ms: record.step_ms,
         took_ms: record.took_ms,
@@ -126,11 +144,11 @@ fn merged(mut all: Vec<Record>) -> Vec<Record> {
 
 /// The records in the file, cleaned; a line that is not a record is passed over.
 fn read_file(lunchroom_home: &Path) -> Vec<Record> {
-    std::fs::read_to_string(file(lunchroom_home))
-        .unwrap_or_default()
+    // A byte that is not UTF-8 is read as U+FFFD (shown as a mark), not as the loss of the file.
+    String::from_utf8_lossy(&std::fs::read(file(lunchroom_home)).unwrap_or_default())
         .lines()
         .filter_map(|l| serde_json::from_str::<Record>(l).ok())
-        .map(|r| sanitized(&r))
+        .map(|r| sanitized(&r, false))
         .collect()
 }
 
@@ -148,8 +166,9 @@ fn read_spilled(lunchroom_home: &Path) -> Vec<(PathBuf, Record)> {
     files
         .into_iter()
         .filter_map(|p| {
-            let record = serde_json::from_str::<Record>(&std::fs::read_to_string(&p).ok()?).ok()?;
-            Some((p, sanitized(&record)))
+            let bytes = std::fs::read(&p).ok()?;
+            let record = serde_json::from_str::<Record>(&String::from_utf8_lossy(&bytes)).ok()?;
+            Some((p, sanitized(&record, false)))
         })
         .collect()
 }
@@ -227,7 +246,7 @@ pub fn add(lunchroom_home: &Path, record: &Record) -> Result<(), String> {
 
 /// [`add`], waiting `wait` for the lock.
 fn add_waiting(lunchroom_home: &Path, record: &Record, wait: Duration) -> Result<(), String> {
-    let record = sanitized(record);
+    let record = sanitized(record, true);
     std::fs::create_dir_all(lunchroom_home).map_err(|e| e.to_string())?;
     let lock_path = lunchroom_home.join("guard-records.flock");
     let lock = OpenOptions::new()
@@ -291,8 +310,8 @@ pub fn recent(records: &[Record], now: u64) -> Vec<&Record> {
     shown.collect()
 }
 
-/// The `hook` of a record of a DENIED decision (1.1). Such a record holds the time, the session and
-/// the reason word (`step`) and no command text; `step_ms` and `took_ms` only keep two DENIED
+/// The `hook` of a record of a DENIED decision (1.1). Such a record holds the time, the session, the
+/// reason word (`step`) and the call as it is kept (§17 item 4); `step_ms` and `took_ms` only keep two DENIED
 /// records of one second apart.
 #[cfg(feature = "console")]
 pub const DENIED_HOOK: &str = "denied";
@@ -309,8 +328,8 @@ pub const PROBE_SECS: u64 = 600;
 #[cfg(feature = "console")]
 pub const PROBE_COUNT: usize = 5;
 
-/// Records one DENIED decision of `session` for `reason` (the reason's word) at `at`. Sends
-/// nothing anywhere.
+/// Records one DENIED decision of `session` for `reason` (the reason's word) at `at`, with the call
+/// as it is kept (§17 item 4). Sends nothing anywhere.
 ///
 /// # Errors
 /// Why the record could not be written at all.
@@ -320,6 +339,7 @@ pub fn add_denied(
     at: u64,
     session: &str,
     reason: &str,
+    call: &str,
 ) -> Result<(), String> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -330,7 +350,7 @@ pub fn add_denied(
             at,
             session: session.to_owned(),
             hook: DENIED_HOOK.to_owned(),
-            call: String::new(),
+            call: call.to_owned(),
             step: reason.to_owned(),
             step_ms: nanos,
             took_ms: u64::from(std::process::id()),
@@ -628,5 +648,291 @@ mod tests {
         sessions.dedup();
         assert_eq!(sessions.len(), 80);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // §17 item 4 (C3): a DENIED decision's call is kept with its secrets replaced and each control
+    // character, direction mark and backslash written as its mark, newlines too; read back it is
+    // the same text, not marked again.
+    #[cfg(feature = "console")]
+    #[test]
+    fn denied_call_is_kept_with_marks_and_secrets_replaced_and_reads_back_the_same() {
+        let home = scratch("denied-call");
+        let token = format!("ghp_{}", "a".repeat(36));
+        let call = format!("curl -H {token} x\u{1b}[2J\u{202e}\\n\nsecond");
+        assert_eq!(
+            add_denied(&home, 100, "sess", "configuration", &call),
+            Ok(())
+        );
+        let want = format!(
+            "curl -H {} x\\u{{1b}}[2J\\u{{202e}}\\u{{5c}}n\\u{{a}}second",
+            lunchroom_core::secrets::REMOVED
+        );
+        let kept = read(&home);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].call, want);
+        let on_disk = std::fs::read_to_string(file(&home)).unwrap_or_default();
+        assert!(
+            !on_disk.contains("ghp_")
+                && !on_disk.contains('\u{1b}')
+                && !on_disk.contains('\u{202e}')
+        );
+        assert_eq!(on_disk.lines().count(), 1);
+        // A second write keeps the first as it was.
+        assert_eq!(add_denied(&home, 101, "sess", "kill", "ls"), Ok(()));
+        let again = read(&home);
+        assert_eq!(again[0].call, want);
+        assert_eq!(again[1].call, "ls");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // §17 item 4: cut at 64 KiB with the mark `cut`, exactly 64 KiB whole; a hand-edited file with a
+    // raw control character is cleaned when read.
+    #[cfg(feature = "console")]
+    #[test]
+    fn denied_call_64_kib_boundary_and_a_raw_file_is_cleaned_on_read() {
+        let home = scratch("denied-cut");
+        let exact = "a".repeat(64 * 1024);
+        assert_eq!(add_denied(&home, 1, "s", "kill", &exact), Ok(()));
+        assert_eq!(
+            add_denied(&home, 2, "s", "kill", &format!("{exact}b")),
+            Ok(())
+        );
+        let kept = read(&home);
+        assert_eq!(kept[0].call, exact);
+        assert_eq!(
+            kept[1].call,
+            format!("{exact}{}", lunchroom_core::shown::CUT_MARK)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let home = scratch("denied-raw");
+        std::fs::create_dir_all(&home).ok();
+        let raw = Record {
+            call: "x\u{1b}y".to_owned(),
+            hook: DENIED_HOOK.to_owned(),
+            ..record(5, None)
+        };
+        let line = serde_json::to_string(&raw).unwrap_or_default();
+        std::fs::write(file(&home), format!("{line}\n")).ok();
+        assert_eq!(read(&home)[0].call, "x\\u{1b}y");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- C3 (Codex's list): DENIED records ----
+
+    #[cfg(feature = "console")]
+    fn token() -> String {
+        format!("ghp_{}", "b".repeat(36))
+    }
+
+    // C3-060, C3-061, C3-062: each DENIED decision is its own record with its call, session and
+    // reason; five identical retries are five records.
+    #[cfg(feature = "console")]
+    #[test]
+    fn c3_each_retry_a_record_with_call_session_and_reason() {
+        let home = scratch("c3-retry");
+        for _ in 0..5 {
+            assert_eq!(
+                add_denied(&home, 50, "s1", "configuration", "curl https://x"),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            add_denied(&home, 50, "s2", "kill", "curl https://x"),
+            Ok(())
+        );
+        let kept = read(&home);
+        assert_eq!(kept.len(), 6);
+        assert!(
+            kept.iter()
+                .all(|r| r.call == "curl https://x" && r.hook == DENIED_HOOK && r.at == 50)
+        );
+        assert_eq!(
+            kept.iter()
+                .filter(|r| r.session == "s1" && r.step == "configuration")
+                .count(),
+            5
+        );
+        assert_eq!(
+            kept.iter()
+                .filter(|r| r.session == "s2" && r.step == "kill")
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // C3-065: each secret form of L1.2's minimum set is replaced in the record, on disk and read.
+    #[cfg(feature = "console")]
+    #[test]
+    fn c3_each_secret_pattern_replaced_in_record() {
+        let home = scratch("c3-secrets");
+        let secrets = [
+            format!("AKIA{}", "A1".repeat(8)),
+            token(),
+            format!("sk-{}", "k".repeat(24)),
+            format!("xoxb-{}", "1234567890"),
+            format!("npm_{}", "n".repeat(36)),
+            ["mongo", "db://user:hunter22@host/db"].concat(),
+            ["pass", "word=hunter2222"].concat(),
+            ["API", "_KEY: abcdef1234"].concat(),
+            ["-----BEGIN RSA PRIVATE", " KEY-----\nMIIEow"].concat(),
+        ];
+        for (n, s) in secrets.iter().enumerate() {
+            let call = format!("run {s}\nthen \"{s}\" done {s}");
+            assert_eq!(add_denied(&home, 10 + n as u64, "s", "leak", &call), Ok(()));
+        }
+        let on_disk = std::fs::read_to_string(file(&home)).unwrap_or_default();
+        let read_back = read(&home);
+        for s in &secrets {
+            let first = s.lines().next().unwrap_or("");
+            let probe = first.split(['=', ':', ' ']).next_back().unwrap_or(first);
+            assert!(!on_disk.contains(probe), "{probe} on disk");
+            assert!(
+                read_back.iter().all(|r| !r.call.contains(probe)),
+                "{probe} read"
+            );
+        }
+        assert_eq!(read_back.len(), secrets.len());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // C3-066: a secret put into the file by hand is replaced again when it is read.
+    #[cfg(feature = "console")]
+    #[test]
+    fn c3_secret_replaced_on_read_too() {
+        let home = scratch("c3-secret-read");
+        std::fs::create_dir_all(&home).ok();
+        let raw = Record {
+            call: format!("curl {}", token()),
+            hook: DENIED_HOOK.to_owned(),
+            ..record(5, None)
+        };
+        let line = serde_json::to_string(&raw).unwrap_or_default();
+        std::fs::write(file(&home), format!("{line}\n")).ok();
+        let kept = read(&home);
+        assert_eq!(
+            kept[0].call,
+            format!("curl {}", lunchroom_core::secrets::REMOVED)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // C3-048: a record file with a byte that is not UTF-8 keeps every record; the byte reads as
+    // U+FFFD and nothing panics.
+    #[cfg(feature = "console")]
+    #[test]
+    fn c3_invalid_utf8_replaced_visibly() {
+        let home = scratch("c3-utf8");
+        assert_eq!(add_denied(&home, 1, "s", "kill", "first"), Ok(()));
+        let mut bytes = std::fs::read(file(&home)).unwrap_or_default();
+        let bad = Record {
+            call: "f@g".to_owned(),
+            hook: DENIED_HOOK.to_owned(),
+            ..record(2, None)
+        };
+        let mut line = serde_json::to_string(&bad).unwrap_or_default().into_bytes();
+        let at = line.iter().position(|b| *b == b'@').unwrap_or(0);
+        line.splice(at..=at, [0x66, 0xc0, 0xaf, 0x67]);
+        bytes.extend_from_slice(&line);
+        bytes.push(b'\n');
+        std::fs::write(file(&home), bytes).ok();
+        let kept = read(&home);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].call, "first");
+        assert!(kept[1].call.contains('\u{fffd}'), "{:?}", kept[1].call);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // C3-071: the records file is readable by its user alone.
+    #[cfg(feature = "console")]
+    #[test]
+    fn c3_records_file_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = scratch("c3-mode");
+        assert_eq!(add_denied(&home, 1, "s", "kill", "x"), Ok(()));
+        let mode = std::fs::metadata(file(&home)).map(|m| m.permissions().mode() & 0o777);
+        assert_eq!(mode.ok(), Some(0o600));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // C3-072, C3-073: up to 1,000 DENIED records beside the 200 others: 999, 1000 kept whole, the
+    // 1,001st pushes out the oldest DENIED one only; a burst never pushes out an undecided call.
+    #[cfg(feature = "console")]
+    #[test]
+    fn c3_denied_cap_1000_beside_200() {
+        let home = scratch("c3-cap");
+        for at in 0..200u64 {
+            assert_eq!(add(&home, &record(at, Some("no answer"))), Ok(()));
+        }
+        let denied_count =
+            |home: &Path| read(home).iter().filter(|r| r.hook == DENIED_HOOK).count();
+        let other_count = |home: &Path| read(home).iter().filter(|r| r.hook != DENIED_HOOK).count();
+        for n in 0..999u64 {
+            assert_eq!(add_denied(&home, 1_000 + n, "s", "kill", "c"), Ok(()));
+        }
+        assert_eq!((denied_count(&home), other_count(&home)), (999, 200));
+        assert_eq!(add_denied(&home, 3_000, "s", "kill", "c"), Ok(()));
+        assert_eq!((denied_count(&home), other_count(&home)), (1_000, 200));
+        assert_eq!(add_denied(&home, 3_001, "s", "kill", "c"), Ok(()));
+        let all = read(&home);
+        assert_eq!(all.iter().filter(|r| r.hook == DENIED_HOOK).count(), 1_000);
+        assert_eq!(
+            all.iter()
+                .filter(|r| r.hook == DENIED_HOOK)
+                .map(|r| r.at)
+                .min(),
+            Some(1_001)
+        );
+        assert_eq!(all.iter().filter(|r| r.hook != DENIED_HOOK).count(), 200);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // C3-074, C3-075, C3-076, C3-077: five DENIED decisions of one session in 10 minutes (600
+    // seconds, a decision exactly 600 seconds old counts, 601 does not), every reason counts, two
+    // sessions never add up.
+    #[cfg(feature = "console")]
+    #[test]
+    fn c3_probing_threshold_window_session_and_reason() {
+        let mk = |at: u64, session: &str, step: &str| Record {
+            hook: DENIED_HOOK.to_owned(),
+            step: step.to_owned(),
+            session: session.to_owned(),
+            step_ms: at,
+            ..record(at, None)
+        };
+        let now = 10_000;
+        for (n, probing) in [(4usize, false), (5, true), (6, true)] {
+            let all: Vec<Record> = (0..n as u64).map(|i| mk(now - i, "a", "kill")).collect();
+            assert_eq!(denied_counts(&all, now)[0].probing(), probing, "{n}");
+        }
+        let edge = |age: u64| -> bool {
+            let mut all: Vec<Record> = (0..4u64).map(|i| mk(now - i, "a", "kill")).collect();
+            all.push(mk(now - age, "a", "kill"));
+            denied_counts(&all, now)[0].probing()
+        };
+        assert!(edge(599) && edge(600) && !edge(601));
+        let reasons = ["configuration", "kill", "leak", "unparsed", "protected"];
+        let all: Vec<Record> = reasons
+            .iter()
+            .enumerate()
+            .map(|(i, r)| mk(now - i as u64, "a", r))
+            .collect();
+        assert!(denied_counts(&all, now)[0].probing());
+        let mut two: Vec<Record> = (0..3u64).map(|i| mk(now - i, "a", "kill")).collect();
+        two.extend((0..3u64).map(|i| mk(now - i, "b", "kill")));
+        assert!(
+            denied_counts(&two, now)
+                .iter()
+                .all(|c| !c.probing() && c.recent == 3)
+        );
+        // Equal times and a time in the future: counted by the window, never negative.
+        let same: Vec<Record> = (0..5u64)
+            .map(|i| Record {
+                step_ms: i,
+                ..mk(now, "a", "kill")
+            })
+            .collect();
+        assert!(denied_counts(&same, now)[0].probing());
+        assert_eq!(denied_counts(&[mk(now + 50, "a", "kill")], now).len(), 0);
     }
 }

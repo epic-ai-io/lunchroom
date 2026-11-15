@@ -1,5 +1,5 @@
 #!/bin/bash
-# Proof 7, inside the container: the real Codex CLI 0.166.0 on a pseudo-terminal, Lunchroom 1.1.0
+# Proof 7, inside the container: the real Codex CLI 0.166.0 on a pseudo-terminal, Lunchroom 1.1
 # installed for it with `lunchroom install codex`, Codex's own hook review answered in Codex's own
 # screen ("Trust all and continue"), and its API answered by codexmock.py so that a prompt becomes a
 # real tool call whose real hooks run.
@@ -25,6 +25,8 @@ chmod 777 "$SESS"
 mkdir -p "$DEVHOME/.codex"
 cat > "$DEVHOME/.codex/config.toml" <<'T'
 model = "gpt-5.5"
+# 2026-11-14: Codex otherwise stops on its own "Update available" question before its prompt.
+check_for_update_on_startup = false
 model_provider = "mock"
 approval_policy = "never"
 # Codex's own sandbox cannot start inside this rootless container ("No usable execution environment
@@ -41,9 +43,50 @@ chown -R dev "$DEVHOME/.codex"
 MOCK_LOG="$SESS/mock.log" python3 "$PROOF/codexmock.py" &
 sleep 1
 install_lunchroom codex
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install codex finished" \
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install codex finished" \
     || { fail "lunchroom install codex did not finish"; finish; }
 
+# 1.1, spec section 13 (H1.4): after `lunchroom install codex`, config.toml holds web_search = "disabled"
+# at the top (Codex's hosted web search reaches no hook), and the backup of the file as it was is kept.
+if python3 - "$DEVHOME/.codex/config.toml" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
+top = [l for l in lines[:first_table] if l.replace(" ", "").startswith("web_search=")]
+sys.exit(0 if top == ['web_search = "disabled"'] or [t.replace(" ", "") for t in top] == ['web_search="disabled"'] else 1)
+PY
+then
+    pass "config.toml holds web_search = \"disabled\" at the top, above its first table (H1.4)"
+else
+    fail "config.toml does not hold web_search = \"disabled\" at the top"
+    sed 's/^/    | /' "$DEVHOME/.codex/config.toml" | head -20
+fi
+BACKUPS=$(ls "$DEVHOME/.codex"/config.toml.* 2>/dev/null | tr '\n' ' ')
+measured "files beside config.toml: ${BACKUPS:-none}"
+BACKUP_OK=no
+for b in $BACKUPS; do
+    grep -q 'model_provider = "mock"' "$b" && ! grep -q '^web_search' "$b" && BACKUP_OK=yes
+done
+[ "$BACKUP_OK" = yes ] && pass "a backup of config.toml as it was before the install is kept (H1.4)" \
+    || fail "no backup of the earlier config.toml (with the mock provider and no web_search line) is beside it"
+# 1.1, spec section 13 (H1.5): the tool-call hook is written as `<program> guard pretool || exit 2`,
+# "with a line written to standard error before the `exit 2`" (Codex blocks an exit 2 only with a
+# reason on standard error). So the command runs the program's `guard pretool`, then on failure
+# writes to standard error and ends with `exit 2` (2026-11-14: the earlier check wanted the command
+# to end in the bare text `|| exit 2`, which the clause's own line before the exit rules out).
+python3 - "$DEVHOME/.codex/hooks.json" "$LR" <<'PY' && pass "the PreToolUse hook is '<program> guard pretool || exit 2' with a line to standard error before the exit (H1.5)" || fail "the PreToolUse hook is not '<program> guard pretool || exit 2' with a line to standard error before the exit"
+import json, re, sys
+hooks = json.load(open(sys.argv[1]))["hooks"]
+cmds = [h["command"] for g in hooks["PreToolUse"] for h in g["hooks"]]
+def ok(c):
+    c = c.strip()
+    head, sep, tail = c.partition(" guard pretool ||")
+    return (sep != "" and sys.argv[2] in head and ">&2" in tail
+            and re.search(r"exit 2;?\s*\}?$", tail) is not None
+            and tail.index(">&2") < tail.rindex("exit 2"))
+sys.exit(0 if any(ok(c) for c in cmds) else 1)
+PY
 # The proof's own hook, beside Lunchroom's PreToolUse hook, before Codex first reads the file.
 cp "$PROOF/tee-hook.sh" /usr/local/bin/tee-hook.sh
 chmod 755 /usr/local/bin/tee-hook.sh
@@ -119,7 +162,16 @@ key "join cx"
 n=0; until status | grep -q "^cx	" || [ $n -ge 60 ]; do sleep 0.5; n=$((n + 1)); done
 status | sed 's/^/    /'
 status | grep "^cx	" | grep -q AVAILABLE && pass "the Codex session joined and is AVAILABLE (guarded)" \
-    || fail "the Codex session is not AVAILABLE"
+    || { fail "the Codex session is not AVAILABLE"
+         # 2026-11-14: the reason names a process (/proc/<pid>/exe); show what that process runs
+         # and its parent chain, which is gone with the container.
+         for p in $(status | grep -o '/proc/[0-9]*/exe' | grep -o '[0-9]*' | sort -u); do
+             q=$p
+             while [ -n "$q" ] && [ "$q" != 0 ] && [ "$q" != 1 ]; do
+                 echo "    process $q: exe $(readlink "/proc/$q/exe" 2>&1); args $(tr '\0' ' ' < "/proc/$q/cmdline" 2>/dev/null | cut -c1-200)"
+                 q=$(awk '{print $4}' "/proc/$q/stat" 2>/dev/null)
+             done
+         done; }
 
 heading "2. a real apply_patch call: what Codex gives the hook"
 R=$(probe cx PATCHTEST p1)
@@ -170,14 +222,15 @@ esac
 
 heading "3. apply_patch into Lunchroom's own folder, and a raw codex queue"
 R2=$(probe cx PATCHPROT p2)
-echo "MEASURED apply_patch of ~/.lunchroom/planted-p2.txt: Codex got back: $(echo "$R2" | head -c 700)"
+# 1.1, spec section 17 item 5: "any write to /var/lib/lunchroom ... [is] DENIED" (1.0.x protected ~/.lunchroom).
+echo "MEASURED apply_patch of /var/lib/lunchroom/planted-p2.txt: Codex got back: $(echo "$R2" | head -c 700)"
 case "$R2" in
     *DENIED*) pass "an apply_patch that writes inside Lunchroom's own folder is DENIED" ;;
     "") fail "no result for the apply_patch into Lunchroom's folder" ;;
     *) fail "an apply_patch that writes inside Lunchroom's own folder was NOT denied: $R2" ;;
 esac
-[ -e "$DEVHOME/.lunchroom/planted-p2.txt" ] && fail "the file ~/.lunchroom/planted-p2.txt was created" \
-    || pass "the file ~/.lunchroom/planted-p2.txt does not exist (and the folder does: $( [ -d "$DEVHOME/.lunchroom" ] && echo yes || echo no))"
+[ -e /var/lib/lunchroom/planted-p2.txt ] && fail "the file /var/lib/lunchroom/planted-p2.txt was created" \
+    || pass "the file /var/lib/lunchroom/planted-p2.txt does not exist (and the folder does: $( [ -d /var/lib/lunchroom ] && echo yes || echo no))"
 
 C=$(probe cx CONTROLTEST c1)
 measured "control exec_command (ls /opt/proof): Codex got back: $(echo "$C" | head -c 200)"
@@ -230,5 +283,23 @@ echo "$SF" | grep -qF -- "$LASTWORDS" \
     || fail "the last words of the DENIED text ('$LASTWORDS') are not on Codex's screen: it is cut off or folded"
 LINES=$(grep -c . "$RUN/screen-codex.txt")
 measured "Codex's screen holds $LINES non-blank lines (scrollback included)"
+
+heading "5. the tool-call hook fails closed: with Lunchroom's program gone, a call is blocked (1.1, section 13 item 5)"
+# Spec: "with the guard's program removed ... a tool call is blocked in Claude Code and in Codex and the
+# blocked call's text names `lunchroom doctor`". The program is moved aside, then put back.
+mv "$LR" "$LR.gone"
+F=$(probe cx CONTROLTEST c2)
+mv "$LR.gone" "$LR"
+echo "MEASURED control call with the program removed: Codex got back: $(echo "$F" | head -c 600)"
+[ -e /tmp/control-ran-c2 ] && fail "the control call RAN with Lunchroom's program gone: the hook failed open" \
+    || pass "the control call did not run with Lunchroom's program gone (/tmp/control-ran-c2 does not exist)"
+case "$F" in
+    "") fail "no result came back for the call made with the program gone" ;;
+    *"lunchroom doctor"*) pass "the blocked call's text names 'lunchroom doctor'" ;;
+    *) fail "the blocked call's text does not name 'lunchroom doctor': $(echo "$F" | head -c 300)" ;;
+esac
+G=$(probe cx CONTROLTEST c3)
+[ -e /tmp/control-ran-c3 ] && pass "with the program put back the control call runs again" \
+    || fail "with the program put back the control call did not run: ${G:-nothing}"
 
 finish

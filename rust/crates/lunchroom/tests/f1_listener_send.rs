@@ -87,12 +87,33 @@ fn an_ide_session_keeps_its_listener_at_a_start_and_at_a_turns_end() {
     }
 }
 
+/// The tool-call hook's command as `lunchroom install` writes it into `file` (H1.5): this mirrors
+/// `pretool_command` and `guard_failed_line` of `src/install.rs` (`FAILURE_HEAD`, `FAILURE_TAIL`,
+/// `FAILED_LINE_HEAD`, `FAILED_LINE_TAIL`), which a test of another crate cannot call. The program's
+/// path holds only characters the install's `shell_word` leaves unquoted.
+fn pretool_command(program: &str, file: &Path) -> String {
+    format!(
+        "{program} guard pretool || {{ [ $? -eq 2 ] || printf '%s\\n' 'Lunchroom: the guard failed \
+         and this tool call was blocked. Run lunchroom doctor, or reinstall Lunchroom, or, where \
+         the Lunchroom program is gone, remove the Lunchroom hooks from {} or run lunchroom \
+         uninstall.' >&2; exit 2; }}",
+        file.display().to_string().replace('\'', "'\\''")
+    )
+}
+
 /// Claude Code settings holding the guard hooks `lunchroom install` writes.
 fn configure_claude_guard(sb: &Sandbox) {
     let program = env!("CARGO_BIN_EXE_lunchroom");
     let hook = |mode: &str| json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}]);
+    // H1.5: the tool-call hook is the install's fail-closed line and carries `"onFailure": "block"`.
+    let settings_file = sb.home().join(".claude/settings.json");
+    let pretool = json!([{"hooks": [{
+        "type": "command",
+        "command": pretool_command(program, &settings_file),
+        "onFailure": "block",
+    }]}]);
     let settings = json!({"hooks": {
-        "PreToolUse": hook("pretool"), "PostToolUse": hook("posttool"),
+        "PreToolUse": pretool, "PostToolUse": hook("posttool"),
         "PostToolUseFailure": hook("posttool"), "UserPromptSubmit": hook("prompt"),
     }});
     let _ = std::fs::create_dir_all(sb.home().join(".claude"));
@@ -114,15 +135,24 @@ fn configure_codex(sb: &Sandbox, body: &str) {
         ("SessionStart", "start", "session_start"),
     ];
     let mut events = serde_json::Map::new();
+    let file = codex.join("hooks.json");
     for (event, mode, _) in hooks {
+        // H1.5: Codex's tool-call hook is the install's fail-closed line, naming its own file.
+        let command = if mode == "pretool" {
+            pretool_command(program, &file)
+        } else {
+            format!("{program} guard {mode}")
+        };
         events.insert(
             event.to_owned(),
-            json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}]),
+            json!([{"hooks": [{"type": "command", "command": command}]}]),
         );
     }
-    let file = codex.join("hooks.json");
     let _ = std::fs::write(&file, json!({ "hooks": events }).to_string());
-    let mut config = "model = \"x\"\n\n[features]\nunified_exec_tty = false\n".to_owned();
+    // H1.4: the install writes `web_search = "disabled"` at the top of config.toml.
+    let mut config =
+        "model = \"x\"\nweb_search = \"disabled\"\n\n[features]\nunified_exec_tty = false\n"
+            .to_owned();
     for (_, _, state) in hooks {
         let _ = write!(
             config,

@@ -160,7 +160,8 @@ fn the_help_text_is_plain_and_complete() {
         "Agents may run:\n  send <name> [--reply-to <id>] <text>",
         "  codex-threads [-n COUNT]                recent Codex threads, to name one with `register`\n  help, version\n",
         "  yolo <name,name,...|all> till <HH:MM>   let those agents act without asking until then (UTC);\n",
-        "separate names with commas; it works for Claude Code\n",
+        "separate names with commas; it works for agents of\n",
+        "every harness, and `till now` ends it at once\n",
         "HELD: a message from another agent is in a session, so Lunchroom restricts what that agent may do.\n",
         // R3.1 (2026-11-03): UNGUARDED is a lack of evidence, not a guard that stopped.
         "UNGUARDED: an agent is running, but Lunchroom has no evidence that its guard runs, so it delivers nothing to it.\n",

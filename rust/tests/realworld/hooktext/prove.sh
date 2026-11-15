@@ -2,7 +2,7 @@
 # Proof 6 (hooktext): what the user sees of Lunchroom's multi-line hook texts in Claude Code (and,
 # when the Codex part is built, in Codex).
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/hooktext/prove.sh | tee hooktext.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/hooktext/prove.sh | tee hooktext.txt
 
 . "$(dirname "$0")/../common/host.sh"
 

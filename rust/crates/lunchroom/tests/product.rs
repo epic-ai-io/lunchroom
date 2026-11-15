@@ -175,8 +175,11 @@ fn version_names_the_build() {
 }
 
 // §5::2, §7::8 (inspection aid): the shipped code opens no network connection, listens
-// on nothing, runs no service and sends or receives no chat message; its only dependencies are
-// serde, serde_json and sha2.
+// on nothing, runs no service and sends or receives no chat message. Its direct dependencies are
+// local-only: serde, serde_json, sha2, toml_edit (parsing and hashing), lunchroom-core (path),
+// rustix (terminal modes by system call), ed25519-dalek (signing and checking, no I/O), ratatui and
+// crossterm (the console's screen and keyboard on the user's own terminal) and signal-hook (restores
+// the terminal on SIGTERM/SIGHUP). `no_network_or_async_crate_is_locked` checks the whole lock.
 #[test]
 fn product_runs_locally_and_sends_no_chat_message() {
     let banned = [
@@ -218,10 +221,98 @@ fn product_runs_locally_and_sends_no_chat_message() {
             } else if in_deps && line.contains('=') {
                 let name = line.split(['=', '.']).next().unwrap_or_default().trim();
                 assert!(
-                    ["serde", "serde_json", "sha2", "toml_edit", "lunchroom-core"].contains(&name),
+                    [
+                        "serde",
+                        "serde_json",
+                        "sha2",
+                        "toml_edit",
+                        "lunchroom-core",
+                        "ratatui",
+                        "crossterm",
+                        "signal-hook",
+                        "ed25519-dalek",
+                        "rustix"
+                    ]
+                    .contains(&name),
                     "{manifest}: {name}"
                 );
             }
+        }
+    }
+}
+
+/// The packages of `Cargo.lock` with the names they depend on.
+fn locked_packages() -> Vec<(String, Vec<String>)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join("Cargo.lock")).unwrap_or_default();
+    let mut out = Vec::new();
+    for block in text.split("[[package]]").skip(1) {
+        let mut name = String::new();
+        let mut deps = Vec::new();
+        let mut in_deps = false;
+        for line in block.lines() {
+            let line = line.trim();
+            if let Some(n) = line.strip_prefix("name = \"") {
+                n.trim_end_matches('"').clone_into(&mut name);
+            } else if line.starts_with("dependencies = [") {
+                in_deps = true;
+            } else if in_deps && line == "]" {
+                in_deps = false;
+            } else if in_deps {
+                let d = line.trim_matches(|c| c == ',' || c == '"');
+                deps.push(d.split(' ').next().unwrap_or_default().to_owned());
+            }
+        }
+        out.push((name, deps));
+    }
+    out
+}
+
+// §5::2, §7::8 (inspection aid): no package in the lock is a network client, a network
+// server or an async runtime. `mio` is the one allowed name: crossterm and signal-hook-mio use its
+// poller to wait on the user's terminal and signals, and nothing else may depend on it.
+#[test]
+fn no_network_or_async_crate_is_locked() {
+    let packages = locked_packages();
+    assert!(
+        packages.len() > 30,
+        "Cargo.lock not read: {} packages",
+        packages.len()
+    );
+    let banned = [
+        "reqwest",
+        "hyper",
+        "hyper-util",
+        "tokio",
+        "ureq",
+        "tungstenite",
+        "tokio-tungstenite",
+        "async-std",
+        "async-io",
+        "smol",
+        "futures-executor",
+        "openssl",
+        "openssl-sys",
+        "native-tls",
+        "rustls",
+        "h2",
+        "curl",
+        "isahc",
+        "surf",
+        "attohttpc",
+        "socket2",
+        "actix-web",
+        "axum",
+    ];
+    for (name, _) in &packages {
+        assert!(!banned.contains(&name.as_str()), "Cargo.lock holds {name}");
+    }
+    for (name, deps) in &packages {
+        if deps.iter().any(|d| d == "mio") {
+            assert!(
+                ["crossterm", "signal-hook-mio"].contains(&name.as_str()),
+                "{name} depends on mio"
+            );
         }
     }
 }

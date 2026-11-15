@@ -78,6 +78,7 @@ case "$STUB_MODE" in
   deny) echo "Lunchroom: DENIED . fence" >&2; exit 2 ;;
   ask) printf '%s' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Lunchroom: h1 is HELD."}}' ;;
   deliver) printf '%s\\n' "${STUB_TEXT:-lunchroom delivery: 1 message}" >&2; exit 2 ;;
+  freed) printf '%s' '{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"Lunchroom: YOLO authorized until 14:00 UTC."}}' ;;
   signal) kill -TERM $$ ;;
   exit1) exit 1 ;;
   garbage) printf 'not json' ;;
@@ -134,6 +135,18 @@ class PluginWithStandInGuard(unittest.TestCase):
         self.assertIs(sent["approval_channel"], True)
         self.assertIs(sent["harness_yolo"], False)
         self.assertEqual(sent["plugin_file"], os.path.join(HERE, "__init__.py"))
+
+    def test_call_the_guard_frees_under_a_lunchroom_yolo_runs(self):
+        # R2.2, H1.1: the guard's `allow` is no block and no approval prompt, with a person
+        # present and without one; the call asks again once the guard asks again.
+        os.environ["STUB_MODE"] = "freed"
+        self.assertIsNone(self.call())
+        self.gate.surfaces = (False, False, False)
+        self.assertIsNone(self.call(tool_call_id="c2"))
+        self.gate.surfaces = (True, False, False)
+        os.environ["STUB_MODE"] = "ask"
+        asked = self.call(tool_call_id="c3")
+        self.assertIsNotNone(asked)
 
     def test_denied_call_is_blocked_with_the_guards_reason(self):
         os.environ["STUB_MODE"] = "deny"
@@ -545,6 +558,34 @@ class PluginWithStandInGuard(unittest.TestCase):
         out = self.plugin.on_pre_tool_call(tool_name="terminal", args={}, session_id="h1", program=absent)
         self.assertEqual(out["action"], "block")
 
+    def test_a_missing_failing_or_silent_guard_is_one_that_could_not_decide(self):
+        """§13::107 and §13::108: with the guard program missing, exiting with an error,
+        killed by a signal, answering with what cannot be read, or giving no answer in time, the call
+        goes to the user where a person can be asked, and is DENIED where nobody can."""
+        self.plugin.DEADLINE_SECONDS = 0.3
+        absent = os.path.join(self.dir, "absent")
+        cases = [
+            ("allow", absent, "its program is missing"),
+            ("exit1", self.program, "exit 1"),
+            ("signal", self.program, "stopped by signal 15"),
+            ("garbage", self.program, "its answer could not be read"),
+            ("sleep", self.program, "no answer in time"),
+        ]
+        for mode, program, why in cases:
+            os.environ["STUB_MODE"] = mode
+            self.gate.surfaces = (True, False, False)
+            out = self.plugin.on_pre_tool_call(tool_name="terminal", args={"command": "ls"},
+                                               session_id="h1", tool_call_id="c1", program=program)
+            self.assertEqual(out["action"], "approve", mode)
+            self.assertIn(why, out["message"], mode)
+            self.assertIn("It needs your yes", out["message"], mode)
+            self.gate.surfaces = (False, False, False)
+            out = self.plugin.on_pre_tool_call(tool_name="terminal", args={"command": "ls"},
+                                               session_id="h1", tool_call_id="c1", program=program)
+            self.assertEqual(out["action"], "block", mode)
+            self.assertIn(why, out["message"], mode)
+            self.assertIn("Nobody can be asked in this session, so this call is DENIED.", out["message"], mode)
+
     def test_no_session_goes_to_the_user_or_is_denied(self):
         self.assertEqual(self.call(session_id="")["action"], "approve")
         self.gate.surfaces = (False, False, False)
@@ -560,6 +601,22 @@ class PluginWithStandInGuard(unittest.TestCase):
                                       session_id="h1", tool_call_id="c1", status="ok", program=self.program)
         self.assertEqual(self.args(), ["guard", "posttool"])
         self.assertEqual(self.sent()["tool_response"], "out")
+
+    def test_after_call_carries_the_id_and_the_input_as_judged_before_the_call(self):
+        # T1.8: the guard keeps a call's written paths under its id from the call to its after-call
+        # hook, so the hook sends the same id and the input as it was judged, not as the tool
+        # left it.
+        args = {"command": "echo x > out.txt", "workdir": "/w"}
+        self.plugin.on_pre_tool_call(tool_name="terminal", args=args, session_id="h1",
+                                     tool_call_id="w1", program=self.program)
+        before = self.sent()
+        self.plugin.on_post_tool_call(tool_name="terminal", args={"command": "changed"}, result="ok",
+                                      session_id="h1", tool_call_id="w1", status="ok",
+                                      program=self.program)
+        after = self.sent()
+        self.assertEqual(self.args(), ["guard", "posttool"])
+        self.assertEqual(after["tool_use_id"], before["tool_use_id"])
+        self.assertEqual(after["tool_input"], before["tool_input"])
 
     def test_turn_text_is_typed_only_on_this_computers_surfaces(self):
         log = []
@@ -589,6 +646,24 @@ class PluginWithStandInGuard(unittest.TestCase):
         os.environ["STUB_MODE"] = "deliver"
         out = self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli", program=self.program)
         self.assertEqual(out, {"context": "lunchroom delivery: 1 message"})
+        os.environ["STUB_MODE"] = "allow"
+        self.assertIsNone(self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli",
+                                                      program=self.program))
+
+    def test_turn_takes_the_line_telling_of_an_approval_as_context_without_handing_a_message(self):
+        """§7::20: at the start of the next turn the guard's listener returns one line
+        naming the approval and the exact call; the plugin puts it in the turn's context, once, and
+        keeps no message id for it (it is no message: nothing waits to be confirmed)."""
+        line = ("Lunchroom: the user approved one call of yours with `lunchroom approve` (ap-00000007). "
+                "It is not another agent's message. You may run it again now, exactly as it was, once; "
+                "you stay HELD.\nTool: terminal\nThe call's input:\n{\"command\":\"git push\"}")
+        os.environ["STUB_MODE"] = "deliver"
+        os.environ["STUB_TEXT"] = line
+        out = self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli",
+                                          turn_id="t1", program=self.program)
+        self.assertEqual(out, {"context": line})
+        self.assertEqual(self.args(), ["listen", "--once"])
+        self.assertNotIn("h1", self.plugin.HANDED)
         os.environ["STUB_MODE"] = "allow"
         self.assertIsNone(self.plugin.on_pre_llm_call(session_id="h1", user_message="hi", platform="cli",
                                                       program=self.program))

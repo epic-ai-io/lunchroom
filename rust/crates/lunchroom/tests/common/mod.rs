@@ -346,3 +346,57 @@ impl Drop for Sandbox {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+/// Stands for the settings file a fixture is written to: the tool-call hook's line names the file the
+/// hook is in, so [`write_settings`] puts the file's own name in its place.
+pub const HERE: &str = "/x/here.json";
+
+/// Writes `value` to `file`, the file's own name in the place of [`HERE`].
+pub fn write_settings(file: &std::path::Path, value: &serde_json::Value) {
+    let text = value.to_string().replace(HERE, &file.display().to_string());
+    let _ = std::fs::write(file, text);
+}
+
+/// As [`write_settings`], for a file under the user's home: the guard resolves `HOME` (links and
+/// `..`), and the line names the file by that path, byte for byte, as the install writes it.
+pub fn write_settings_resolved(file: &std::path::Path, value: &serde_json::Value) {
+    let resolved = file
+        .parent()
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .zip(file.file_name())
+        .map_or_else(|| file.to_path_buf(), |(dir, name)| dir.join(name));
+    let text = value
+        .to_string()
+        .replace(HERE, &resolved.display().to_string());
+    let _ = std::fs::write(file, text);
+}
+
+/// The tool-call hook's command as `lunchroom install` writes it (H1.5): `<program> guard pretool`
+/// and the failure branch with its line on standard error, naming [`HERE`].
+pub fn pretool_command(program: &str) -> String {
+    format!(
+        "{program} guard pretool || {{ [ $? -eq 2 ] || printf '%s\\n' 'Lunchroom: the guard failed \
+         and this tool call was blocked. Run lunchroom doctor, or reinstall Lunchroom, or, where \
+         the Lunchroom program is gone, remove the Lunchroom hooks from {HERE} or run \
+         lunchroom uninstall.' >&2; exit 2; }}"
+    )
+}
+
+/// The command of the guard hook of `mode` as the install writes it.
+pub fn guard_command(program: &str, mode: &str) -> String {
+    if mode == "pretool" {
+        pretool_command(program)
+    } else {
+        format!("{program} guard {mode}")
+    }
+}
+
+/// The hook of `mode` as the install writes it for Claude Code (the tool-call hook also carries
+/// `"onFailure": "block"`) or for Codex.
+pub fn guard_hook(program: &str, mode: &str, claude: bool) -> serde_json::Value {
+    let mut hook = serde_json::json!({"type": "command", "command": guard_command(program, mode)});
+    if claude && mode == "pretool" {
+        hook["onFailure"] = serde_json::json!("block");
+    }
+    hook
+}

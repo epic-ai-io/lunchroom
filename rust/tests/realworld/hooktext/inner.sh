@@ -24,7 +24,8 @@ make_user
 export MOCK_API=1
 seed_claude
 install_lunchroom
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install claude-code finished" \
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install claude-code finished" \
     || { fail "lunchroom install claude-code did not finish"; finish; }
 
 # flat TEXT: one line, spaces collapsed, so a phrase wrapped over lines can be found.

@@ -2,7 +2,7 @@
 # Proof 5 (clock skew and lock contention): stamps from a clock that stepped back, and a store lock
 # another Lunchroom process holds.
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/clocklock/prove.sh | tee clocklock.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/clocklock/prove.sh | tee clocklock.txt
 
 . "$(dirname "$0")/../common/host.sh"
 

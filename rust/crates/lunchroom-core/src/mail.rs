@@ -45,30 +45,9 @@ const NOTICES_PER_MESSAGE: usize = 8;
 pub const GONE_NOTICE_SECS: u64 = 86_400;
 
 /// The longest message text Lunchroom accepts, in UTF-8 bytes (64 KiB). Every send is stored whole
-/// in `state.json`, rewritten on every guard hook, and handed to a harness as one argument.
+/// in `state.json`, rewritten on every guard hook. No harness takes the envelope as a command
+/// argument (D1.1), so the number of lines is not limited (D1.2).
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
-
-/// The longest single command argument Linux runs a program with, `MAX_ARG_STRLEN`, in bytes
-/// counting the closing NUL. A harness takes the envelope as one such argument (`codex queue
-/// --message`, `openclaw agent --message`).
-pub const MAX_ARG_BYTES: usize = 131_072;
-
-/// What an envelope holds besides the message's labelled body, at most: its fixed text and the
-/// program path in its reply line (a path is at most 4096 bytes, and quoting for the shell can
-/// make each of them four), with room to spare.
-const ENVELOPE_FIXED_BYTES: usize = 20_000;
-
-/// Whether the envelope of a message `text` with id length `id_len` from `from_name` to `to_name`
-/// is sure to fit one command argument: its body is `text` with every line labelled
-/// `[lr:<id>]> ` (7 bytes and the id), the names are in the header up to three times each, and
-/// [`ENVELOPE_FIXED_BYTES`] covers the rest.
-#[must_use]
-pub fn envelope_fits(id_len: usize, from_name: &str, to_name: &str, text: &str) -> bool {
-    let label = 7 + id_len;
-    let body = text.len() + text.lines().count() * label + 2;
-    let names = 3 * (from_name.len() + to_name.len());
-    ENVELOPE_FIXED_BYTES + names + body < MAX_ARG_BYTES
-}
 
 /// Seconds an attempt waits for the harness's confirmation before it counts as failed (D1.3, D1.4).
 pub const CONFIRM_SECS: u64 = 60;
@@ -121,6 +100,11 @@ pub struct Message {
     /// D1.3).
     #[serde(default)]
     pub handed_over: bool,
+    /// The order this message was recorded in, among all messages and all lines of Lunchroom's:
+    /// one counter in the store, taken under its lock (§17.10: equal times keep the order
+    /// recorded). 0 for a message recorded before 1.1. A field of 1.1: kept in the second file.
+    #[serde(default)]
+    pub rec: u64,
     /// What the user and the sender have been told of it while it waits (D1.8), and why it cannot
     /// be handed over now (D1.9). A store written before 1.1.0 reads as nothing told.
     #[serde(default)]
@@ -129,6 +113,15 @@ pub struct Message {
     /// write so an older program in a session that stays open does not erase them.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// The plain session record of a Codex session as it stood at a hand-over (D1.1): its length and its
+/// file identity (device and inode), all 0 when there was none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordMark {
+    pub len: u64,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// What Lunchroom has told of a QUEUED message, and why it cannot be handed over (D1.8, D1.9).
@@ -267,9 +260,6 @@ pub enum SendRefusal {
     NameOnlyHolder,
     /// The text is longer than [`MAX_MESSAGE_BYTES`].
     TooLong,
-    /// The text is within [`MAX_MESSAGE_BYTES`], but with every line labelled the envelope would not
-    /// fit one command argument ([`MAX_ARG_BYTES`]): too many lines.
-    TooManyLines,
     /// DENIED by a rule: `leak` (L1.2, L1.4), `halted` or `rate limit` (R1).
     Denied(Reason),
 }
@@ -283,6 +273,8 @@ pub struct Accepted {
     pub to: Identity,
     /// This message was delivered-and-halts: the pair is now HALTED for reason `loop` (R1.3).
     pub halted: bool,
+    /// The line of Lunchroom's that tells it (card 3, line 3), for the sender's `send` output.
+    pub halted_line: Option<String>,
 }
 
 /// What the recipient's guard does with a message it sees arrive (D1.1, D1.2).
@@ -304,6 +296,74 @@ pub enum AttemptOutcome {
     StillQueued { failed_attempts: u32 },
     Failed,
 }
+
+/// How far a session's transcript has been read (T1.7). It holds a byte offset and message ids, and
+/// no text of the transcript.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptRead {
+    /// The transcript's path, so a transcript that is another file starts again.
+    #[serde(default)]
+    pub path: String,
+    /// The byte the next read starts at.
+    #[serde(default)]
+    pub offset: u64,
+    /// The ids of the labels found so far.
+    #[serde(default)]
+    pub ids: BTreeSet<String>,
+    /// The read reached the end of the transcript.
+    #[serde(default)]
+    pub done: bool,
+    /// The user typed after the read began: the unread transcript no longer holds the session, and
+    /// the labels found before are not held against it.
+    #[serde(default)]
+    pub typed: bool,
+    /// A hook began a read that has not reported its result: it was cut off by the guard's time,
+    /// or its file stalls. The next hook's read of it is limited in time, so a stalled transcript
+    /// does not cost every hook the guard's whole time.
+    #[serde(default)]
+    pub reading: bool,
+}
+
+/// What the guard judged a call to write, kept from before the call to its after-call hook (T1.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WritingCall {
+    /// The paths, each spelling the guard resolved a word to.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// When it was kept.
+    #[serde(default)]
+    pub at: u64,
+}
+
+/// Paths a HELD session's call wrote, with the messages that held it at that moment (T1.8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Marked {
+    /// The paths the call wrote, as the guard judged them before the call (every spelling).
+    pub paths: Vec<String>,
+    /// The session that wrote them, and the name it had.
+    pub writer: Identity,
+    #[serde(default)]
+    pub writer_name: String,
+    /// The messages that held the writer when the call ran.
+    pub holders: Vec<Hold>,
+    /// When the call's after-call hook ran.
+    #[serde(default)]
+    pub since: u64,
+    /// The harness's id for the call.
+    #[serde(default)]
+    pub call: String,
+}
+
+/// The name a hold takes while a session's transcript is not read to its end (T1.7): the source
+/// "unjudged", as for a tool output the guard did not judge, with this as its mark.
+pub const UNREAD_TRANSCRIPT: &str = "transcript (not read to the end)";
+
+/// Most calls whose written paths are kept between a call's two hooks: a call that never reaches
+/// its after-call hook (cancelled by the user) leaves its entry, so the oldest go.
+const WRITING_KEPT: usize = 512;
+
+/// How long the paths of a call are kept for its after-call hook: a day.
+const WRITING_SECS: u64 = 86_400;
 
 /// Every message, name, hold and approval Lunchroom keeps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,7 +398,7 @@ pub struct Mail {
     /// the same session id in two harnesses two agents (I1.1).
     inboxes: BTreeMap<Harness, BTreeMap<String, Vec<String>>>,
     /// What holds each session, by identity key (D1.5).
-    holds: BTreeMap<String, Vec<Hold>>,
+    pub(crate) holds: BTreeMap<String, Vec<Hold>>,
     notices: BTreeMap<String, Vec<Notice>>,
     /// What the user is told of messages that wait or end (D1.8), in the next prompt or listener
     /// of any guarded session; each once.
@@ -352,6 +412,19 @@ pub struct Mail {
     pub(crate) approvals: Vec<Approval>,
     #[serde(default)]
     pub(crate) requests: Vec<Request>,
+    /// The lines that tell an agent of the user's approval or refusal of one of its calls (A1.2,
+    /// §17.10), each with the text `lunchroom read <id>` prints. A field of 1.1: it is kept in the
+    /// store's second file (D1.2).
+    #[serde(default)]
+    pub(crate) tells: Vec<Tell>,
+    /// The calls the user refused (§17.10): a retry of the exact call is DENIED with the reason that
+    /// the user refused it. A field of 1.1: it is kept in the store's second file.
+    #[serde(default)]
+    pub(crate) declined: Vec<Refusal>,
+    /// The plain session record as it stood when each message was handed to a Codex session, by
+    /// message id (D1.1). A field of 1.1: it is kept in the store's second file.
+    #[serde(default)]
+    handed_at: BTreeMap<String, RecordMark>,
     /// Calls the guard sent to the user's own permission prompt, by session key and the harness's
     /// id for the call, with the agent's name and the action, so card 4's line follows the yes.
     #[serde(default)]
@@ -365,9 +438,33 @@ pub struct Mail {
     /// Identity keys of the named agents the user has been told are UNGUARDED (R3.4).
     #[serde(default)]
     unguarded_told: BTreeSet<String>,
-    /// Identity keys of the sessions whose transcript a guard hook has searched (T1.7).
+    /// F2-AC55: when the user dismissed each session's PROBING alert, by session id; the alert
+    /// stays dark until a DENIED decision newer than this. A field of 1.2: it is kept in the store's
+    /// second file (D1.2).
+    #[serde(default)]
+    probe_dismissed: BTreeMap<String, u64>,
+    /// Identity keys of the sessions whose transcript a guard hook has searched (T1.7). Kept for a
+    /// 1.0.1 program, which reads it; 1.1 reads [`Mail::transcripts`].
     #[serde(default)]
     transcripts_read: BTreeSet<String>,
+    /// How far each session's transcript has been read, by identity key (T1.7): the byte offset
+    /// and the message ids found, never the transcript's text. A field of 1.1: it is kept in the
+    /// store's second file (D1.2).
+    #[serde(default)]
+    transcripts: BTreeMap<String, TranscriptRead>,
+    /// The paths each call of a session is judged to write, by session key and the harness's id
+    /// for the call, kept from the call's guard hook to its after-call hook (T1.8).
+    #[serde(default)]
+    writing: BTreeMap<String, WritingCall>,
+    /// The paths a HELD session's calls wrote, each with the messages that held it (T1.8). Never
+    /// expires: only the user clears one.
+    #[serde(default)]
+    marked: Vec<Marked>,
+    /// The answer `sudo -n -l` gave at the last install (A1.3, §17.8: "keeps the answer"), as the
+    /// JSON of [`crate::sudoers::Kept`]. A field of 1.1: it is kept in the store's second file. A
+    /// value that is not an answer reads as none kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sudo_answer: Option<Value>,
     /// For each Codex session, by identity key, the fingerprint of the trusted guard that ran in
     /// it (R3.1, Codex adapter).
     #[serde(default)]
@@ -388,10 +485,170 @@ pub struct Mail {
     /// it is Lunchroom's own, not a custom title (I1.5). It outlives the session's names.
     #[serde(default)]
     titles: BTreeMap<String, String>,
+    /// Every line of Lunchroom's, with its time and its agents, never removed (§16 item 1). A
+    /// field of 1.1: it is kept in the store's second file (D1.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lines: Vec<lines::LineRecord>,
+    /// The last number of the one counter that orders every message and every line recorded
+    /// ([`Message::rec`], [`lines::LineRecord::rec`]). A field of 1.1.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    rec_counter: u64,
+    /// Identity keys of the sessions that have been told what HELD means (V1.7, §16 item 1): a
+    /// line is told to a session, so a session that starts anew is told again. A field of 1.1.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    held_defined: BTreeSet<String>,
+    /// For each session, by identity key, the sequence numbers of the lines not yet shown in an
+    /// envelope (channel N, §16 item 2). A line is kept until the session hears it (K1.29): the
+    /// one-day rule of D1.8 does not remove it. A field of 1.1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    envelope_pending: BTreeMap<String, Vec<u64>>,
+    /// The calls waiting for the user (D1.8). A field of 1.1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    calls: Vec<calls::WaitingCall>,
+    /// Approvals given for kept calls and not yet used or expired (D1.8 "Not used in time"). A
+    /// field of 1.1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unused: Vec<calls::UnusedWatch>,
+    /// For each message that began a hold, the sequence number of the line "<agent> is HELD."
+    /// that told it (§16 item 5). A field of 1.1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    held_lines: BTreeMap<String, u64>,
+    /// For each message whose envelope was built, the sequence numbers of the lines it carried,
+    /// until the message is confirmed (§16 item 2, channel N). A field of 1.1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    envelope_shown: BTreeMap<String, Vec<u64>>,
+    /// What the program last found of each named agent's guard (R3), by identity key, for the
+    /// console: it runs as the user `lunchroom`, which reads neither the developer's home folder
+    /// nor another user's `/proc/<pid>/exe`, so it shows what the developer's own program found.
+    /// A field of 1.2: it is kept in the store's second file (D1.2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    judged: BTreeMap<String, Judged>,
+    /// The text of each arrival of another agent's text that Lunchroom did not deliver and that
+    /// holds a session (an OpenClaw or Hermes prompt the user did not type, a harness's own
+    /// cross-session message), by the hold's message key, cut at [`UNRECORDED_MAX`] bytes: the
+    /// console's panel of a HELD agent shows each message that holds it, whole (§17.10). Kept
+    /// while it holds a session. A field of 1.2: it is kept in the store's second file (D1.2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    unrecorded: BTreeMap<String, Unrecorded>,
     /// Fields a later program wrote that this one does not know, carried through every read and
     /// write.
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+/// Serde: a counter at 0 is not written.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+const fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Mail {
+    /// The next number of the one counter that orders every message and every line recorded.
+    pub(crate) fn next_rec(&mut self) -> u64 {
+        self.rec_counter += 1;
+        self.rec_counter
+    }
+
+    /// Records what the program found of `who`'s guard, replacing what it found before. A
+    /// session that has no name is not recorded: the console shows only named agents.
+    pub fn set_judged(&mut self, who: &Identity, judged: Judged) {
+        let key = who.key();
+        if self.names.values().any(|w| w.key() == key) {
+            self.judged.insert(key, judged);
+        }
+    }
+
+    /// [`Mail::hold_unrecorded`], keeping the arrival's `text`, every secret replaced
+    /// ([`crate::secrets::redact`]) and cut at [`UNRECORDED_MAX`] bytes at a character boundary,
+    /// for the console's panel of the HELD agent.
+    pub fn hold_unrecorded_text(
+        &mut self,
+        who: &Identity,
+        source: &str,
+        mark: &str,
+        text: &str,
+        now: u64,
+    ) {
+        self.hold_unrecorded(who, source, mark);
+        // decision of 2026-11-14 ("Keep, secrets replaced"): kept with every secret replaced, as a
+        // DENIED record is (V1.4), then cut.
+        let text = crate::secrets::redact(text);
+        let mut end = text.len().min(UNRECORDED_MAX);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.unrecorded.insert(
+            format!("{source}:{mark}"),
+            Unrecorded {
+                text: text[..end].to_owned(),
+                cut: end < text.len(),
+                at: now,
+            },
+        );
+    }
+
+    /// The kept text of the arrival that the hold `message` names, if there is one.
+    #[must_use]
+    pub fn unrecorded(&self, message: &str) -> Option<&Unrecorded> {
+        self.unrecorded.get(message)
+    }
+
+    /// What the program last found of `who`'s guard, if it has judged it.
+    #[must_use]
+    pub fn judged(&self, who: &Identity) -> Option<&Judged> {
+        self.judged.get(&who.key())
+    }
+}
+
+/// The most bytes of an arrival's text the store keeps for the console.
+pub const UNRECORDED_MAX: usize = 64 * 1024;
+
+/// The text of an arrival Lunchroom did not deliver, and when it came.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unrecorded {
+    pub text: String,
+    /// The text was longer than [`UNRECORDED_MAX`] bytes and was cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut: bool,
+    pub at: u64,
+}
+
+/// What the developer's own program found of an agent's guard (R3), and when, for the console.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Judged {
+    /// What the evidence showed.
+    pub found: Found,
+    /// For an UNGUARDED agent, the one reason R3.4 gives, as the user reads it; else empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    /// The harness process the judgment was made of, `<pid>:<start time>`, if the session had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    /// When (seconds since the Unix epoch).
+    pub at: u64,
+}
+
+/// The three findings of R3.1 to R3.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Found {
+    /// Not running, or cannot be reached.
+    NotRunning,
+    /// Running without the evidence R3.1 needs.
+    Unguarded,
+    /// The guard ran in its current session and the configuration is in place.
+    Guarded,
+}
+
+/// The fields 1.1 adds are kept in the store's second file (D1.2, [`side`]).
+impl crate::store::Sided for Mail {
+    fn split(main: &mut Value) -> Value {
+        side::split(main)
+    }
+
+    fn join(main: &mut Value, side_fields: &Value) {
+        side::join(main, side_fields);
+    }
 }
 
 /// Writes the current [`SCHEMA`] whatever the store was read with. (Serde hands the field by
@@ -500,6 +757,14 @@ impl Mail {
         });
         self.user_notices
             .retain(|n| now.saturating_sub(n.at) < KEEP_SECS);
+        self.forget_old_writing(now);
+        self.forget_old_tells(now);
+        let known: BTreeSet<String> = self.messages.keys().cloned().collect();
+        self.handed_at.retain(|id, _| known.contains(id));
+        // The text of another agent's arrival is kept while it holds a session.
+        let held_by: BTreeSet<&String> =
+            self.holds.values().flatten().map(|h| &h.message).collect();
+        self.unrecorded.retain(|k, _| held_by.contains(k));
         self.processes.retain(|k, _| alive(k));
         self.process_members.retain(|k, _| alive(k));
         let holding: BTreeSet<String> = self
@@ -565,9 +830,23 @@ impl Mail {
         self.seen.insert(who.key());
     }
 
-    /// Records that a guard hook searched this session's transcript; `true` the first time only.
-    pub fn first_transcript_read(&mut self, who: &Identity) -> bool {
-        self.transcripts_read.insert(who.key())
+    /// Keeps the answer `sudo -n -l` gave (A1.3), replacing the one kept before.
+    pub fn keep_sudo_answer(&mut self, kept: &crate::sudoers::Kept) {
+        self.sudo_answer = serde_json::from_str(&kept.to_json()).ok();
+    }
+
+    /// The answer kept at the last install; `None` when none was kept or the field is not an
+    /// answer (`lunchroom doctor` then has nothing to compare with).
+    #[must_use]
+    pub fn sudo_answer(&self) -> Option<crate::sudoers::Kept> {
+        crate::sudoers::Kept::from_json(&self.sudo_answer.as_ref()?.to_string())
+    }
+
+    /// The ids of every message Lunchroom has a record of: the labels of a transcript that name
+    /// none of them hold nothing (T1.7).
+    #[must_use]
+    pub fn message_ids(&self) -> BTreeSet<String> {
+        self.messages.keys().cloned().collect()
     }
 
     /// A hook saw this session running in the harness process `process` (its pid and start time,
@@ -840,6 +1119,7 @@ impl Mail {
     ///
     /// # Errors
     /// [`SendRefusal`], for the first rule that stops it.
+    #[allow(clippy::too_many_lines)] // one send: the rules in order, the record, the lines it tells
     pub fn send(
         &mut self,
         from: &Identity,
@@ -850,10 +1130,6 @@ impl Mail {
     ) -> Result<Accepted, SendRefusal> {
         if text.len() > MAX_MESSAGE_BYTES {
             return Err(SendRefusal::TooLong);
-        }
-        let next_id = format!("lr-{:08}", self.next_message + 1);
-        if !envelope_fits(next_id.len(), from_name, to_name, text) {
-            return Err(SendRefusal::TooManyLines);
         }
         self.expire_handovers(now);
         if !self.seen.contains(&from.key()) {
@@ -872,24 +1148,25 @@ impl Mail {
         }
         if asks_for_secret(text) {
             // L1.4: DENIED, and both agents are told; the recipient learns who asked, never the
-            // message itself (card 2), once until it has read the notice.
-            let text = format!(
-                "{} {from_name} asked you for a secret; the message was not delivered.",
-                crate::cards::asked_for_secret()
+            // message itself (card 2), once until it has read the notice. §16 item 8: the line
+            // names the two agents ("<sender> to <recipient>") and carries no text of the message;
+            // the recipient hears it by D and N, the user by U; the sender hears it by S.
+            let _ = self.tell_line(
+                now,
+                &crate::cards::asked_for_secret(),
+                lines::Who::Message {
+                    from: from_name,
+                    to: to_name,
+                },
+                &[from.clone(), to.clone()],
+                &[],
+                &[calls::Hearer {
+                    who: to.clone(),
+                    d: true,
+                    n: true,
+                }],
+                true,
             );
-            let notices = self.notices.entry(to.key()).or_default();
-            if !notices.iter().any(|n| n.text == text) {
-                push_notice(
-                    notices,
-                    Notice {
-                        message: String::new(),
-                        text,
-                        at: now,
-                        reason: false,
-                    },
-                    false,
-                );
-            }
             return Err(SendRefusal::Denied(Reason::Leak));
         }
         if self.is_held(from) && has_secret(text) {
@@ -905,6 +1182,7 @@ impl Mail {
         };
         self.next_message += 1;
         let id = format!("lr-{:08}", self.next_message);
+        let rec = self.next_rec();
         self.messages.insert(
             id.clone(),
             Message {
@@ -919,6 +1197,7 @@ impl Mail {
                 failed_attempts: 0,
                 presented_at: None,
                 handed_over: false,
+                rec,
                 told: Told::default(),
                 extra: BTreeMap::new(),
             },
@@ -929,11 +1208,31 @@ impl Mail {
             .entry(to.session.clone())
             .or_default()
             .push(id.clone());
+        // §16 item 12: the eighth send halts the pair: the sender hears the line by S (printed
+        // from this text), the other agent by D and N, the user by U. A message the pair
+        // exchanged is "A and B": the agents of the event are the two of the pair.
+        let halted_line = halted.then(|| {
+            self.tell_line(
+                now,
+                &crate::cards::loop_halted(),
+                lines::Who::Agents(&[from_name, to_name]),
+                &[from.clone(), to.clone()],
+                &[],
+                &[calls::Hearer {
+                    who: to.clone(),
+                    d: true,
+                    n: true,
+                }],
+                true,
+            )
+            .text
+        });
         Ok(Accepted {
             id,
             from: from.clone(),
             to,
             halted,
+            halted_line,
         })
     }
 
@@ -1005,13 +1304,42 @@ impl Mail {
         // D1.8: a message the user and the sender were told of while it waited is told DELIVERED.
         let told = message.told.any.then(|| Self::delivered_text(message, now));
         let holds = self.holds.entry(to.key()).or_default();
+        // §16 item 5: the hold begins with the first message that holds the session.
+        let begins = holds.is_empty() || (holds.len() == 1 && holds[0].message == id);
+        // (Held from the hand-over already, D1.5: the line was told then, if it was.)
         if !holds.iter().any(|h| h.message == id) {
             holds.push(hold);
         }
         if let Some(text) = told {
             self.tell(id, &text);
         }
+        if begins && !self.held_lines.contains_key(id) {
+            self.hold_begins(id, now);
+        }
+        self.envelope_confirmed(to, id);
         Confirmation::Show
+    }
+
+    /// [`Mail::handed_over`] for a Codex session, keeping `mark`, the plain session record as it
+    /// stood at the hand-over (D1.1): the search for the message's id starts there.
+    pub fn handed_over_at(&mut self, id: &str, mark: RecordMark) {
+        if self
+            .messages
+            .get(id)
+            .is_some_and(|m| m.status == Status::Queued)
+        {
+            // The earliest mark stands: an earlier hand-over nobody confirmed may have reached the
+            // record, and a search from a later mark would miss it (D1.2).
+            self.handed_at.entry(id.to_owned()).or_insert(mark);
+        }
+        self.handed_over(id);
+    }
+
+    /// The record mark kept when message `id` was handed over; `None` for a hand-over that kept
+    /// none (a message handed over by 1.0.1, or to a harness with no record).
+    #[must_use]
+    pub fn handed_at(&self, id: &str) -> Option<RecordMark> {
+        self.handed_at.get(id).copied()
     }
 
     /// Ids of `to`'s QUEUED messages already handed to its harness, awaiting confirmation.
@@ -1057,6 +1385,26 @@ impl Mail {
         let holds = self.holds.entry(to.key()).or_default();
         if !holds.iter().any(|h| h.message == id) {
             holds.push(hold);
+        }
+        // The line "<agent> is HELD." is told once the hand-over has gone ahead
+        // ([`Mail::hand_over_held`]): a hand-over that fails releases this hold, and a line told
+        // before that would have been false (D1.5).
+    }
+
+    /// The hand-over of `id` went ahead (the harness's program took it, or gave no answer, D1.3):
+    /// the recipient is HELD from this moment, and when this message began the hold the line
+    /// "<agent> is HELD." is told (§16 item 5, D1.5). Nothing for a message that is not holding
+    /// its recipient, one whose recipient was HELD already, or one already told.
+    pub fn hand_over_held(&mut self, id: &str, now: u64) {
+        let Some(message) = self.messages.get(id) else {
+            return;
+        };
+        let began = self
+            .holds
+            .get(&message.to.key())
+            .is_some_and(|h| h.len() == 1 && h[0].message == id);
+        if began && !self.held_lines.contains_key(id) {
+            self.hold_begins(id, now);
         }
     }
 
@@ -1226,8 +1574,13 @@ impl Mail {
         };
         message.presented_at = None;
         message.handed_over = false;
-        if release && let Some(holds) = self.holds.get_mut(&message.to.key()) {
-            holds.retain(|h| h.message != id);
+        if release {
+            // Nothing reached the session: the record is looked at afresh at the next hand-over.
+            self.handed_at.remove(id);
+            if let Some(holds) = self.holds.get_mut(&message.to.key()) {
+                holds.retain(|h| h.message != id);
+            }
+            self.end_declines();
         }
         true
     }
@@ -1349,7 +1702,10 @@ impl Mail {
     /// HALTED (R1.5). The caller passes only a prompt the guard accepts as the user's.
     pub fn user_typed(&mut self, who: &Identity) {
         self.holds.remove(&who.key());
+        // §17.10: a decline stands only while its hold does.
+        self.end_declines();
         self.conversations.user_typed(&who.key());
+        self.transcript_typed(who);
     }
 
     /// Another agent's text reached `who` by a way Lunchroom did not deliver (a harness's own
@@ -1367,9 +1723,129 @@ impl Mail {
             });
         }
     }
+
+    /// F2-AC54, F2-AC57: discards the QUEUED or FAILED message `id`: it leaves `messages` and its
+    /// recipient's inbox, every hold that names it ends, and its sender is told (D1.4).
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::Delivered`] for a DELIVERED message, [`Refused::Unknown`] for an id the store
+    /// does not hold; nothing is changed.
+    pub fn discard_message(&mut self, id: &str, words: &str, now: u64) -> Result<Message, Refused> {
+        let Some(found) = self.messages.get(id) else {
+            return Err(Refused::Unknown);
+        };
+        if found.status == Status::Delivered {
+            return Err(Refused::Delivered);
+        }
+        let Some(gone) = self.messages.remove(id) else {
+            return Err(Refused::Unknown);
+        };
+        if let Some(list) = self
+            .inboxes
+            .get_mut(&gone.to.harness)
+            .and_then(|by_session| by_session.get_mut(&gone.to.session))
+        {
+            list.retain(|m| m != id);
+        }
+        for holds in self.holds.values_mut() {
+            holds.retain(|h| h.message != id);
+        }
+        self.holds.retain(|_, holds| !holds.is_empty());
+        push_notice(
+            self.notices.entry(gone.from.key()).or_default(),
+            Notice {
+                message: id.to_owned(),
+                text: words.to_owned(),
+                at: now,
+                reason: false,
+            },
+            true,
+        );
+        Ok(gone)
+    }
+
+    /// F2-AC55: holds `who` as HELD by the user. The hold names no sender, so it permits no reply
+    /// (I1.6), and it ends as every hold does: the user typing in that session or releasing it.
+    pub fn hold_by_user(&mut self, who: &Identity, now: u64) {
+        let message = format!("user:{now}");
+        let holds = self.holds.entry(who.key()).or_default();
+        if !holds.iter().any(|h| h.message == message) {
+            holds.push(Hold {
+                message,
+                from: None,
+                from_name: "the user".to_owned(),
+            });
+        }
+    }
+
+    /// F2-AC55: the user dismissed the PROBING alert of session `session` (the session id its
+    /// DENIED records carry) at `now`.
+    pub fn dismiss_probe(&mut self, session: &str, now: u64) {
+        self.probe_dismissed.insert(session.to_owned(), now);
+    }
+
+    /// When the user last dismissed the PROBING alert of session `session`.
+    #[must_use]
+    pub fn probe_dismissed_at(&self, session: &str) -> Option<u64> {
+        self.probe_dismissed.get(session).copied()
+    }
+
+    /// F2-AC57: the holds of `who` whose message the store no longer holds. A hold the user made
+    /// (`user:<n>`) or one that came another way (`<source>:<mark>`) names no message and is never
+    /// stale.
+    #[must_use]
+    pub fn stale_holds(&self, who: &Identity) -> Vec<&Hold> {
+        self.holding(who)
+            .iter()
+            .filter(|h| !h.message.contains(':') && !self.messages.contains_key(&h.message))
+            .collect()
+    }
+
+    /// F2-AC57: ends the stale holds of `who`; returns how many ended.
+    pub fn release_stale(&mut self, who: &Identity) -> usize {
+        let stale: Vec<String> = self
+            .stale_holds(who)
+            .iter()
+            .map(|h| h.message.clone())
+            .collect();
+        if let Some(holds) = self.holds.get_mut(&who.key()) {
+            holds.retain(|h| !stale.contains(&h.message));
+            if holds.is_empty() {
+                self.holds.remove(&who.key());
+            }
+        }
+        stale.len()
+    }
+
+    /// F2-AC57: the QUEUED or FAILED messages whose recipient has no name in the store.
+    #[must_use]
+    pub fn unnamed_messages(&self) -> Vec<&Message> {
+        self.messages
+            .values()
+            .filter(|m| m.status != Status::Delivered)
+            .filter(|m| !self.names.values().any(|who| *who == m.to))
+            .collect()
+    }
 }
 
+/// Why the store would not discard a message (F2-AC54).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The store holds no message of that id.
+    Unknown,
+    /// The message was DELIVERED: it reached its session and cannot be taken back.
+    Delivered,
+}
+
+pub mod calls;
+mod carry;
+pub mod lines;
+mod reading;
+mod side;
 mod waiting;
+pub use crate::approvals::{Refusal, Tell, TellKind};
+pub use carry::Read as TranscriptSearch;
 pub use waiting::{cannot_hand_over, clock, span, standing, waiting_for};
 
 #[cfg(test)]
@@ -1383,3 +1859,18 @@ mod tests_f1_sweep;
 
 #[cfg(test)]
 mod tests_f1_notices;
+
+#[cfg(test)]
+mod tests_u5;
+
+#[cfg(test)]
+mod tests_u6;
+
+#[cfg(test)]
+mod tests_enum;
+
+#[cfg(test)]
+mod tests_c1;
+
+#[cfg(test)]
+mod tests_c1_codex;

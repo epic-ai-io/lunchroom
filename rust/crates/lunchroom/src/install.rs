@@ -4,8 +4,10 @@
 //!
 //! Spec: §13 H1.4 (the installer writes each harness configuration beside the old one, keeps a
 //! backup, tells the user any step only they can do, and never writes a harness's trust records),
-//! H1.5 (it sets no option that turns a guard failure into a block: a broken guard must never lock
-//! the user out; the guard itself sends what it cannot decide to the user), A1.3 (it changes the configuration that runs the guard, so it runs only on the user's
+//! H1.5 (the tool-call hook of Claude Code and of Codex is `<program> guard pretool || exit 2` with a
+//! line on standard error first, and Claude Code's carries `"onFailure": "block"`, so a guard that
+//! fails blocks that call; the prompt hook carries neither, so a failure never blocks the user's
+//! typing), A1.3 (it changes the configuration that runs the guard, so it runs only on the user's
 //! confirmation from a terminal no guarded session owns: the user's passphrase, or, for the install
 //! that sets the first one, a typed yes). Host facts:
 //! `docs/host-facts/claude-code.md` (hook output, `onFailure`, `asyncRewake`).
@@ -20,13 +22,22 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use lunchroom_core::mail::Mail;
+use lunchroom_core::setgid;
 use lunchroom_core::store::Store;
 
 #[cfg(feature = "console")]
-mod console_setup;
+pub(crate) mod console_keys;
+#[cfg(feature = "console")]
+pub(crate) mod console_setup;
+#[cfg(feature = "console")]
+pub(crate) mod console_state;
+#[cfg(all(test, feature = "console"))]
+mod console_tests;
 
 use crate::cli::Outcome;
-use crate::evidence::{CODEX_TTY, codex_tty_setting};
+use crate::evidence::{
+    CODEX_TTY, CODEX_WEB, CODEX_WEB_DISABLED, codex_tty_setting, codex_web_is_off,
+};
 use crate::home::Env;
 use crate::terminal::{NO_VERIFIER, System, confirm, confirm_or_begin, verifier_shown};
 
@@ -419,11 +430,47 @@ fn shell_word(word: &str) -> String {
     }
 }
 
+/// What the tool-call hook writes to standard error when the guard fails (H1.5): that Lunchroom's
+/// guard failed and the call was blocked, and what the user does. It is one single-quoted shell
+/// word, so it holds no single quote of its own; `file` is the harness configuration file the user
+/// edits, a quote in its name escaped.
+pub(crate) fn guard_failed_line(file: &Path) -> String {
+    format!(
+        "{FAILED_LINE_HEAD}{}{FAILED_LINE_TAIL}",
+        file.display().to_string().replace('\'', "'\\''")
+    )
+}
+
+/// The line of [`guard_failed_line`] before the configuration file's name.
+const FAILED_LINE_HEAD: &str = "Lunchroom: the guard failed and this tool call was blocked. Run \
+     lunchroom doctor, or reinstall Lunchroom, or, where the Lunchroom program is gone, remove the \
+     Lunchroom hooks from ";
+/// The line of [`guard_failed_line`] after the file's name.
+const FAILED_LINE_TAIL: &str = " or run lunchroom uninstall.";
+
+/// Before the line of [`guard_failed_line`] in the tool-call hook's command.
+const FAILURE_HEAD: &str = "|| { [ $? -eq 2 ] || printf '%s\\n' '";
+/// After it.
+const FAILURE_TAIL: &str = "' >&2; exit 2; }";
+
+/// The tool-call hook's command (H1.5): `<program> guard pretool || exit 2`, with a line on
+/// standard error before the `exit 2`, since Codex blocks on an exit 2 only when the hook wrote a
+/// reason to standard error. A guard that itself exits 2 has blocked the call and written its own
+/// reason, so the line is written only for another failure: a program that is missing (127),
+/// stopped by the system (128 and more) or ended by an error of its own.
+pub(crate) fn pretool_command(program: &str, file: &Path) -> String {
+    format!(
+        "{program} guard pretool {FAILURE_HEAD}{}{FAILURE_TAIL}",
+        guard_failed_line(file)
+    )
+}
+
 /// The hook groups Lunchroom adds, by hook event. Claude Code's listener waits in the background
 /// (`asyncRewake`); Codex's hooks cannot, so there the listener hands a waiting message over once,
 /// at a session's start and a turn's end. Claude Code runs `PostToolUseFailure` instead of
-/// `PostToolUse` when a tool fails, so the guard sees that output too.
-fn lunchroom_hooks(program: &Path, target: Target) -> Vec<(&'static str, Value)> {
+/// `PostToolUse` when a tool fails, so the guard sees that output too. `file` is the configuration
+/// file the hooks are written to; the tool-call hook's failure line names it (H1.5).
+fn lunchroom_hooks(program: &Path, target: Target, file: &Path) -> Vec<(&'static str, Value)> {
     let p = shell_word(&program.display().to_string());
     let guard = |mode: &str| {
         json!({"hooks": [{
@@ -431,6 +478,19 @@ fn lunchroom_hooks(program: &Path, target: Target) -> Vec<(&'static str, Value)>
             "command": format!("{p} guard {mode}"),
             "timeout": GUARD_TIMEOUT,
         }]})
+    };
+    // H1.5: the tool-call hook fails closed, and in Claude Code carries `"onFailure": "block"`,
+    // which also blocks a call when the hook passes its time limit. No other hook carries either.
+    let pretool = {
+        let mut hook = json!({
+            "type": "command",
+            "command": pretool_command(&p, file),
+            "timeout": GUARD_TIMEOUT,
+        });
+        if target == Target::ClaudeCode {
+            hook["onFailure"] = json!("block");
+        }
+        json!({"hooks": [hook]})
     };
     let listen = match target {
         Target::ClaudeCode => json!({"hooks": [{
@@ -446,7 +506,7 @@ fn lunchroom_hooks(program: &Path, target: Target) -> Vec<(&'static str, Value)>
         }]}),
     };
     let mut hooks = vec![
-        ("PreToolUse", guard("pretool")),
+        ("PreToolUse", pretool),
         ("PostToolUse", guard("posttool")),
         ("UserPromptSubmit", guard("prompt")),
         ("SessionStart", guard("start")),
@@ -491,6 +551,98 @@ const HOOK_ARGUMENTS: [&str; 6] = [
     "listen --once",
 ];
 
+/// `args`, the words after Lunchroom's program in a hook command, are the arguments one of
+/// Lunchroom's hooks gives it: one of [`HOOK_ARGUMENTS`], or `guard pretool` followed by the
+/// failure branch of H1.5 as [`pretool_command`] writes it (the file name any). An earlier
+/// install's `guard pretool` alone (the 1.0.1 installer wrote it, commit 276b58f, `install.rs` line
+/// 346) is still Lunchroom's, so an install over it replaces it. Every other `guard pretool ...`,
+/// among them a bare `|| exit 2` that no release wrote, is the user's.
+pub(crate) fn is_hook_arguments(args: &str) -> bool {
+    let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let args = words(args);
+    if HOOK_ARGUMENTS.contains(&args.as_str()) {
+        return true;
+    }
+    failure_branch_matches(&args)
+}
+
+/// `args` are `guard pretool` followed by exactly the failure branch [`pretool_command`] writes
+/// (H1.5): the form that blocks a call when the guard fails. The 1.0.x form (`guard pretool`
+/// alone) and a bare `|| exit 2` (Codex counts an exit 2 with nothing on standard error as a failed
+/// hook, which lets the call run) are not it.
+///
+/// The comparison is byte for byte with what the install writes, and the line's file name is the
+/// file the hook was read from (`file`; the same file by its path, or once both are resolved): a
+/// leading, trailing, repeated, tab, line-break, carriage-return or Unicode space, any other text,
+/// or the name of another file is not it. The hook is still Lunchroom's, so an install replaces it
+/// ([`is_hook_arguments`], which reads runs of whitespace as one space), but it is not the form
+/// that blocks: the shell reads a line break as a second command, and a syntax error exits 2 with
+/// nothing on standard error, which Codex lets through.
+pub(crate) fn is_fail_closed_for(args: &str, file: &Path) -> bool {
+    let Some(name) = args
+        .strip_prefix("guard pretool ")
+        .and_then(|rest| rest.strip_prefix(FAILURE_HEAD))
+        .and_then(|rest| rest.strip_suffix(FAILURE_TAIL))
+        .and_then(|line| line.strip_prefix(FAILED_LINE_HEAD))
+        .and_then(|line| line.strip_suffix(FAILED_LINE_TAIL))
+    else {
+        return false;
+    };
+    // The name is one single-quoted word: no quote in it but an escaped one.
+    if name.is_empty() || name.replace("'\\''", "").contains('\'') {
+        return false;
+    }
+    // The name is, byte for byte, the path of the file the hook was read from, the string the
+    // install writes: a link, a relative path, `..`, `.` or a doubled slash that reaches the same
+    // file is another spelling, not it (the safe side: the reason names the reinstall). No call is
+    // made on the file system, so there is no race and nothing to follow.
+    // Compared as bytes: a path that is not UTF-8 has no spelling in the line (the install refuses
+    // it), so it is never equal to one.
+    std::os::unix::ffi::OsStrExt::as_bytes(file.as_os_str())
+        == name.replace("'\\''", "'").as_bytes()
+}
+
+/// The tool-call hook's line names the configuration file in text (a JSON string), and evidence
+/// takes the hook as the install's only when that name is the file's path byte for byte: a path
+/// that is not text cannot be named, so the guard would never count as in place (H1.5). The
+/// install refuses such a path before it changes anything.
+fn refuse_unnamable(settings_path: &Path) -> Option<Outcome> {
+    settings_path.to_str().is_none().then(|| {
+        Outcome::failed(
+            "the configuration file's path holds a byte that is not text, so the guard's hook \
+             cannot name it; nothing was changed",
+            2,
+        )
+    })
+}
+
+/// `args` are, byte for byte, `guard pretool`: the only form a released installer wrote for the
+/// tool-call hook (the 1.0.1 release, commit 276b58f, `rust/crates/lunchroom/src/install.rs` line
+/// 346, `"command": format!("{p} guard {mode}")`), the one evidence tells the user to reinstall
+/// over. No space, tab, no-break or other Unicode space, line break or carriage return is folded,
+/// and no other form is an older install: a bare `|| exit 2` was never written by a release and is
+/// not Lunchroom's hook.
+pub(crate) fn is_pre_1_1_pretool(args: &str) -> bool {
+    args == "guard pretool"
+}
+
+/// The longest hook command that can be the install's line. A longer one is not read at all.
+pub(crate) const MAX_HOOK_COMMAND: usize = 4096;
+
+/// [`is_fail_closed_for`]'s shape with runs of whitespace read as one space, and any file name.
+fn failure_branch_matches(args: &str) -> bool {
+    let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let args = words(args);
+    // The line is exactly [`guard_failed_line`]'s: its fixed words around a file name, which is one
+    // single-quoted word: no quote in it but an escaped one, and not empty.
+    args.strip_prefix("guard pretool ")
+        .and_then(|rest| rest.strip_prefix(words(FAILURE_HEAD).as_str()))
+        .and_then(|r| r.strip_suffix(words(FAILURE_TAIL).as_str()))
+        .and_then(|line| line.strip_prefix(words(FAILED_LINE_HEAD).as_str()))
+        .and_then(|line| line.strip_suffix(words(FAILED_LINE_TAIL).as_str()))
+        .is_some_and(|file| !file.trim().is_empty() && !file.replace("'\\''", "").contains('\''))
+}
+
 /// A hook Lunchroom wrote: its command runs Lunchroom's program, by its path (quoted or not) or by
 /// a link that resolves to it (an earlier install under another name) or as [`default_program`],
 /// with exactly the arguments one of Lunchroom's hooks gives it. A user's hook that runs the same
@@ -499,10 +651,7 @@ fn is_lunchroom_hook(hook: &Value, program: &Path, home: &Path) -> bool {
     let Some(command) = hook["command"].as_str() else {
         return false;
     };
-    let known = |args: &str| {
-        let args = args.split_whitespace().collect::<Vec<_>>().join(" ");
-        HOOK_ARGUMENTS.contains(&args.as_str())
-    };
+    let known = is_hook_arguments;
     let p = program.display().to_string();
     let quoted = shell_word(&p);
     if [p.as_str(), quoted.as_str()].into_iter().any(|p| {
@@ -570,6 +719,7 @@ fn with_lunchroom_hooks(
     program: &Path,
     home: &Path,
     target: Target,
+    file: &Path,
 ) -> Result<Map<String, Value>, String> {
     let hooks = settings
         .entry("hooks")
@@ -577,7 +727,7 @@ fn with_lunchroom_hooks(
         .as_object_mut()
         .ok_or("the settings' \"hooks\" is not an object")?;
     let mut places = strip_lunchroom_hooks(hooks, program, home);
-    for (event, group) in lunchroom_hooks(program, target) {
+    for (event, group) in lunchroom_hooks(program, target, file) {
         let list = hooks
             .entry(event)
             .or_insert_with(|| Value::Array(Vec::new()))
@@ -653,7 +803,8 @@ const HERMES_PLUGIN: [(&str, &str); 2] = [
 
 /// Where `lunchroom` is linked so it runs by name: `~/.local/bin/lunchroom` or `~/bin/lunchroom`,
 /// the first of those folders on `path` that holds no other `lunchroom` (one already linked to
-/// `program` counts as free). `None` when neither is on `path`.
+/// `program` counts as free); with neither folder on the account at all, `~/.local/bin/lunchroom`
+/// (the install makes the folder). `None` when neither on `path` is free and one of them exists.
 fn path_link(home: &Path, path: &std::ffi::OsStr, program: &Path) -> Option<PathBuf> {
     let wanted = [home.join(".local/bin"), home.join("bin")];
     std::env::split_paths(path)
@@ -663,21 +814,43 @@ fn path_link(home: &Path, path: &std::ffi::OsStr, program: &Path) -> Option<Path
             Ok(target) => target == program,
             Err(_) => fs::symlink_metadata(l).is_err(),
         })
+        // Decision of 2026-11-14 ("Make the link"): an account with neither folder gets
+        // ~/.local/bin, which the common login profiles put on PATH once it exists.
+        .or_else(|| (!wanted.iter().any(|d| d.exists())).then(|| home.join(".local/bin/lunchroom")))
 }
 
 /// Links `link` to `program` (nothing to do when it already is); the report's line. A link that
 /// cannot be made is a line of the report too, never an error: the program and what was written
 /// before the link stay in the report of an install that went on.
 fn link_program(link: &Path, program: &Path) -> String {
+    let folder = link.parent().unwrap_or(link);
+    // Decision of 2026-11-14 ("Make the link"): on an account with neither ~/.local/bin nor
+    // ~/bin, ~/.local/bin is made for the link (path_link chose it, and the question named it).
     let made = if fs::read_link(link).is_err() {
-        std::os::unix::fs::symlink(program, link)
+        if folder.ends_with(".local/bin") && !folder.exists() {
+            // Made with the user's own group, not the setgid program's `lunchroom`.
+            lunchroom_core::setgid::as_own_group(|| fs::create_dir_all(folder))
+                .and_then(|()| std::os::unix::fs::symlink(program, link))
+        } else {
+            std::os::unix::fs::symlink(program, link)
+        }
     } else {
         Ok(())
     };
+    let on_path =
+        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == folder));
     match made {
-        Ok(()) => format!(
+        Ok(()) if on_path => format!(
             "linked {} to it, so `lunchroom` runs by name\n",
             link.display()
+        ),
+        Ok(()) => format!(
+            "linked {} to it; {} is not on your PATH yet, so until it is, run it by its path, {}. \
+             Open a new login shell: Ubuntu, Debian and Fedora put ~/.local/bin on PATH when it \
+             exists\n",
+            link.display(),
+            folder.display(),
+            program.display()
         ),
         Err(e) => format!(
             "{} was not linked to it ({e}); run it by its path, {}\n",
@@ -705,8 +878,15 @@ fn earlier_lines(earlier: &[(String, lunchroom_core::identity::Identity)]) -> St
 
 /// The question's line about the link, empty when there is none.
 fn link_line(link: Option<&PathBuf>) -> String {
-    link.map(|l| format!("\nIt also links {} to the program.", l.display()))
-        .unwrap_or_default()
+    link.map(|l| match l.parent().filter(|f| !f.exists()) {
+        Some(folder) => format!(
+            "\nIt also makes {} and links {} to the program.",
+            folder.display(),
+            l.display()
+        ),
+        None => format!("\nIt also links {} to the program.", l.display()),
+    })
+    .unwrap_or_default()
 }
 
 /// `lunchroom install openclaw` or `lunchroom install hermes`: the program, and the plugin's files
@@ -723,10 +903,7 @@ fn install_plugin(openclaw: bool, env: &Env, sys: &mut dyn System, program: &Pat
         );
     }
     let (dir, files): (PathBuf, &[(&str, &str)]) = if openclaw {
-        (
-            user_folder(env).join("plugins").join("openclaw"),
-            &OPENCLAW_PLUGIN,
-        )
+        (openclaw_plugin_dir(env), &OPENCLAW_PLUGIN)
     } else {
         (
             env.hermes_home.join("plugins").join("lunchroom"),
@@ -816,6 +993,19 @@ fn install_plugin(openclaw: bool, env: &Env, sys: &mut dyn System, program: &Pat
     Outcome::ok(report)
 }
 
+/// Spec section 13 item 4: `lunchroom install` with no harness named found none: nothing was changed, and how to
+/// name one. A harness's folder is made the first time it runs, so one installed and never started
+/// is not found.
+fn no_harness_found() -> Outcome {
+    Outcome::failed(
+        "no supported harness was found (Claude Code, Codex, OpenClaw, Hermes), so nothing was \
+         changed. A harness's folder (~/.claude, ~/.codex, ~/.openclaw, ~/.hermes) is made the \
+         first time it runs: start it once, or name it: lunchroom install \
+         claude-code|codex|openclaw|hermes",
+        2,
+    )
+}
+
 /// The supported harnesses whose folder exists for this user (H1.4): the word `install` takes, and
 /// the harness's name.
 pub(crate) fn found_harnesses(env: &Env) -> Vec<(&'static str, &'static str)> {
@@ -854,14 +1044,7 @@ pub(crate) fn found_harnesses_in(env: &Env, claude: &Path) -> Vec<(&'static str,
 fn install_found(env: &Env, sys: &mut dyn System) -> (Outcome, bool) {
     let found = found_harnesses(env);
     if found.is_empty() {
-        return (
-            Outcome::failed(
-                "no supported harness was found (Claude Code, Codex, OpenClaw, Hermes); name one: \
-                 lunchroom install claude-code|codex|openclaw|hermes",
-                2,
-            ),
-            false,
-        );
+        return (no_harness_found(), false);
     }
     let names: Vec<&str> = found.iter().map(|(_, name)| *name).collect();
     let mut first = Some(format!("Found: {}\n", names.join(", ")));
@@ -1038,16 +1221,37 @@ impl System for Prompted<'_> {
     fn verifier_blocker(&self) -> Option<String> {
         self.sys.verifier_blocker()
     }
+    fn confirm_root(&mut self, question: &str) -> Result<(), String> {
+        // The preface goes before the first question, as in `meet`; other modes pass it on.
+        let first = match &mut self.mode {
+            Mode::Preface(first) => first.take(),
+            Mode::Capture(_) | Mode::Offer { .. } => None,
+        };
+        match first {
+            Some(first) => self.sys.confirm_root(&format!("{first}{question}")),
+            None => self.sys.confirm_root(question),
+        }
+    }
+    fn sudo_list(&mut self) -> Result<String, String> {
+        self.sys.sudo_list()
+    }
+    fn sudo_list_user(&mut self, user: &str) -> Result<String, String> {
+        self.sys.sudo_list_user(user)
+    }
     #[cfg(feature = "console")]
     fn root_blocker(&self) -> Option<String> {
         self.sys.root_blocker()
+    }
+    #[cfg(feature = "console")]
+    fn missing(&self, path: &Path) -> bool {
+        self.sys.missing(path)
     }
     #[cfg(feature = "console")]
     fn run_root(&mut self, what: &str, argv: &[String], input: Option<&str>) -> Result<(), String> {
         self.sys.run_root(what, argv, input)
     }
     #[cfg(feature = "console")]
-    fn run_user(&mut self, program: &Path, args: &[&str]) -> Result<bool, String> {
+    fn run_user(&mut self, program: &Path, args: &[&str]) -> Result<i32, String> {
         self.sys.run_user(program, args)
     }
 }
@@ -1069,6 +1273,21 @@ pub fn install(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
         } else {
             Outcome::failed("usage: lunchroom install console", 2)
         };
+    }
+    // §17.2: where this system sets the store wall up and this is not yet the setgid program, the
+    // wall comes first and the setgid program's own install writes the hooks.
+    #[cfg(feature = "console")]
+    if sys.sets_up_wall() && !lunchroom_core::setgid::active() {
+        // §13::4: with no harness named and none found, the install changes nothing and says how
+        // to name one. Asked before the wall: the wall's root steps change the system (cold
+        // first-time install, 2026-11-14: the wall was set up, then the hooks could not be).
+        if args.is_empty() && found_harnesses(env).is_empty() {
+            return no_harness_found();
+        }
+        // F2 design, "Finding and starting the console", item 1: the console setup that ends the
+        // install is run by the installed (setgid) program's own install, which `finish_wall`
+        // starts as a child; this unpacked parent does not run it a second time.
+        return console_setup::install_with_wall(args, env, sys);
     }
     // F112-AC3: an install run with the build already installed is told so before its question.
     let installed_now = installed_program(env);
@@ -1111,6 +1330,64 @@ pub fn install(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
             }
         }
     }
+    // F2 design item 1: this install ends by running the console setup.
+    #[cfg(feature = "console")]
+    if installed && out.code == 0 && lunchroom_core::setgid::active() {
+        out = end_with_console(out, env, &mut *noticed.sys);
+    }
+    out
+}
+
+/// What an install says when the console setup that ends it stops: the wall stays installed.
+#[cfg(feature = "console")]
+const CONSOLE_STOPPED: &str = "The store wall is installed and the hooks run the new program, but \
+the console is not set up (the reason is above). To finish, run `lunchroom install console` in a \
+terminal of your own.\n";
+
+/// What the end of an install does about the console (F2 design, item 1).
+#[cfg(feature = "console")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterInstall {
+    /// The console is not set up: run the console setup.
+    RunSetup,
+    /// The console is set up: only say how to open it.
+    SayOpen,
+}
+
+/// The decision of [`AfterInstall`], from the one fact it rests on.
+#[cfg(feature = "console")]
+fn after_install(console_set_up: bool) -> AfterInstall {
+    if console_set_up {
+        AfterInstall::SayOpen
+    } else {
+        AfterInstall::RunSetup
+    }
+}
+
+/// F2 design, "Finding and starting the console", item 1: the end of `lunchroom install`, run by
+/// the installed (setgid) program, so a rerun of it and the fresh install's `finish_wall` child
+/// are the same path. A console already set up is only told how to open
+/// ([`crate::cli::OPEN_CONSOLE_LINE`]); otherwise [`console_setup::install_console`] runs in this
+/// process (with the wall active it builds no wall steps and does not run `install` again), with
+/// its checks and the stop on a wide password-free rule (F2-AC31). When it stops the report says
+/// how to finish and the code is not 0.
+#[cfg(feature = "console")]
+fn end_with_console(mut out: Outcome, env: &Env, sys: &mut dyn System) -> Outcome {
+    if after_install(console_setup::console_is_set_up(env, sys)) == AfterInstall::RunSetup {
+        let setup = console_setup::install_console(env, sys);
+        out.stdout.push_str(&setup.stdout);
+        out.stderr.push_str(&setup.stderr);
+        if setup.code != 0 {
+            // The hooks are written, the console is not set up: exit code 6, which the unpacked
+            // program that started this one reads as "hooks done" (F2 design, "Finding and
+            // starting the console", item 1, exit codes). The report says how to finish.
+            out.stdout.push_str(CONSOLE_STOPPED);
+            out.code = console_setup::CONSOLE_NOT_SET_UP;
+            return out;
+        }
+    }
+    out.stdout.push_str(crate::cli::OPEN_CONSOLE_LINE);
+    out.stdout.push('\n');
     out
 }
 
@@ -1224,7 +1501,7 @@ fn remaining_users(env: &Env, program: &Path) -> Vec<String> {
     for (harness, plugin, disable) in [
         (
             "OpenClaw",
-            user_folder(env).join("plugins/openclaw/index.mjs"),
+            openclaw_plugin_dir(env).join("index.mjs"),
             "openclaw plugins disable lunchroom",
         ),
         (
@@ -1249,6 +1526,14 @@ fn remaining_users(env: &Env, program: &Path) -> Vec<String> {
 #[must_use]
 #[allow(clippy::too_many_lines)] // one transaction: plan, lock, re-plan, write, report
 pub fn uninstall(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
+    #[cfg(feature = "console")]
+    if args.first().map(String::as_str) == Some("console") {
+        return if args.len() == 1 {
+            console_setup::uninstall_console(env, sys)
+        } else {
+            Outcome::failed("usage: lunchroom uninstall console", 2)
+        };
+    }
     let (harness, settings_path) = match args.first().map(String::as_str) {
         Some("claude-code") => ("Claude Code", env.claude_home.join("settings.json")),
         Some("codex") => ("Codex", env.codex_home.join("hooks.json")),
@@ -1329,23 +1614,10 @@ pub fn uninstall(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
                 "Start each {harness} session anew, so it stops running the guard."
             );
             let users = remaining_users(env, &program);
-            if users.is_empty() {
-                let _ = writeln!(
-                    report,
-                    "Lunchroom's program and messages stay in {}: delete that folder, and the \
-                     `lunchroom` link in ~/.local/bin or ~/bin, to remove them. No other harness \
-                     was found using them.",
-                    env.lunchroom_home.display()
-                );
-            } else {
-                let _ = writeln!(
-                    report,
-                    "Lunchroom's program and messages stay in {}, and are still used by: {}. \
-                     Do not delete that folder or the `lunchroom` link until those are \
-                     uninstalled too.",
-                    env.lunchroom_home.display(),
-                    users.join("; ")
-                );
+            report.push_str(&what_stays(&env.lunchroom_home, &users));
+            #[cfg(feature = "console")]
+            if let Some(note) = console_setup::rule_file_note(sys) {
+                report.push_str(&note);
             }
             // The passphrase check is root's: Lunchroom does not remove it.
             let _ = writeln!(
@@ -1359,6 +1631,48 @@ pub fn uninstall(args: &[String], env: &Env, sys: &mut dyn System) -> Outcome {
     }
 }
 
+/// What `lunchroom uninstall <harness>` says stays after the hooks are removed, for Lunchroom's
+/// folder `home` and the harnesses still using it. With the store wall (1.1, §17 item 2) the
+/// program is the shared `/usr/local/lib/lunchroom/lunchroom` and the messages are in
+/// `/var/lib/lunchroom/<uid>`, both root's: the developer cannot delete them, so the line names
+/// them as root's instead of telling the developer to delete a folder.
+fn what_stays(home: &Path, users: &[String]) -> String {
+    let walled = home.starts_with(setgid::STORE_ROOT);
+    match (walled, users.is_empty()) {
+        (false, true) => format!(
+            "Lunchroom's program and messages stay in {}: delete that folder, and the `lunchroom` \
+             link in ~/.local/bin or ~/bin, to remove them. No other harness was found using \
+             them.\n",
+            home.display()
+        ),
+        (false, false) => format!(
+            "Lunchroom's program and messages stay in {}, and are still used by: {}. Do not delete \
+             that folder or the `lunchroom` link until those are uninstalled too.\n",
+            home.display(),
+            users.join("; ")
+        ),
+        (true, true) => format!(
+            "Lunchroom's program stays at {} and your messages in {}, both root's. No other \
+             harness was found using them. To remove them, run `lunchroom uninstall console` \
+             first, then, as root, remove {}, and delete the `lunchroom` link in ~/.local/bin or \
+             ~/bin. The program is shared by every user of this computer who installed \
+             Lunchroom: remove {} only when none of them uses it.\n",
+            setgid::PROGRAM,
+            home.display(),
+            home.display(),
+            setgid::PROGRAM_DIR
+        ),
+        (true, false) => format!(
+            "Lunchroom's program stays at {} and your messages in {}, both root's, and they are \
+             still used by: {}. Do not remove them or the `lunchroom` link until those are \
+             uninstalled too.\n",
+            setgid::PROGRAM,
+            home.display(),
+            users.join("; ")
+        ),
+    }
+}
+
 /// The settings at `path` with Lunchroom's hooks in place, and whether that changes them. Sessions
 /// read their hooks when they start; with the same hooks, open sessions already run the program at
 /// its path and take the new one at their next call.
@@ -1369,7 +1683,7 @@ fn plan(
     target: Target,
 ) -> Result<(Map<String, Value>, bool), Outcome> {
     let old = read_settings(path)?;
-    match with_lunchroom_hooks(old.clone(), program, home, target) {
+    match with_lunchroom_hooks(old.clone(), program, home, target, path) {
         Ok(new) => {
             let changed = new != old;
             Ok((new, changed))
@@ -1393,6 +1707,13 @@ pub(crate) fn installed_program(env: &Env) -> PathBuf {
     } else {
         env.lunchroom_home.join("bin").join("lunchroom")
     }
+}
+
+/// The folder `lunchroom install openclaw` writes Lunchroom's OpenClaw plugin to, and the one
+/// `doctor` checks: the user's own folder (2026-11-14 real-world kit: doctor looked in the store,
+/// which in setgid mode is `/var/lib/lunchroom/<uid>`, and reported a plugin it could not find).
+pub(crate) fn openclaw_plugin_dir(env: &Env) -> PathBuf {
+    user_folder(env).join("plugins").join("openclaw")
 }
 
 /// The user's own Lunchroom folder, which the user's processes can read (the OpenClaw plugin, the
@@ -1448,6 +1769,9 @@ pub(crate) fn install_target_with(
             2,
         );
     }
+    if let Some(out) = refuse_unnamable(&settings_path) {
+        return out;
+    }
     if let Err(out) = plan(&settings_path, &program, &env.home, target) {
         return out;
     }
@@ -1457,7 +1781,7 @@ pub(crate) fn install_target_with(
     };
     // Shown as written: an event's groups in order, so two hooks on one event both show.
     let mut added = Map::new();
-    for (event, group) in lunchroom_hooks(&program, target) {
+    for (event, group) in lunchroom_hooks(&program, target, &settings_path) {
         if let Value::Array(groups) = added.entry(event).or_insert_with(|| json!([])) {
             groups.push(group);
         }
@@ -1504,7 +1828,7 @@ pub(crate) fn install_target_with(
         return out;
     }
     let config = fs::read_to_string(&config_path).unwrap_or_default();
-    let setting_new = matches!(target, Target::Codex) && codex_tty_setting(&config) != Some(false);
+    let setting_new = matches!(target, Target::Codex) && !codex_settings_are_off(&config);
     match install_files(
         &program,
         link.as_deref(),
@@ -1549,8 +1873,10 @@ fn name_earlier(
     }
 }
 
-/// `config` with Codex's terminals off, everything else as it was; `None` when it is not TOML or
-/// `features` is not a table, which Codex would refuse too.
+/// `config` with the two paths Codex runs no hook for turned off, everything else as it was: its
+/// terminals (`unified_exec_tty = false` under `[features]`) and its hosted web search
+/// (`web_search = "disabled"` at the top level, H1.4); `None` when it is not TOML or `features` is
+/// not a table, which Codex would refuse too.
 fn codex_tty_off(config: &str) -> Option<String> {
     let mut document = config.parse::<toml_edit::DocumentMut>().ok()?;
     document
@@ -1558,7 +1884,13 @@ fn codex_tty_off(config: &str) -> Option<String> {
         .or_insert_with(toml_edit::table)
         .as_table_like_mut()?
         .insert(CODEX_TTY, toml_edit::value(false));
+    document.insert(CODEX_WEB, toml_edit::value(CODEX_WEB_DISABLED));
     Some(document.to_string())
+}
+
+/// The two settings of [`codex_tty_off`] are both in place in `config`.
+fn codex_settings_are_off(config: &str) -> bool {
+    codex_tty_setting(config) == Some(false) && codex_web_is_off(config)
 }
 
 /// What the install question says of the setting (H1), or why the file cannot take it.
@@ -1567,26 +1899,43 @@ fn terminals_line(target: Target, config_path: &Path) -> Result<String, Outcome>
         return Ok(String::new());
     }
     let config = fs::read_to_string(config_path).unwrap_or_default();
-    if codex_tty_setting(&config) == Some(false) {
+    if codex_settings_are_off(&config) {
         return Ok(String::new());
     }
     if codex_tty_off(&config).is_none() {
         return Err(Outcome::failed(
             &format!(
                 "{} names features in a form Lunchroom cannot edit; set {CODEX_TTY} = false under \
-                 [features] there. Nothing was changed.",
+                 [features] and {CODEX_WEB} = \"{CODEX_WEB_DISABLED}\" at the top there. Nothing was \
+                 changed.",
                 config_path.display()
             ),
             2,
         ));
     }
-    Ok(format!(
-        "\nIt also sets {CODEX_TTY} = false under [features] in {}: Codex runs no hook for what an \
-         agent types into an open terminal, so with terminals on a HELD agent could get past the \
-         guard. It applies to every Codex session of this user, and those agents then cannot keep \
-         a terminal program open. Start open Codex sessions anew afterwards.",
-        config_path.display()
-    ))
+    let mut said = String::new();
+    if codex_tty_setting(&config) != Some(false) {
+        let _ = write!(
+            said,
+            "\nIt also sets {CODEX_TTY} = false under [features] in {}: Codex runs no hook for \
+             what an agent types into an open terminal, so with terminals on a HELD agent could \
+             get past the guard. It applies to every Codex session of this user, and those agents \
+             then cannot keep a terminal program open. Start open Codex sessions anew afterwards.",
+            config_path.display()
+        );
+    }
+    if !codex_web_is_off(&config) {
+        let _ = write!(
+            said,
+            "\nIt also sets {CODEX_WEB} = \"{CODEX_WEB_DISABLED}\" at the top of {}: Codex's hosted web \
+             search reaches no hook, so with it on an agent could fetch what the guard never \
+             sees. It applies to every Codex session of this user, and those agents then cannot \
+             search the web. The earlier file is kept as a backup. Start open Codex sessions anew \
+             afterwards.",
+            config_path.display()
+        );
+    }
+    Ok(said)
 }
 
 /// The yes covers the setting as the question stated it: a file that changed since is asked again.
@@ -1601,14 +1950,15 @@ fn setting_as_asked(target: Target, config_path: &Path, asked: &str) -> Result<(
     ))
 }
 
-/// Turns Codex's terminals off in `config_path`, keeping the old file as a backup (H1.1).
+/// Turns Codex's terminals and hosted web search off in `config_path`, keeping the old file as a
+/// backup (H1.1, H1.4).
 fn write_codex_tty_off(config_path: &Path, now: u64) -> std::io::Result<String> {
     let old = match fs::read_to_string(config_path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    if codex_tty_setting(&old) == Some(false) {
+    if codex_settings_are_off(&old) {
         return Ok(String::new());
     }
     let new = codex_tty_off(&old).ok_or_else(|| {
@@ -1616,7 +1966,10 @@ fn write_codex_tty_off(config_path: &Path, now: u64) -> std::io::Result<String> 
     })?;
     let mode = fs::metadata(config_path).map_or(0o600, |m| m.permissions().mode() & 0o777);
     let backup = replace(config_path, new.as_bytes(), mode, now)?;
-    let mut report = format!("set {CODEX_TTY} = false in {}\n", config_path.display());
+    let mut report = format!(
+        "set {CODEX_TTY} = false and {CODEX_WEB} = \"{CODEX_WEB_DISABLED}\" in {}\n",
+        config_path.display()
+    );
     if let Some(b) = backup {
         let _ = writeln!(report, "  the earlier settings are kept at {}", b.display());
     }
@@ -1719,6 +2072,44 @@ mod tests {
 
     use super::*;
     use crate::terminal::fake;
+
+    // Decision of 2026-11-14 ("Make the link"; cold first-time install: a fresh account had no
+    // ~/.local/bin, no link was made and `lunchroom` was not found): with neither ~/.local/bin nor
+    // ~/bin, the install names ~/.local/bin in its question, makes it, links the program there,
+    // and says the folder is not on PATH yet and how to run it until it is; with either folder
+    // there and none free on PATH, nothing is made.
+    #[test]
+    fn a_fresh_account_gets_a_local_bin_link() {
+        let home = crate::test_target()
+            .join("install-fresh-link")
+            .join(std::process::id().to_string());
+        let _ = fs::remove_dir_all(&home);
+        assert!(fs::create_dir_all(&home).is_ok());
+        let program = PathBuf::from("/usr/local/lib/lunchroom/lunchroom");
+        let path = std::env::join_paths([Path::new("/usr/bin")]).unwrap_or_default();
+        let link = home.join(".local/bin/lunchroom");
+        assert_eq!(path_link(&home, &path, &program), Some(link.clone()));
+        assert!(
+            link_line(Some(&link)).contains(&format!(
+                "It also makes {}",
+                home.join(".local/bin").display()
+            )),
+            "{}",
+            link_line(Some(&link))
+        );
+        let said = link_program(&link, &program);
+        assert_eq!(fs::read_link(&link).ok(), Some(program.clone()));
+        assert!(said.contains("is not on your PATH yet"), "{said}");
+        assert!(
+            said.contains("/usr/local/lib/lunchroom/lunchroom"),
+            "{said}"
+        );
+        // ~/bin there, not on PATH: nothing is made.
+        let _ = fs::remove_dir_all(home.join(".local"));
+        assert!(fs::create_dir_all(home.join("bin")).is_ok());
+        assert_eq!(path_link(&home, &path, &program), None);
+        let _ = fs::remove_dir_all(&home);
+    }
 
     // The program is linked by name from ~/.local/bin or ~/bin when one is on PATH, never over
     // another program of that name; one already linked to it counts as free.
@@ -2477,12 +2868,15 @@ mod tests {
         );
     }
 
-    // F112-AC2: with no passphrase set (the first install), each harness found asks its own yes,
-    // as in 1.1.1, and no passphrase is asked before them.
+    // F112-AC2 as F2 settles it (2026-11-09: the console's rule replaces the 1.1.2
+    // first-install yes; spec section 17, "a typed `yes` confirms nothing"): with no passphrase set
+    // (the first install), each harness found is confirmed on its own through the root program's
+    // prompt, no typed yes is asked, no passphrase is asked before them, and a refused root prompt
+    // installs nothing.
     #[test]
-    fn f112_ac2_the_first_install_asks_each_harness_its_own_yes() {
+    fn f112_ac2_the_first_install_confirms_each_harness_through_the_root_prompt() {
         let s = four_found();
-        let mut user = NewUser::new(&["yes\n", "no\n", "no\n", "no\n", "2\n"], &[FIRST, FIRST]);
+        let mut user = NewUser::new(&["2\n"], &[FIRST, FIRST]);
         let out = install(&[], &s.env, &mut user);
         assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
         assert!(
@@ -2493,21 +2887,28 @@ mod tests {
         for (i, name) in FOUR.iter().enumerate() {
             let question = &user.asked[i];
             assert!(
-                question.contains(&format!("add Lunchroom to {name}?"))
-                    && question.ends_with("No passphrase is set yet. Type yes: "),
+                question.contains(&format!("add Lunchroom to {name}?")),
                 "{question}"
             );
+            assert!(!question.contains("Type yes"), "{question}");
+            assert!(
+                out.stdout.contains(&format!("{name}: installed")),
+                "{}",
+                out.stdout
+            );
         }
-        assert!(
-            out.stdout.contains("Claude Code: installed"),
-            "{}",
-            out.stdout
+        assert!(user.prompts.iter().all(|p| !p.ends_with("Passphrase: ")));
+        // The root prompt refused: nothing is installed.
+        let t = four_found();
+        let mut refused = NewUser::new(&["2\n"], &[FIRST, FIRST]);
+        refused.root = Err("the root program's prompt was refused".to_owned());
+        let out = install(&[], &t.env, &mut refused);
+        assert_eq!(out.code, 3, "{}{}", out.stdout, out.stderr);
+        assert_eq!(
+            lunchroom_commands(&t.settings(), "PreToolUse"),
+            Vec::<Value>::new()
         );
-        assert!(
-            out.stdout.contains("Codex: not installed"),
-            "{}",
-            out.stdout
-        );
+        assert!(!t.env.codex_home.join("hooks.json").exists());
     }
 
     // §13::4: uninstalling one harness does not tell the user to delete the shared
@@ -2562,6 +2963,36 @@ mod tests {
             last.stdout
         );
         assert!(!last.stdout.contains("still used by"), "{}", last.stdout);
+    }
+
+    // With the store wall the program and the messages are root's: the uninstall names them as
+    // root's and never tells the developer to delete a folder they cannot delete.
+    #[test]
+    fn uninstall_with_the_store_wall_names_root_s_program_and_store() {
+        let home = Path::new("/var/lib/lunchroom/1001");
+        let alone = what_stays(home, &[]);
+        assert!(!alone.contains("delete that folder"), "{alone}");
+        assert!(
+            alone.contains("/usr/local/lib/lunchroom/lunchroom"),
+            "{alone}"
+        );
+        assert!(alone.contains("/var/lib/lunchroom/1001"), "{alone}");
+        assert!(alone.contains("root's"), "{alone}");
+        assert!(alone.contains("lunchroom uninstall console"), "{alone}");
+        let shared = what_stays(home, &["Codex (/home/u/.codex/hooks.json)".to_owned()]);
+        assert!(shared.contains("still used by: Codex"), "{shared}");
+        assert!(!shared.contains("delete that folder"), "{shared}");
+        assert!(
+            shared.contains("/usr/local/lib/lunchroom/lunchroom"),
+            "{shared}"
+        );
+        // Without the wall the folder is the developer's own, and the advice stays as it was.
+        let own = what_stays(Path::new("/home/u/.lunchroom"), &[]);
+        assert!(
+            own.contains("stay in /home/u/.lunchroom: delete that folder"),
+            "{own}"
+        );
+        assert!(!own.contains("root's"), "{own}");
     }
 
     // §13::4: `lunchroom install` with no harness named offers each supported harness
@@ -2685,6 +3116,11 @@ mod tests {
         }
     }
 
+    /// The tool-call hook's command as an install of `program` writes it into `file` (H1.5).
+    fn pretool_for(program: &Path, file: &Path) -> String {
+        pretool_command(&shell_word(&program.display().to_string()), file)
+    }
+
     fn lunchroom_commands(settings: &Value, event: &str) -> Vec<Value> {
         settings["hooks"][event]
             .as_array()
@@ -2763,9 +3199,10 @@ mod tests {
         assert_eq!(pre.len(), 2, "{hooks}");
         assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/my-hook");
         let program = s.env.lunchroom_home.join("bin/lunchroom");
+        // H1.5: Codex's tool-call hook fails closed by its command; Codex has no `onFailure`.
         assert_eq!(
             pre[1]["hooks"][0]["command"],
-            format!("{} guard pretool", program.display())
+            pretool_for(&program, &codex.join("hooks.json"))
         );
         assert!(pre[1]["hooks"][0].get("onFailure").is_none());
         for (event, mode) in [
@@ -2795,7 +3232,9 @@ mod tests {
             fs::read_to_string(codex.join("config.toml"))
                 .ok()
                 .as_deref(),
-            Some("model = \"x\"\n\n[features]\nunified_exec_tty = false\n")
+            Some(
+                "model = \"x\"\nweb_search = \"disabled\"\n\n[features]\nunified_exec_tty = false\n"
+            )
         );
         let backups = fs::read_dir(&codex)
             .into_iter()
@@ -2818,9 +3257,21 @@ mod tests {
         let _ = fs::create_dir_all(&s.env.codex_home);
         let config = s.env.codex_home.join("config.toml");
         let said = |target| terminals_line(target, &config).unwrap_or_default();
+        // §13::63: the question names the tty setting and `web_search`, each only when it is
+        // written, before the yes.
         assert!(said(Target::Codex).contains(CODEX_TTY));
+        assert!(said(Target::Codex).contains("web_search = \"disabled\""));
         assert_eq!(said(Target::ClaudeCode), "");
         let _ = fs::write(&config, "[features]\nunified_exec_tty = false\n");
+        assert!(!said(Target::Codex).contains(CODEX_TTY));
+        assert!(said(Target::Codex).contains("web_search = \"disabled\""));
+        let _ = fs::write(&config, "web_search = \"disabled\"\n");
+        assert!(said(Target::Codex).contains(CODEX_TTY));
+        assert!(!said(Target::Codex).contains("web_search"));
+        let _ = fs::write(
+            &config,
+            "web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n",
+        );
         assert_eq!(said(Target::Codex), "");
         let turned_on = "[features]\nunified_exec_tty = true\n";
         let mut user = EditsWhileAsking {
@@ -3077,13 +3528,24 @@ mod tests {
         ] {
             let hooks = lunchroom_commands(&settings, event);
             assert_eq!(hooks.len(), 1, "{event}");
-            assert!(
-                hooks[0]["command"]
-                    .as_str()
-                    .is_some_and(|c| c.ends_with(&format!(" guard {mode}")))
-            );
-            // H1.5: no option turns a guard failure into a block.
-            assert!(hooks[0].get("onFailure").is_none(), "{event}");
+            let program = s.env.lunchroom_home.join("bin/lunchroom");
+            if event == "PreToolUse" {
+                // §13::100, §13::103: `<program> guard pretool || exit 2` with its line on
+                // standard error, and `"onFailure": "block"`.
+                assert_eq!(
+                    hooks[0]["command"],
+                    pretool_for(&program, &s.env.claude_home.join("settings.json"))
+                );
+                assert_eq!(hooks[0]["onFailure"], "block");
+            } else {
+                // §13::104-106: no other hook has `|| exit 2` or `onFailure`.
+                assert!(
+                    hooks[0]["command"].as_str().is_some_and(|c| c
+                        .ends_with(&format!(" guard {mode}"))
+                        && !c.contains("||"))
+                );
+                assert!(hooks[0].get("onFailure").is_none(), "{event}");
+            }
         }
         // The session-start line answers at once; the listener waits in the background.
         let start = lunchroom_commands(&settings, "SessionStart");
@@ -3203,9 +3665,14 @@ mod tests {
                 "PreToolUse": [{"hooks": [{"type": "command", "command": format!("{p} guard pretool")}]}]
             }),
         );
-        let reconciled =
-            with_lunchroom_hooks(earlier, program, Path::new("/home/u"), Target::ClaudeCode)
-                .map_or(Value::Null, Value::Object);
+        let reconciled = with_lunchroom_hooks(
+            earlier,
+            program,
+            Path::new("/home/u"),
+            Target::ClaudeCode,
+            Path::new("/home/u/.claude/settings.json"),
+        )
+        .map_or(Value::Null, Value::Object);
         // A bare program path is a hook Lunchroom never writes: the user's, and it stays.
         assert_eq!(
             reconciled["hooks"]["Notification"].as_array().map(Vec::len),
@@ -3225,7 +3692,11 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(pre.len(), 1);
-        assert!(pre[0]["hooks"][0].get("onFailure").is_none());
+        assert_eq!(pre[0]["hooks"][0]["onFailure"], "block");
+        assert_eq!(
+            pre[0]["hooks"][0]["command"],
+            pretool_for(program, Path::new("/home/u/.claude/settings.json"))
+        );
     }
 
     // §13::4: in a group shared with the user's hooks only Lunchroom's hook goes; a hook that runs
@@ -3254,8 +3725,14 @@ mod tests {
                 "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/my-stop"}]}]
             }),
         );
-        let reconciled = with_lunchroom_hooks(earlier, &program, &s.env.home, Target::Codex)
-            .map_or(Value::Null, Value::Object);
+        let reconciled = with_lunchroom_hooks(
+            earlier,
+            &program,
+            &s.env.home,
+            Target::Codex,
+            &s.env.codex_home.join("hooks.json"),
+        )
+        .map_or(Value::Null, Value::Object);
         let commands = |event: &str| -> Vec<Vec<String>> {
             reconciled["hooks"][event]
                 .as_array()
@@ -3278,7 +3755,10 @@ mod tests {
                 vec![format!("{p} guard prompt").as_str()]
             ]
         );
-        assert_eq!(commands("PreToolUse"), [[format!("{p} guard pretool")]]);
+        assert_eq!(
+            commands("PreToolUse"),
+            [[pretool_for(&program, &s.env.codex_home.join("hooks.json"))]]
+        );
         assert_eq!(
             commands("Stop"),
             [
@@ -3289,8 +3769,14 @@ mod tests {
         // An empty group of the user's own stays as it was.
         let mut empty = Map::new();
         empty.insert("hooks".to_owned(), json!({"Notification": [{"hooks": []}]}));
-        let kept = with_lunchroom_hooks(empty, &program, &s.env.home, Target::Codex)
-            .map_or(Value::Null, Value::Object);
+        let kept = with_lunchroom_hooks(
+            empty,
+            &program,
+            &s.env.home,
+            Target::Codex,
+            &s.env.codex_home.join("hooks.json"),
+        )
+        .map_or(Value::Null, Value::Object);
         assert_eq!(kept["hooks"]["Notification"], json!([{"hooks": []}]));
     }
 
@@ -3343,7 +3829,8 @@ mod tests {
             "{question}"
         );
         assert!(question.contains("The hooks it adds:\n{"), "{question}");
-        assert!(!question.contains("onFailure"), "{question}");
+        // §13::103, §13::104: `onFailure` is on the tool-call hook only.
+        assert_eq!(question.matches("onFailure").count(), 1, "{question}");
         // Every hook written is shown under its event, both of SessionStart's among them.
         let shown_hooks = question
             .split_once("The hooks it adds:\n")
@@ -3353,6 +3840,7 @@ mod tests {
         let written = lunchroom_hooks(
             &shown.env.lunchroom_home.join("bin/lunchroom"),
             Target::ClaudeCode,
+            &shown.env.claude_home.join("settings.json"),
         );
         for (event, group) in &written {
             let groups = shown_hooks[*event].as_array().cloned().unwrap_or_default();
@@ -3564,7 +4052,7 @@ mod tests {
         let settings = s.settings();
         assert_eq!(
             settings["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
-            format!("{quoted} guard pretool")
+            pretool_command(&quoted, &s.env.claude_home.join("settings.json"))
         );
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"][0]["command"],
@@ -3588,6 +4076,167 @@ mod tests {
         }
     }
 
+    /// Every name a folder or a file can have that a shell would treat as more than text.
+    const SHELL_NAMES: [&str; 14] = [
+        "a b",
+        "a$(touch S)b",
+        "a`touch S`b",
+        "a;touch S;b",
+        "a\\b",
+        "a\tb",
+        "a\rb",
+        "a\"b",
+        "a$HOMEb",
+        "a%sb",
+        "a&b|c>S",
+        "*",
+        "-n",
+        "u\u{fc}\u{20ac}\u{202e}x",
+    ];
+
+    //H1.5 (shell injection): the hook commands the install writes, run through a real
+    // `sh -c`, execute no byte of a folder name or a configuration file's name. For every name above
+    // as the guard program's folder and as the configuration file's folder, and for a file name that
+    // holds a quote or a line break as well: the stand-in guard program runs (so the program word
+    // was one word), no command named inside a path ran (the sentinel file `S` does not exist), and
+    // the tool-call hook's failure line, when the guard fails, is the fixed words around the path
+    // printed as data, byte for byte.
+    #[test]
+    fn a_hook_command_runs_no_byte_of_a_path_and_prints_the_path_as_data() {
+        let s = Scratch::new();
+        let work = s.root.join("work");
+        assert!(fs::create_dir_all(&work).is_ok());
+        let run_in_work = |command: &str| {
+            let out = std::process::Command::new("sh")
+                .args(["-c", command])
+                .current_dir(&work)
+                .stdin(std::process::Stdio::null())
+                .output();
+            out.map_or((-1, String::new()), |o| {
+                (
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            })
+        };
+        let mut cases: Vec<(String, String)> = SHELL_NAMES
+            .iter()
+            .map(|n| ((*n).to_owned(), "settings.json".to_owned()))
+            .collect();
+        for file_name in [
+            "it's.json",
+            "a\nb.json",
+            "'; touch S; '.json",
+            "\"; touch S; \".json",
+            "a\r\tb.json",
+        ] {
+            cases.push(("plain".to_owned(), file_name.to_owned()));
+        }
+        for target in [Target::ClaudeCode, Target::Codex] {
+            for (n, (program_dir, file_name)) in cases.iter().enumerate() {
+                let sub = format!("{n}-{target:?}");
+                let stand = stand_in(
+                    &s.root.join(&sub).join(program_dir),
+                    "echo ran >> \"$0.ran\"\nexit 1",
+                );
+                let file = s.root.join(&sub).join("conf dir").join(file_name);
+                let hooks = lunchroom_hooks(&stand, target, &file);
+                assert!(hooks.len() >= 6, "{target:?}");
+                for (event, group) in hooks {
+                    let command = group["hooks"][0]["command"].as_str().unwrap_or_default();
+                    let ran = PathBuf::from(format!("{}.ran", stand.display()));
+                    let _ = fs::remove_file(&ran);
+                    let (code, stderr) = run_in_work(command);
+                    assert!(
+                        ran.exists(),
+                        "{event}, {program_dir:?}: the guard program did not run as one word"
+                    );
+                    assert!(
+                        !work.join("S").exists(),
+                        "{event}, {program_dir:?}, {file_name:?}: a command in a name ran"
+                    );
+                    if event == "PreToolUse" {
+                        assert_eq!(code, 2, "{program_dir:?}, {file_name:?}");
+                        assert_eq!(
+                            stderr,
+                            format!("{FAILED_LINE_HEAD}{}{FAILED_LINE_TAIL}\n", file.display()),
+                            "{program_dir:?}, {file_name:?}"
+                        );
+                    } else {
+                        assert_eq!(code, 1, "{event}, {program_dir:?}");
+                        assert!(stderr.is_empty(), "{event}: {stderr}");
+                    }
+                }
+            }
+        }
+    }
+
+    //H1.5: a program path that cannot be quoted into one shell word (a single quote,
+    // a line break, bytes that are not text) is refused for Claude Code and for Codex with the
+    // reason stated, and nothing is written or changed; a path that only holds shell characters
+    // (the names above) is installed, and evidence reads that install as the guard in place.
+    #[test]
+    fn an_unquotable_program_path_is_refused_with_its_reason_for_both_targets() {
+        use std::os::unix::ffi::OsStrExt as _;
+        for target in ["claude-code", "codex"] {
+            let bad: Vec<std::ffi::OsString> = vec![
+                "it's".into(),
+                "two\nlines".into(),
+                "'; touch S; '".into(),
+                std::ffi::OsStr::from_bytes(b"bytes\xff").to_owned(),
+            ];
+            for name in bad {
+                let mut s = Scratch::new();
+                move_home(&mut s, "plain");
+                let home = s.root.join(&name);
+                let _ = fs::create_dir_all(home.join(".claude"));
+                let _ = fs::write(home.join(".claude/settings.json"), OLD_SETTINGS);
+                s.env.lunchroom_home = home.join(".lunchroom");
+                let out = install(&[target.to_owned()], &s.env, &mut UserAt("yes\n"));
+                assert_eq!(out.code, 2, "{target}, {name:?}");
+                assert!(
+                    out.stderr
+                        .contains("holds a quote, a line break or a byte that is not text"),
+                    "{target}, {name:?}: {}",
+                    out.stderr
+                );
+                assert!(out.stderr.contains("nothing was changed"), "{}", out.stderr);
+                assert!(!s.env.lunchroom_home.join("bin/lunchroom").exists());
+                assert!(!s.env.codex_home.join("hooks.json").exists());
+                assert_eq!(
+                    fs::read_to_string(home.join(".claude/settings.json"))
+                        .ok()
+                        .as_deref(),
+                    Some(OLD_SETTINGS)
+                );
+            }
+            // A name full of shell characters is quoted and installed: one guard in place.
+            for (i, name) in SHELL_NAMES.iter().enumerate() {
+                let mut s = Scratch::new();
+                move_home(&mut s, &format!("h{i}{name}"));
+                let out = install(&[target.to_owned()], &s.env, &mut UserAt("yes\n"));
+                assert_eq!(out.code, 0, "{target}, {name:?}: {}", out.stderr);
+                let file = if target == "codex" {
+                    s.env.codex_home.join("hooks.json")
+                } else {
+                    s.env.claude_home.join("settings.json")
+                };
+                let text = fs::read_to_string(&file).unwrap_or_default();
+                let settings: Value = serde_json::from_str(&text).unwrap_or_default();
+                let hook = settings["hooks"]["PreToolUse"].as_array().and_then(|g| {
+                    g.iter()
+                        .find_map(|g| {
+                            g["hooks"][0]["command"]
+                                .as_str()
+                                .filter(|c| c.contains("guard pretool"))
+                        })
+                        .map(|_| ())
+                });
+                assert!(hook.is_some(), "{target}, {name:?}");
+            }
+        }
+    }
+
     // §13::4: an earlier Lunchroom hook whose program is gone, by the default install location
     // (`~/` and `$HOME/` spelled out, quoted or not), is Lunchroom's and goes; a command with
     // another program or other arguments stays.
@@ -3603,9 +4252,14 @@ mod tests {
             "Stop": [{"hooks": [{"type": "command", "command": "$HOME/.lunchroom/bin/lunchroom listen --once"}]}],
             "SessionStart": [{"hooks": [{"type": "command", "command": "'/home/u/.lunchroom/bin/lunchroom' listen"}]}]
         }));
-        let reconciled =
-            with_lunchroom_hooks(earlier, program, Path::new("/home/u"), Target::ClaudeCode)
-                .map_or(Value::Null, Value::Object);
+        let reconciled = with_lunchroom_hooks(
+            earlier,
+            program,
+            Path::new("/home/u"),
+            Target::ClaudeCode,
+            Path::new("/home/u/.claude/settings.json"),
+        )
+        .map_or(Value::Null, Value::Object);
         let pre = &reconciled["hooks"]["PreToolUse"];
         assert_eq!(pre[0]["matcher"], "Bash");
         assert_eq!(pre[0]["hooks"].as_array().map(Vec::len), Some(2));
@@ -3616,7 +4270,7 @@ mod tests {
         assert_eq!(pre[0]["hooks"][1]["command"], "/gone/lunchroom guard other");
         assert_eq!(
             pre[1]["hooks"][0]["command"],
-            format!("{} guard pretool", program.display())
+            pretool_for(program, Path::new("/home/u/.claude/settings.json"))
         );
         for (event, commands) in [
             ("Stop", vec!["listen"]),
@@ -3634,6 +4288,42 @@ mod tests {
                     "{event}"
                 );
             }
+        }
+    }
+
+    // §17.2 (17::25): hooks written for the installed program all run the program at its
+    // new path, and none runs the earlier one.
+    #[cfg(feature = "console")]
+    #[test]
+    fn hooks_for_the_installed_program_run_it_at_its_new_path() {
+        let program = Path::new(lunchroom_core::setgid::PROGRAM);
+        let earlier = settings_of(&json!({
+            "PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "/home/u/.lunchroom/bin/lunchroom guard pretool", "timeout": 15}
+            ]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "/home/u/.lunchroom/bin/lunchroom listen --once"}]}]
+        }));
+        let file = Path::new("/home/u/.claude/settings.json");
+        let new = with_lunchroom_hooks(
+            earlier,
+            program,
+            Path::new("/home/u"),
+            Target::ClaudeCode,
+            file,
+        )
+        .map_or(Value::Null, Value::Object);
+        let mut commands = Vec::new();
+        for (_, groups) in new["hooks"].as_object().into_iter().flatten() {
+            for group in groups.as_array().into_iter().flatten() {
+                for hook in group["hooks"].as_array().into_iter().flatten() {
+                    commands.push(hook["command"].as_str().unwrap_or_default().to_owned());
+                }
+            }
+        }
+        assert!(commands.len() >= 4, "{commands:?}");
+        for c in &commands {
+            assert!(c.contains(lunchroom_core::setgid::PROGRAM), "{c}");
+            assert!(!c.contains("/home/u/.lunchroom/bin/lunchroom"), "{c}");
         }
     }
 
@@ -3657,9 +4347,14 @@ mod tests {
                 {"matcher": "Write", "hooks": [{"type": "command", "command": "/u/b.sh"}]}
             ]
         }));
-        let reconciled =
-            with_lunchroom_hooks(earlier, program, Path::new("/home/u"), Target::Codex)
-                .map_or(Value::Null, Value::Object);
+        let reconciled = with_lunchroom_hooks(
+            earlier,
+            program,
+            Path::new("/home/u"),
+            Target::Codex,
+            Path::new("/home/u/.codex/hooks.json"),
+        )
+        .map_or(Value::Null, Value::Object);
         let commands = |event: &str| -> Vec<String> {
             reconciled["hooks"][event]
                 .as_array()
@@ -3686,7 +4381,7 @@ mod tests {
             commands("PreToolUse"),
             [
                 "/u/a.sh".to_owned(),
-                format!("{p} guard pretool"),
+                pretool_command(&p.to_string(), Path::new("/home/u/.codex/hooks.json")),
                 "/u/b.sh".to_owned()
             ]
         );
@@ -3729,6 +4424,747 @@ mod tests {
         }
         fn install_verifier(&mut self, _line: &str) -> Result<(), String> {
             Ok(())
+        }
+    }
+
+    // §13::62, §13::63, §13::64, §4::43, §4::44 (H1.4): `lunchroom install codex` sets
+    // `web_search = "disabled"` at the top level of `config.toml` (whatever the user had there: no
+    // file, no setting, `live`, `cached`, a value after a table or in a profile), names the setting
+    // in the question before the yes, and keeps the earlier file as a backup; the user's other
+    // lines and profile values stay.
+    #[test]
+    fn codex_install_sets_web_search_disabled_at_the_top_and_keeps_a_backup() {
+        for (name, old) in [
+            ("no file", None),
+            ("unset", Some("model = \"x\"\n[features]\nhooks = true\n")),
+            (
+                "live",
+                Some("web_search = \"live\" # mine\nmodel = \"x\"\n"),
+            ),
+            (
+                "cached",
+                Some("web_search = \"cached\"\n[features]\nunified_exec_tty = true\n"),
+            ),
+            (
+                "a table first",
+                Some("[features]\nhooks = true\n[profiles.p]\nweb_search = \"live\"\n"),
+            ),
+            ("dotted", Some("features.hooks = true\n")),
+            ("quoted key", Some("\"web_search\" = \"indexed\"\n")),
+            ("other type", Some("web_search = true\n")),
+        ] {
+            let s = Scratch::new();
+            let _ = fs::create_dir_all(&s.env.codex_home);
+            let config = s.env.codex_home.join("config.toml");
+            if let Some(old) = old {
+                assert!(fs::write(&config, old).is_ok(), "{name}");
+            }
+            let mut user = Answers {
+                answers: vec!["yes\n"],
+                asked: Vec::new(),
+            };
+            let out = install(&["codex".to_owned()], &s.env, &mut user);
+            assert_eq!(out.code, 0, "{name}: {}{}", out.stdout, out.stderr);
+            // §13::63: the question names the change.
+            let question = user.asked.first().cloned().unwrap_or_default();
+            assert!(
+                question.contains("sets web_search = \"disabled\" at the top of"),
+                "{name}: {question}"
+            );
+            // §13::62: top level, before any table, as a string.
+            let new = fs::read_to_string(&config).unwrap_or_default();
+            let document = new.parse::<toml_edit::DocumentMut>();
+            assert!(document.is_ok(), "{name}: {new}");
+            let document = document.unwrap_or_default();
+            assert_eq!(
+                document["web_search"].as_str(),
+                Some("disabled"),
+                "{name}: {new}"
+            );
+            let first_table = new.find("\n[").unwrap_or(new.len());
+            assert!(
+                new.find("web_search = \"disabled\"")
+                    .is_some_and(|at| at <= first_table),
+                "{name}: {new}"
+            );
+            assert!(crate::evidence::codex_web_is_off(&new), "{name}");
+            assert_eq!(codex_tty_setting(&new), Some(false), "{name}");
+            // §13::64: the earlier file is kept.
+            let backups: Vec<_> = fs::read_dir(&s.env.codex_home)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("config.toml.lunchroom-backup-")
+                })
+                .collect();
+            match old {
+                Some(old) => {
+                    assert_eq!(backups.len(), 1, "{name}");
+                    let kept = fs::read_to_string(backups[0].path()).unwrap_or_default();
+                    assert_eq!(kept, old, "{name}");
+                }
+                None => assert!(backups.is_empty(), "{name}"),
+            }
+            // The user's other lines stay.
+            for line in ["model = \"x\"", "hooks = true", "[profiles.p]"] {
+                if old.is_some_and(|o| o.contains(line)) {
+                    assert!(new.contains(line), "{name}: {new}");
+                }
+            }
+        }
+    }
+
+    // §13::64, §4::44, §13::4 (an install over an older install): a second install
+    // changes neither setting again and keeps the first backup as it was; an older install's hooks
+    // (`guard pretool` alone) are replaced by the new tool-call hook, not added to it; and the
+    // question of the second install names neither setting.
+    #[test]
+    fn an_install_over_an_older_install_keeps_the_backup_and_replaces_the_old_hook() {
+        let s = Scratch::new();
+        let codex = s.env.codex_home.clone();
+        let _ = fs::create_dir_all(&codex);
+        let program = s.env.lunchroom_home.join("bin/lunchroom");
+        let p = program.display();
+        let older = json!({"hooks": {
+            "PreToolUse": [{"hooks": [{"type": "command", "command": format!("{p} guard pretool"), "timeout": 15}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": format!("{p} guard prompt"), "timeout": 15}]}]
+        }})
+        .to_string();
+        let _ = fs::write(codex.join("hooks.json"), &older);
+        let _ = fs::write(codex.join("config.toml"), "model = \"x\"\n");
+        let out = install(&["codex".to_owned()], &s.env, &mut UserAt("yes\n"));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let backups = |prefix: &str| -> Vec<(PathBuf, String)> {
+            fs::read_dir(&codex)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+                .map(|e| (e.path(), fs::read_to_string(e.path()).unwrap_or_default()))
+                .collect()
+        };
+        let config_backups = backups("config.toml.lunchroom-backup-");
+        assert_eq!(config_backups.len(), 1);
+        assert_eq!(config_backups[0].1, "model = \"x\"\n");
+        let hook_backups = backups("hooks.json.lunchroom-backup-");
+        assert_eq!(hook_backups.len(), 1);
+        assert_eq!(hook_backups[0].1, older);
+        let hooks: Value = fs::read_to_string(codex.join("hooks.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(Value::Null);
+        // The older install's tool-call hook is replaced, in its place, not added to.
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            pretool_for(&program, &codex.join("hooks.json"))
+        );
+        // Spelled out, so an install that writes the old form cannot pass by agreeing with itself.
+        let written = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            written.starts_with(&format!("{p} guard pretool || {{ [ $? -eq 2 ] || printf "))
+                && written.contains("lunchroom doctor")
+                && written.ends_with("' >&2; exit 2; }"),
+            "{written}"
+        );
+        assert!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]
+                .get("onFailure")
+                .is_none()
+        );
+        // A second install, on the same files.
+        let after_first = fs::read_to_string(codex.join("config.toml")).unwrap_or_default();
+        let mut user = Answers {
+            answers: vec!["yes\n"],
+            asked: Vec::new(),
+        };
+        let out = install(&["codex".to_owned()], &s.env, &mut user);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let question = user.asked.first().cloned().unwrap_or_default();
+        assert!(!question.contains("web_search"), "{question}");
+        assert!(!question.contains(CODEX_TTY), "{question}");
+        assert_eq!(
+            fs::read_to_string(codex.join("config.toml")).unwrap_or_default(),
+            after_first
+        );
+        assert_eq!(backups("config.toml.lunchroom-backup-"), config_backups);
+        let again: Value = fs::read_to_string(codex.join("hooks.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(Value::Null);
+        assert_eq!(again, hooks);
+        // `lunchroom uninstall` removes the new form of the hook, and only Lunchroom's hooks.
+        let out = uninstall(&["codex".to_owned()], &s.env, &mut UserAt("yes\n"));
+        assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+        let left = fs::read_to_string(codex.join("hooks.json")).unwrap_or_default();
+        assert!(!left.contains("guard pretool"), "{left}");
+        assert!(!left.contains("guard prompt"), "{left}");
+    }
+
+    // §13::100, §13::103 (H1.5), Fable M11: an install over a 1.0.1 install (`<program>
+    // guard pretool`, commit 276b58f install.rs line 346), replaces the tool-call hook with the fail-closed form (and, in Claude Code,
+    // `onFailure: block`) in the place the old one stood, keeps the user's hooks and a backup, and
+    // leaves one Lunchroom tool-call hook; the old forms are Lunchroom's, so uninstall removes them.
+    // This test fails when the install leaves a 1.0.x `guard pretool` in place, drops `onFailure: block`, writes the old form, or skips the backup: each of those
+    // mutations was made and caught. The code
+    // before the M11 fix already replaced the old forms; the fix for what evidence accepts is
+    // proved in evidence.rs by `claude_hooks_of_the_old_form_are_not_the_guard_and_name_the_reinstall`
+    // and `a_codex_tool_call_hook_of_the_old_form_is_unguarded_and_names_the_reinstall`.
+    #[test]
+    fn an_install_over_old_form_tool_call_hooks_writes_the_fail_closed_form() {
+        // The old form alone, with Windows line endings, and two Lunchroom tool-call hooks.
+        for old in [
+            &["guard pretool"][..],
+            &["guard pretool\r\n"],
+            &["guard pretool", "guard pretool\r\n"],
+        ] {
+            let s = Scratch::new();
+            let program = s.env.lunchroom_home.join("bin/lunchroom");
+            let p = program.display();
+            let settings = s.env.claude_home.join("settings.json");
+            let mut groups = vec![
+                json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "/u/a.sh"}]}),
+            ];
+            for suffix in old {
+                groups.push(json!({"hooks": [{"type": "command", "command": format!("{p} {suffix}"), "timeout": 15}]}));
+            }
+            let before = json!({"model": "opus", "hooks": {
+                "PreToolUse": groups,
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": format!("{p} guard prompt")}]}]
+            }})
+            .to_string();
+            assert!(fs::write(&settings, &before).is_ok());
+            let out = install(&["claude-code".to_owned()], &s.env, &mut UserAt("yes\n"));
+            assert_eq!(out.code, 0, "{old:?}:{}", out.stderr);
+            let after = s.settings();
+            let pre = after["hooks"]["PreToolUse"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(pre.len(), 2, "{old:?}:{after}");
+            assert_eq!(pre[0]["hooks"][0]["command"], "/u/a.sh");
+            assert_eq!(
+                pre[1]["hooks"][0]["command"],
+                pretool_for(&program, &settings),
+                "{old:?}"
+            );
+            // The command is spelled out, not only compared with what `pretool_command` returns,
+            // so a install that writes the old form cannot pass by agreeing with itself.
+            let written = pre[1]["hooks"][0]["command"].as_str().unwrap_or_default();
+            assert!(
+                written.starts_with(&format!("{p} guard pretool || {{ [ $? -eq 2 ] || printf "))
+                    && written.contains("lunchroom doctor")
+                    && written.ends_with("' >&2; exit 2; }"),
+                "{old:?}: {written}"
+            );
+            assert_eq!(pre[1]["hooks"][0]["onFailure"], "block", "{old:?}");
+            assert_eq!(lunchroom_commands(&after, "PreToolUse").len(), 1, "{old:?}");
+            let backup = fs::read_dir(&s.env.claude_home)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .find(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("settings.json.lunchroom-backup-")
+                })
+                .and_then(|e| fs::read_to_string(e.path()).ok());
+            assert_eq!(backup.as_deref(), Some(before.as_str()), "{old:?}");
+        }
+        // The old forms are Lunchroom's: uninstall removes them, and keeps the user's hook.
+        let s = Scratch::new();
+        let program = s.env.lunchroom_home.join("bin/lunchroom");
+        let older = json!({"hooks": {"PreToolUse": [
+            {"hooks": [{"type": "command", "command": "/u/a.sh"}]},
+            {"hooks": [{"type": "command", "command": format!("{} guard pretool", program.display())}]}
+        ]}})
+        .to_string();
+        assert!(fs::write(s.env.claude_home.join("settings.json"), older).is_ok());
+        let out = uninstall(&["claude-code".to_owned()], &s.env, &mut UserAt("yes\n"));
+        assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+        let left = s.settings();
+        assert_eq!(
+            left["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            left["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "/u/a.sh"
+        );
+    }
+
+    /// Runs a hook's `command` as Claude Code and Codex run it, through `sh -c`, with `input` on
+    /// its standard input: its exit code, standard output and standard error.
+    fn run_hook(command: &str, input: &str) -> (i32, String, String) {
+        use std::io::Write as _;
+        let child = std::process::Command::new("sh")
+            .args(["-c", command])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else {
+            return (-1, String::new(), "sh did not start".to_owned());
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        match child.wait_with_output() {
+            Ok(out) => (
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ),
+            Err(e) => (-1, String::new(), e.to_string()),
+        }
+    }
+
+    /// Whether `target`'s harness blocks the tool call a hook of exit code `code` and standard
+    /// error `stderr` answered. Claude Code: exit 2 blocks (`docs/host-facts/claude-code.md`).
+    /// Codex 0.163.0: exit 2 blocks only with a reason on standard error (`pre_tool_use.rs` lines
+    /// 261-276); any other failure lets the call run.
+    fn harness_blocks(target: Target, code: i32, stderr: &str) -> bool {
+        match target {
+            Target::ClaudeCode => code == 2,
+            Target::Codex => code == 2 && !stderr.trim().is_empty(),
+        }
+    }
+
+    /// A stand-in guard program in `dir` named `lunchroom` with `body` as its shell script.
+    fn stand_in(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::create_dir_all(dir);
+        let path = dir.join("lunchroom");
+        let _ = fs::remove_file(&path);
+        assert!(fs::write(&path, format!("#!/bin/sh\n{body}\n")).is_ok());
+        assert!(fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).is_ok());
+        path
+    }
+
+    // §13::99, §13::100, §13::101, §13::102, §4::37 (H1.5): the tool-call hook of
+    // Claude Code and of Codex, run as the harness runs it, blocks the call when the guard program
+    // is missing, is killed by the system (SIGKILL, and SIGTERM) during the call, exits with an
+    // error of its own, or is not executable; the line on standard error says that the guard failed
+    // and the call was blocked, and names `lunchroom doctor`, reinstalling, the configuration file
+    // and `lunchroom uninstall`. A guard that answers is not touched: its own exit 2 keeps its own
+    // reason (no failure line), and its answer on standard output passes with exit 0.
+    #[test]
+    fn the_tool_call_hook_blocks_the_call_when_the_guard_fails() {
+        let s = Scratch::new();
+        for (target, file) in [
+            (Target::ClaudeCode, s.env.claude_home.join("settings.json")),
+            (Target::Codex, s.env.codex_home.join("hooks.json")),
+        ] {
+            let program = s.env.lunchroom_home.join("bin/lunchroom");
+            let template = lunchroom_hooks(&program, target, &file)
+                .into_iter()
+                .find(|(event, _)| *event == "PreToolUse")
+                .and_then(|(_, hook)| hook["hooks"][0]["command"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            // The same command with the stand-in in folder `dir` as the guard program.
+            let at = |dir: &str| {
+                let stand = s.root.join(dir).join("lunchroom");
+                template.replace(&program_word(&program), &program_word(&stand))
+            };
+            assert!(template.starts_with(&program_word(&program)));
+            for (what, body) in [
+                ("killed with SIGKILL", Some("kill -9 $$")),
+                ("stopped with SIGTERM", Some("kill -15 $$")),
+                ("an error of its own", Some("echo oops >&2; exit 1")),
+                ("a fault exit 101", Some("exit 101")),
+                ("missing", None),
+            ] {
+                let dir = format!("guard-{}", what.replace(' ', "-"));
+                if let Some(body) = body {
+                    stand_in(&s.root.join(&dir), body);
+                }
+                let (code, stdout, stderr) = run_hook(&at(&dir), "{}");
+                assert_eq!(code, 2, "{target:?} {what}: {stderr}");
+                assert!(stdout.is_empty(), "{target:?} {what}: {stdout}");
+                assert!(
+                    harness_blocks(target, code, &stderr),
+                    "{target:?} {what}: {stderr}"
+                );
+                for named in [
+                    "the guard failed",
+                    "tool call was blocked",
+                    "lunchroom doctor",
+                    "reinstall Lunchroom",
+                    "lunchroom uninstall",
+                    &file.display().to_string(),
+                ] {
+                    assert!(
+                        stderr.contains(named),
+                        "{target:?} {what}: {named}: {stderr}"
+                    );
+                }
+                // The line is the last of standard error, before the exit.
+                assert!(
+                    stderr.trim_end().ends_with("lunchroom uninstall."),
+                    "{target:?} {what}: {stderr}"
+                );
+            }
+            // Not executable.
+            let dir = s.root.join("guard-not-executable");
+            let path = stand_in(&dir, "exit 0");
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+            }
+            let (code, _, stderr) = run_hook(&at("guard-not-executable"), "{}");
+            assert_eq!(
+                (code, harness_blocks(target, code, &stderr)),
+                (2, true),
+                "{stderr}"
+            );
+            // A guard that answers: its own block keeps its reason, its allow passes.
+            stand_in(
+                &s.root.join("guard-blocks"),
+                "echo 'DENIED: no' >&2; exit 2",
+            );
+            let (code, stdout, stderr) = run_hook(&at("guard-blocks"), "{}");
+            assert_eq!(
+                (code, stdout.as_str(), stderr.as_str()),
+                (2, "", "DENIED: no\n")
+            );
+            assert!(harness_blocks(target, code, &stderr));
+            stand_in(
+                &s.root.join("guard-allows"),
+                "cat >/dev/null; echo '{\"ok\":1}'",
+            );
+            let (code, stdout, stderr) = run_hook(&at("guard-allows"), "{}");
+            assert_eq!(
+                (code, stdout.as_str(), stderr.as_str()),
+                (0, "{\"ok\":1}\n", "")
+            );
+        }
+    }
+
+    /// `program` as the program word of a hook command written by this install.
+    fn program_word(program: &Path) -> String {
+        shell_word(&program.display().to_string())
+    }
+
+    // §13::101, §13::102: a configuration file whose name holds a single quote, a space
+    // or a `%` still gives one line, naming the file, and the command is one valid shell command.
+    #[test]
+    fn the_failure_line_names_a_file_with_a_quote_in_its_name() {
+        let dir = Path::new("/tmp/it's a %s dir");
+        let file = dir.join("settings.json");
+        let command = pretool_command("/nonexistent/lunchroom", &file);
+        let (code, stdout, stderr) = run_hook(&command, "");
+        assert_eq!(code, 2, "{stderr}");
+        assert_eq!(stdout, "");
+        assert!(stderr.contains(&file.display().to_string()), "{stderr}");
+        // One line of ours, after what the shell said of the missing program.
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|l| l.starts_with("Lunchroom: "))
+                .count(),
+            1,
+            "{stderr}"
+        );
+        // And it is read back as Lunchroom's: the hook the install replaces and `uninstall` removes.
+        assert!(is_hook_arguments(program_and_args(&command).1));
+    }
+
+    // §13::83, §13::97, §13::98, §13::105, §13::106, §13::104: the prompt hook has no
+    // `|| exit 2` and no `onFailure`, so a guard that fails there (program missing, killed) answers
+    // with an exit code Claude Code and Codex do not read as a block (not 2): the user's typing
+    // reaches the agent; a guard that itself blocks a prompt carrying another agent's text (T1)
+    // exits 2 with its reason, which both harnesses honour. Claude Code's `onFailure` is on the
+    // tool-call hook only, and Codex's hooks carry none.
+    #[test]
+    fn the_prompt_hook_never_blocks_the_users_typing() {
+        let s = Scratch::new();
+        for (target, file) in [
+            (Target::ClaudeCode, s.env.claude_home.join("settings.json")),
+            (Target::Codex, s.env.codex_home.join("hooks.json")),
+        ] {
+            let hooks = lunchroom_hooks(&s.env.lunchroom_home.join("bin/lunchroom"), target, &file);
+            let with_on_failure: Vec<&str> = hooks
+                .iter()
+                .filter(|(_, group)| group["hooks"][0].get("onFailure").is_some())
+                .map(|(event, _)| *event)
+                .collect();
+            let with_exit: Vec<&str> = hooks
+                .iter()
+                .filter(|(_, group)| {
+                    group["hooks"][0]["command"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("exit 2"))
+                })
+                .map(|(event, _)| *event)
+                .collect();
+            assert_eq!(with_exit, ["PreToolUse"], "{target:?}");
+            match target {
+                Target::ClaudeCode => assert_eq!(with_on_failure, ["PreToolUse"]),
+                Target::Codex => assert_eq!(with_on_failure, [] as [&str; 0]),
+            }
+            let prompt = hooks
+                .iter()
+                .find(|(event, _)| *event == "UserPromptSubmit")
+                .map(|(_, group)| {
+                    group["hooks"][0]["command"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .unwrap_or_default();
+            let program = s.env.lunchroom_home.join("bin/lunchroom");
+            for (what, body) in [
+                ("missing", None),
+                ("killed", Some("kill -9 $$")),
+                ("an error", Some("exit 1")),
+            ] {
+                let dir = format!("prompt-{what}");
+                if let Some(body) = body {
+                    stand_in(&s.root.join(&dir), body);
+                }
+                let command = prompt.replace(
+                    &program_word(&program),
+                    &shell_word(&s.root.join(&dir).join("lunchroom").display().to_string()),
+                );
+                let (code, _, stderr) = run_hook(&command, "{}");
+                assert_ne!(code, 0, "{target:?} {what}");
+                assert_ne!(code, 2, "{target:?} {what}");
+                assert!(!harness_blocks(target, code, &stderr), "{target:?} {what}");
+            }
+            // The guard's own block of a prompt carrying another agent's text passes through.
+            stand_in(
+                &s.root.join("prompt-blocks"),
+                "echo 'another agent wrote this' >&2; exit 2",
+            );
+            let command = prompt.replace(
+                &program_word(&program),
+                &shell_word(&s.root.join("prompt-blocks/lunchroom").display().to_string()),
+            );
+            let (code, _, stderr) = run_hook(&command, "{}");
+            assert!(harness_blocks(target, code, &stderr), "{target:?}");
+            assert_eq!(stderr, "another agent wrote this\n");
+        }
+    }
+
+    // §13::4 (R3.1): which commands are Lunchroom's hooks. The install writes, reads
+    // back, replaces and removes the failure branch of H1.5 exactly as it writes it; an earlier
+    // `guard pretool` is still Lunchroom's (the 1.0.1 installer wrote it); a bare `|| exit 2`, a
+    // user's own `guard pretool || <something else>`, a hook that runs the guard through another program, and a line with a
+    // quote that ends the word early are not.
+    #[test]
+    fn only_the_exact_failure_branch_is_lunchroom_s_tool_call_hook() {
+        let program = Path::new("/home/u/.lunchroom/bin/lunchroom");
+        let home = Path::new("/home/u");
+        let file = Path::new("/home/u/.claude/settings.json");
+        let written = pretool_command(&program.display().to_string(), file);
+        let hook = |c: &str| json!({"type": "command", "command": c});
+        for ours in [
+            written.clone(),
+            format!("{} guard pretool", program.display()),
+            pretool_command(
+                &program.display().to_string(),
+                Path::new("/a b/it's/settings.json"),
+            ),
+        ] {
+            assert!(is_lunchroom_hook(&hook(&ours), program, home), "{ours}");
+        }
+        for theirs in [
+            format!("{} guard pretool || exit 2", program.display()),
+            format!("'{}' guard pretool || exit 2", program.display()),
+            format!("{} guard pretool || true", program.display()),
+            format!("{} guard pretool || exit 0", program.display()),
+            format!("{} guard pretool || exit 2; rm -rf /", program.display()),
+            format!(
+                "{} guard pretool || {{ [ $? -eq 2 ] || printf '%s\\n' 'x'; rm y; echo 'z' >&2; exit 2; }}",
+                program.display()
+            ),
+            format!("env FOO=1 {} guard pretool || exit 2", program.display()),
+            format!("timeout 5 {written}"),
+            "/usr/bin/other guard pretool || exit 2".to_owned(),
+            written.replace("exit 2; }", "exit 0; }"),
+            format!("{written} && other"),
+            // Fable's LOW: between the fixed head and tail, only the line the install writes.
+            // An empty line, no file name, a line that says something else, an extra command
+            // (inside the branch, before the exit, and after the line), a changed test or exit.
+            format!(
+                "{} guard pretool {FAILURE_HEAD}{FAILURE_TAIL}",
+                program.display()
+            ),
+            format!(
+                "{} guard pretool {FAILURE_HEAD}{FAILED_LINE_HEAD}{FAILED_LINE_TAIL}{FAILURE_TAIL}",
+                program.display()
+            ),
+            format!(
+                "{} guard pretool {FAILURE_HEAD}the guard is fine{FAILURE_TAIL}",
+                program.display()
+            ),
+            written.replace("' >&2; exit 2; }", "' >&2; rm -rf x; exit 2; }"),
+            written.replace("printf '%s\\n' '", "true; printf '%s\\n' '"),
+            written.replace("[ $? -eq 2 ]", "[ $? -eq 3 ]"),
+            written.replace("exit 2; }", "exit 3; }"),
+            written.replace(" or run lunchroom uninstall.", " or do nothing."),
+            written.replace("Lunchroom: the guard failed", "Lunchroom: the guard worked"),
+        ] {
+            assert!(
+                !is_lunchroom_hook(&hook(&theirs), program, home),
+                "{theirs}"
+            );
+        }
+        // Whitespace the install did not write (Windows line endings, a tab, a line break) is still
+        // Lunchroom's hook, so an install replaces it and uninstall removes it, but it is not the
+        // form that blocks: the shell reads a line break as a second command.
+        for odd in [
+            format!("{written}\r"),
+            format!("{written}\r\n"),
+            written.replace("; exit 2", ";\nexit 2"),
+            written.replace(" || { ", " ||\t{ "),
+            written.replace(" >&2; ", " >&2;\r\n "),
+        ] {
+            assert!(is_lunchroom_hook(&hook(&odd), program, home), "{odd:?}");
+            assert!(
+                !is_fail_closed_for(program_and_args(&odd).1, file),
+                "{odd:?}"
+            );
+        }
+        assert!(is_fail_closed_for(program_and_args(&written).1, file));
+        // The evidence reads the same forms.
+        let guard = |command: &str| {
+            crate::evidence::guard_program(
+                &hook(command),
+                "pretool",
+                crate::evidence::PreTool::Older,
+                Some(file),
+            )
+            .is_some()
+        };
+        assert!(guard(&written));
+        assert!(guard(&format!("{} guard pretool", program.display())));
+        assert!(!guard(&format!(
+            "{} guard pretool || true",
+            program.display()
+        )));
+        assert!(!guard(&written.replace("exit 2; }", "exit 0; }")));
+    }
+
+    //H1.5 (a configuration path that is not UTF-8): the hook's line names the file in
+    // text and evidence takes the hook only when the name is the path byte for byte, so the install
+    // refuses such a path, for Claude Code and for Codex, before it writes the program or the
+    // settings or asks for a confirmation.
+    #[test]
+    fn the_install_refuses_a_configuration_path_that_is_not_text() {
+        use std::os::unix::ffi::OsStringExt as _;
+        for target in ["claude-code", "codex"] {
+            let mut s = Scratch::new();
+            let dir = s
+                .root
+                .join(std::ffi::OsString::from_vec(b"not-text-\xff".to_vec()));
+            assert!(fs::create_dir_all(&dir).is_ok());
+            if target == "codex" {
+                s.env.codex_home = dir.clone();
+            } else {
+                s.env.claude_home = dir.clone();
+            }
+            let mut user = Answers {
+                answers: vec!["yes\n"],
+                asked: Vec::new(),
+            };
+            let out = install(&[target.to_owned()], &s.env, &mut user);
+            assert_eq!(out.code, 2, "{target}: {}{}", out.stdout, out.stderr);
+            assert!(out.stderr.contains("not text"), "{target}: {}", out.stderr);
+            assert!(user.asked.is_empty(), "{target}: no question is asked");
+            assert_eq!(
+                fs::read_dir(&dir).map_or(1, Iterator::count),
+                0,
+                "{target}: nothing is written"
+            );
+            assert!(!s.env.lunchroom_home.join("bin/lunchroom").exists());
+        }
+    }
+
+    //H1.5, §13::4: every character of Unicode's White_Space (U+0009-000D, 0020, 0085,
+    // 00A0, 1680, 2000-200A, 2028, 2029, 202F, 205F, 3000), alone and mixed with a carriage return and
+    // a line feed, in any of the places a hook's words are separated, leaves a Lunchroom hook
+    // Lunchroom's: the install replaces it and uninstall removes it, the user's hook staying. A
+    // character that only looks like a space (zero-width space, byte order mark, Mongolian vowel
+    // separator) does not: the word it is in is another word.
+    #[test]
+    fn every_unicode_white_space_leaves_a_hook_lunchroom_s_to_replace_and_remove() {
+        let program = Path::new("/home/u/.lunchroom/bin/lunchroom");
+        let home = Path::new("/home/u");
+        let file = Path::new("/home/u/.claude/settings.json");
+        let p = program.display().to_string();
+        let written = pretool_command(&p, file);
+        let args = written
+            .strip_prefix(&format!("{p} "))
+            .unwrap_or_default()
+            .to_owned();
+        let table: Vec<char> = ('\u{9}'..='\u{d}')
+            .chain(['\u{20}', '\u{85}', '\u{a0}', '\u{1680}'])
+            .chain('\u{2000}'..='\u{200a}')
+            .chain(['\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}'])
+            .collect();
+        assert_eq!(table.len(), 25);
+        let hook = |command: &str| json!({"type": "command", "command": command});
+        let mut found = Vec::new();
+        for c in &table {
+            assert!(c.is_whitespace(), "{c:?}");
+            for pad in [
+                c.to_string(),
+                format!("{c}\r\n"),
+                format!("\r{c}\n"),
+                format!("\n{c}\r"),
+            ] {
+                for variant in [
+                    format!("{p}{pad}{args}"),
+                    format!(
+                        "{p} {}",
+                        args.replacen("guard pretool", &format!("guard{pad}pretool"), 1)
+                    ),
+                    format!("{p} {}", args.replacen("||", &format!("{pad}||{pad}"), 1)),
+                    format!("{written}{pad}"),
+                    format!("{p}{pad}guard{pad}pretool"),
+                    format!("{p} guard{pad}pretool{pad}"),
+                ] {
+                    assert!(
+                        is_lunchroom_hook(&hook(&variant), program, home),
+                        "{c:?}: {variant:?}"
+                    );
+                    found.push(variant);
+                }
+            }
+        }
+        // Install and uninstall: every variant goes, the user's hook stays.
+        let mut groups = vec![json!({"hooks": [hook("/u/mine.sh")]})];
+        groups.extend(found.iter().map(|v| json!({"hooks": [hook(v)]})));
+        let mut hooks = Map::new();
+        hooks.insert("PreToolUse".to_owned(), Value::Array(groups));
+        let places = strip_lunchroom_hooks(&mut hooks, program, home);
+        assert_eq!(places.get("PreToolUse"), Some(&1));
+        assert_eq!(
+            hooks["PreToolUse"],
+            json!([{"hooks": [{"type": "command", "command": "/u/mine.sh"}]}])
+        );
+        // Look-alikes of a space are not one.
+        for like in ['\u{200b}', '\u{feff}', '\u{180e}', '\u{2060}'] {
+            assert!(!like.is_whitespace(), "{like:?}");
+            for variant in [
+                format!("{p} guard{like}pretool"),
+                format!("{p}{like}guard pretool"),
+                written.replacen("guard pretool", &format!("guard{like}pretool"), 1),
+            ] {
+                assert!(
+                    !is_lunchroom_hook(&hook(&variant), program, home),
+                    "{like:?}: {variant:?}"
+                );
+            }
         }
     }
 
@@ -3840,7 +5276,13 @@ mod tests {
                 "{event}"
             );
         };
-        one("PreToolUse", "guard pretool");
+        assert_eq!(
+            ours(&after, "PreToolUse", &program),
+            [pretool_command(
+                &program,
+                &s.env.claude_home.join("settings.json")
+            )]
+        );
         one("PostToolUse", "guard posttool");
         one("UserPromptSubmit", "guard prompt");
         assert_eq!(
@@ -3904,8 +5346,12 @@ mod tests {
             );
             let hooks: Value = serde_json::from_str(&after).unwrap_or(Value::Null);
             let p = program.display().to_string();
+            assert_eq!(
+                ours(&hooks, "PreToolUse", &p),
+                [pretool_command(&p, &path)],
+                "PreToolUse"
+            );
             for (event, rest) in [
-                ("PreToolUse", "guard pretool"),
                 ("PostToolUse", "guard posttool"),
                 ("UserPromptSubmit", "guard prompt"),
             ] {
@@ -4137,8 +5583,9 @@ mod tests {
         );
     }
 
-    /// A user who has set no passphrase yet: answers a yes and then the hold mode, types the
-    /// secrets in turn, and has the system put a verifier in place as root's.
+    /// A user who has set no passphrase yet: the root program's prompt confirms the install, the
+    /// user answers the hold mode, types the secrets in turn, and has the system put a verifier in
+    /// place as root's.
     struct NewUser {
         answers: Vec<&'static str>,
         secrets: Vec<&'static str>,
@@ -4148,6 +5595,8 @@ mod tests {
         installed: Option<String>,
         install: Result<(), String>,
         blocker: Option<String>,
+        /// What the root program's own prompt answers.
+        root: Result<(), String>,
     }
 
     impl NewUser {
@@ -4161,6 +5610,7 @@ mod tests {
                 installed: None,
                 install: Ok(()),
                 blocker: None,
+                root: Ok(()),
             }
         }
     }
@@ -4168,6 +5618,10 @@ mod tests {
     impl System for NewUser {
         fn verifier_blocker(&self) -> Option<String> {
             self.blocker.clone()
+        }
+        fn confirm_root(&mut self, question: &str) -> Result<(), String> {
+            self.asked.push(question.to_owned());
+            self.root.clone()
         }
         fn ancestors(&self) -> Vec<(Option<String>, String)> {
             UserAt("").ancestors()
@@ -4205,17 +5659,19 @@ mod tests {
 
     const FIRST: &str = "my first passphrase";
 
-    // A1.3: the install that finds no passphrase is confirmed with a typed yes, because there is
-    // nothing to check a passphrase against; once the hooks are written it sets the first
-    // passphrase (asked twice, put in place as root's, read back) and says so.
+    // A1.3: the install that finds no passphrase is confirmed by the root program's own prompt
+    // (never by a typed yes), because there is nothing to check a passphrase against; once the
+    // hooks are written it sets the first passphrase (asked twice, put in place as root's, read
+    // back) and says so.
     #[test]
-    fn the_first_install_is_confirmed_with_yes_and_sets_the_passphrase() {
+    fn the_first_install_is_confirmed_by_the_root_program_and_sets_the_passphrase() {
         let s = Scratch::new();
-        let mut user = NewUser::new(&["yes\n", "2\n"], &[FIRST, FIRST]);
+        let mut user = NewUser::new(&["2\n"], &[FIRST, FIRST]);
         let out = install(&["claude-code".to_owned()], &s.env, &mut user);
         assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
         assert!(
-            user.asked[0].ends_with("No passphrase is set yet. Type yes: "),
+            user.asked[0].contains("Lunchroom: add Lunchroom to")
+                && !user.asked[0].contains("Type yes"),
             "{}",
             user.asked[0]
         );
@@ -4243,13 +5699,14 @@ mod tests {
         );
     }
 
-    // A1.3: an install the user declines changes nothing and sets no passphrase; an install that
+    // A1.3: an install the root program's prompt refuses changes nothing and sets no passphrase; an install that
     // cannot put the verifier in place is done, and says that the passphrase is not set and that
     // the commands only the user may run are denied until it is.
     #[test]
     fn a_declined_first_install_sets_nothing_and_a_failed_passphrase_step_is_reported() {
         let s = Scratch::new();
-        let mut no = NewUser::new(&["no\n"], &[FIRST, FIRST]);
+        let mut no = NewUser::new(&[], &[FIRST, FIRST]);
+        no.root = Err("sudo -v did not succeed; nothing was written".to_owned());
         assert_eq!(
             install(&["claude-code".to_owned()], &s.env, &mut no).code,
             3
@@ -4257,7 +5714,7 @@ mod tests {
         assert_eq!(no.prompts, Vec::<String>::new());
         assert_eq!(no.installed, None);
         assert!(!s.env.lunchroom_home.join("bin/lunchroom").exists());
-        let mut failing = NewUser::new(&["yes\n", "2\n"], &[FIRST, FIRST]);
+        let mut failing = NewUser::new(&["2\n"], &[FIRST, FIRST]);
         failing.install = Err("making /etc/lunchroom did not succeed (exit status: 1)".to_owned());
         let out = install(&["claude-code".to_owned()], &s.env, &mut failing);
         // The hooks are written, and the install fails: no passphrase is set.
@@ -4292,7 +5749,7 @@ mod tests {
     #[test]
     fn a_system_that_cannot_hold_the_verifier_fails_the_install_before_any_passphrase_is_typed() {
         let s = Scratch::new();
-        let mut user = NewUser::new(&["yes\n", "2\n"], &[FIRST, FIRST]);
+        let mut user = NewUser::new(&["2\n"], &[FIRST, FIRST]);
         user.blocker = Some("sudo was not found; install sudo".to_owned());
         let out = install(&["claude-code".to_owned()], &s.env, &mut user);
         assert_ne!(out.code, 0, "{}{}", out.stdout, out.stderr);

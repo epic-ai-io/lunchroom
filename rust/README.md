@@ -49,11 +49,11 @@ table below gives the full meaning of each.
 Each release publishes `lunchroom-v<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl`, with `SHA256SUMS` signed by Sigstore. Check a download before you run
 it, with cosign 3 or newer: first that this repository's release workflow signed `SHA256SUMS` for the
-release's own tag (here `v1.1.3`; use the tag you downloaded), then the archive against it:
+release's own tag (here `v1.2.0`; use the tag you downloaded), then the archive against it:
 
 ```
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.1.3 \
+  --certificate-identity https://github.com/epic-ai-io/lunchroom/.github/workflows/release.yml@refs/tags/v1.2.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum -c SHA256SUMS --ignore-missing
 ```
@@ -137,16 +137,20 @@ What you do afterwards:
 A broken guard never locks you out: what the guard cannot check goes to you, or, where nobody can be
 asked, that one call is DENIED (see "When the guard cannot decide a call" below).
 
-`lunchroom version` names the build, for example `lunchroom 1.1.3 (a1b2c3d)`: the version, then the commit it was built from, with
+`lunchroom version` names the build, for example `lunchroom 1.2.0 (a1b2c3d)`: the version, then the commit it was built from, with
 `, modified` when a tracked file of the source differs from that commit (untracked files do not
 count); a build from a source copy with no git history shows the version alone. The install reports the build it installed and the
 one it kept as a backup.
 
 To remove Lunchroom, first run `lunchroom uninstall claude-code` and `lunchroom uninstall codex` in
 your own terminal: each removes only Lunchroom's hooks and keeps a backup. For OpenClaw run
-`openclaw plugins disable lunchroom`, for Hermes `hermes plugins disable lunchroom`. Then delete the
-`lunchroom` link in `~/.local/bin` or `~/bin`, and last `~/.lunchroom`: a hook that still names the
-program after it is gone fails on every call.
+`openclaw plugins disable lunchroom`, for Hermes `hermes plugins disable lunchroom`. Then run
+`lunchroom uninstall console`, which removes the console's public key and leaves the `sudo` rule
+file `/etc/sudoers.d/zz-lunchroom-<uid>`, where the install wrote one, in place. What stays is root's: the program
+`/usr/local/lib/lunchroom/lunchroom`, shared by every user of the computer who installed Lunchroom,
+and your messages in `/var/lib/lunchroom/<uid>`. Remove your folder as root, delete the `lunchroom`
+link in `~/.local/bin` or `~/bin`, and remove `/usr/local/lib/lunchroom` only when no other user
+uses it: a hook that still names the program after it is gone fails on every call.
 
 If Lunchroom's store ever cannot be read, the guard still settles the calls that need no record:
 
@@ -182,8 +186,8 @@ To upgrade an installed Lunchroom, download and unpack the new release, then run
 path, in your own terminal, from the unpacked folder:
 
 ```
-tar xzf lunchroom-v1.1.3-x86_64-unknown-linux-musl.tar.gz
-cd lunchroom-v1.1.3-x86_64-unknown-linux-musl
+tar xzf lunchroom-v1.2.0-x86_64-unknown-linux-musl.tar.gz
+cd lunchroom-v1.2.0-x86_64-unknown-linux-musl
 ./lunchroom install
 ```
 
@@ -415,9 +419,8 @@ them, only show):
 - `lunchroom mode [relaxed|balanced|strict]`: show the hold mode, or set it.
 - `lunchroom yolo <name,name,...|all> till <HH:MM>`: let the named agents act without asking until then
   (UTC); name them separated by commas. The end may also be a date and time, `YYYY-MM-DDTHH:MMZ`. It
-  turns YOLO on for every agent named, or for none: `all` names every agent, so while any of them is
-  a Codex, OpenClaw or Hermes agent (`lunchroom yolo` works for Claude Code agents only) it is DENIED
-  and says which agents to name instead.
+  turns YOLO on for every agent named, or for none, and works for agents of every harness (Claude
+  Code, Codex, OpenClaw, Hermes). `lunchroom yolo <name,...|all> till now` ends it at once.
 - `lunchroom register <name> <harness>:<session id>`: name a session so it receives messages
   (`--codex-thread <id>` and `--claude-session <id>` are accepted in place of `<harness>:<session id>`).
 - `lunchroom unregister <name>`: take a name away so that session receives no more messages;
@@ -456,6 +459,7 @@ Exit codes: 0 done (a hand-over that FAILED, or is not confirmed, is reported in
 exit code is still 0), 1 a store or file Lunchroom needs cannot be used, 2 usage or an argument that
 is not valid (a DENIED message that is empty, too long or has too many lines is 2 too), 3 not permitted (DENIED because
 the session, the name, your terminal or your passphrase does not qualify), 4 HALTED, 5 rate limit,
+6 `lunchroom install` wrote the hooks but the console is not set up (the output says how to finish),
 7 DENIED by a rule.
 
 ## The Claude Code adapter
@@ -567,87 +571,127 @@ plugin's own tests run with `python3 -m unittest` in `rust/plugins/hermes/`.
 ## Stated limits
 
 These are statements for users of what Lunchroom does not prevent; they are not rules to test.
+Lunchroom publishes them with each release, in its documentation.
 
 1. A hostile program running as the same user is out of scope (T1.4).
 2. Lunchroom cannot tell a person's typing from a turn some other program writes into a harness,
-   except for the markers it knows. The fences (F1) close the known channels; any
-   unknown one is a limit.
-3. A HELD agent can still pass to its sender anything already in its context or that it may read, in
-   a form no scanner recognises (L1.3).
-4. Lunchroom tracks another agent's text by its labels; text an agent rewrote before writing it
-   elsewhere is not tracked once written. In the Strict hold mode (P1.6) a HELD agent writes nothing
-   without the user's approval, except, under a `lunchroom yolo`, writes that are not PROTECTED (P1,
-   R2.4), which bounds this; in the Balanced mode only its PROTECTED writes are bounded, and in the
-   Relaxed mode only its writes to Lunchroom's program and the guard's configuration (P1.6).
+   except for the markers it knows (finding #21). The fences (F1) close the known channels,
+   terminals and `tmux` and `screen` among them (F1.4); a channel no fence names, such as a new
+   program or service that writes a turn into a harness, is not closed until a fence names it.
+3. In the Balanced and Relaxed hold modes a HELD agent can still pass to its sender anything
+   already in its context or that it may read, in a form no scanner recognises; in the Strict hold
+   mode each reply comes to you first, and such a form can pass your reading too (L1.3).
+4. Lunchroom tracks another agent's text by its labels, and the files a HELD agent writes (T1.8).
+   Text carried where Lunchroom does not see a file path (a write by a script or program whose
+   text does not name the path, a database, a network service) is not tracked. In the Strict hold
+   mode (P1.6) a HELD agent writes nothing without the user's approval, except, under a `lunchroom
+   yolo`, writes that are not PROTECTED (P1, R2.4), which bounds this; in the Balanced mode only
+   its PROTECTED writes are bounded, and in the Relaxed mode only its writes to Lunchroom's
+   program and the guard's configuration (P1.6).
 5. Exactly-once action is not promised; delivery is at most once per message id, with unknown
    outcomes stated (D1).
 6. Where an OpenClaw or Hermes approval appears, and whether it reaches a phone, depends on the
    user's own setup of that harness; Lunchroom only asks, and blocks when nobody can answer (A1).
-7. Lunchroom spots a request for a secret by its words (L1.4); a reworded request can get through.
-   In the Strict and Balanced hold modes (P1.6) a HELD agent's credential reads still go to the user
-   (L1.1), and in every mode a reply carrying a secret is still scanned (L1.2).
+7. Lunchroom spots a request for a secret by its words, in the languages L1.4 lists and inside
+   base64, hexadecimal and rot13 (L1.4); a request reworded so that it names none of those words,
+   written in another language, or encoded another way, can get through. In the Strict and
+   Balanced hold modes (P1.6) a HELD agent's credential reads still go to the user (L1.1), and in
+   every mode a reply carrying a secret is still scanned (L1.2).
 8. Lunchroom judges a call by what the call itself shows. Apart from searching the text of a script
    or code the call runs for the fences, the identity variables and Lunchroom's own commands (F1,
-   I1.2, A1.3), it does not judge what that script or program goes on to do, such as sending data
-   or deleting files, so under a `lunchroom yolo` a HELD agent's script runs like any ordinary call;
-   a channel the script reaches in a way its text does not spell out is not caught. A file a program
-   reads as data (`sed` or `awk` input, the arguments after an interpreter's script) is not
-   searched, unless the `sed` or `awk` program can run what it reads. A script is
-   searched as it reads when the call is made, so a call that writes a script and then runs it is
-   judged on the script as it was before. The search counts a mention anywhere in a script's
-   text, a string it only prints included, so a script that quotes one of Lunchroom's user-only
-   commands is DENIED; an agent changes such a file with its own edit tools instead.
-9. A guard program that is missing, or that the system stops before it answers, is a failure the
-   harness itself handles: Claude Code and Codex then run the call unchecked, and pass a prompt on
-   unchecked, another agent's text included, without holding the session. Lunchroom accepts this so that
-   a broken guard never locks the user out (H1.5). In OpenClaw and Hermes, Lunchroom's plugin
-   handles it instead: the call goes to the user, or is DENIED where nobody can answer, and
-   another agent's text holds the session; the user's own typing still goes on. When the guard's program is missing, Lunchroom
-   shows that agent UNGUARDED and delivers nothing to it (R3); a guard stopped during one call
-   leaves no such trace. The table "When the guard cannot decide a call" above sets the outcomes
-   side by side.
-10. The passphrase check does not hold where an agent has passwordless `sudo`: such an agent acts
-    as root, and can write the verifier, remove it, or change Lunchroom's own files.
-11. An agent can read the verifier (it is readable by every user) and guess the passphrase
-    offline. A minimum of 12 characters and 600000 PBKDF2 rounds slow that guessing; they do not
-    prevent it for a weak passphrase. Use a long one that appears nowhere else.
-12. A program that records the user's keystrokes defeats any secret typed at a terminal, this
-    passphrase included. Until the first passphrase is set, the install that sets it is confirmed
-    with a typed `yes`, which a process of the user's own can type.
-13. The envelope reaches a Codex or OpenClaw session as one argument of `codex queue` or
-    `openclaw agent`, so another user of the computer can read it in `/proc/<pid>/cmdline` while
-    that program runs; Lunchroom's own store is readable by its user alone.
-14. The passphrase step needs `sudo` (not `doas`), `install` and `stty` in `/usr/bin`, `/bin`,
-    `/usr/sbin` or `/sbin`; a system without `sudo` installs the hooks but no passphrase, and says
-    so, and the commands only the user may run stay DENIED until a passphrase is set.
-15. Starting a new session is recognised by the forms P1.4 lists, where the program is plainly the
-    program being run: a prompt with no option, given through a wrapper Lunchroom does not know, is
-    not recognised, and in a program's own code it is recognised only as a string after the
-    program's name at the start of a list or call, in plain text the guard can read: a bracket in
-    a comment between them, a quote mark earlier in the text, or a prompt built at run time, is not.
-16. A Hermes `terminal` command's folder is read from Hermes itself; where it cannot be read, a
-    HELD agent's command goes to the user.
+   I1.2, A1.3), and while HELD for what its text would make PROTECTED or DENIED as a command of its
+   own (P1.4), it does not judge what that script or program goes on to do; a compiled program,
+   or a step a script reaches in a way its text does not spell out (a name built at run time),
+   is not caught. A file a program reads as data (`sed` or `awk` input, the arguments after an
+   interpreter's script) is not searched, unless the `sed` or `awk` program can run what it reads.
+   The search counts a mention anywhere in a script's text, a string it only prints included, so
+   a script that quotes one of Lunchroom's user-only commands is DENIED; an agent changes such a
+   file with its own edit tools instead.
+9. A guard that fails on a tool call blocks that call (H1.5), except in two cases the harness
+   decides. Codex runs the call when its hook passes the time limit set for it in Codex's hooks
+   file, since Codex then stops the hook and counts it as failed, not as a block (Codex 0.163.0,
+   `codex-rs/hooks/src/engine/command_runner.rs` lines 310-320, "hook timed out", and
+   `codex-rs/hooks/src/events/pre_tool_use.rs` lines 205-211; a command hook's settings are
+   `command`, `commandWindows`, `timeout`, `async`, `statusMessage` and `additionalContextLimit`,
+   none of which makes a failed hook block, `codex-rs/config/src/hook_config.rs` lines 163-185;
+   read 2026-11-03). OpenClaw runs every call when Lunchroom's plugin is not
+   loaded ("A plugin that is not loaded runs no hook, and the call goes ahead",
+   `docs/host-facts/openclaw-and-hermes.md`); Lunchroom then shows that agent UNGUARDED and
+   delivers nothing to it (R3). A failure of the prompt hook passes the prompt on unchecked,
+   another agent's text included, without holding the session, so that a broken guard never
+   blocks your typing (H1.5).
+10. The passphrase check (A1.3) and the store wall (§17.2) do not hold where your account has a
+    `sudo` rule that needs no password: a process using it acts as root, and can write the verifier,
+    remove it, or change Lunchroom's own files. While such a rule stays, agents keep root, so their
+    builds and service restarts work; Lunchroom DENIES an agent's command, as root or not, that
+    names Lunchroom's paths or runs as the user `lunchroom` (A1.3), and `lunchroom doctor` says so
+    (C1.4), but a root command that reaches Lunchroom's files in a way its text does not show (K1.8)
+    is not caught, and the console is not installed (§17.8). `lunchroom install console` offers to
+    close this: on your typed yes it adds a rule that makes `sudo` ask your account for its password
+    (§17.8). From then on every `sudo` command of your account asks that password, an agent's
+    included, so an agent's `sudo` command no longer runs unattended; the guard still DENIES only
+    the commands it DENIED before. Giving your account a password for `sudo` by any other means
+    closes this too.
+11. (fixed in 1.1)
+12. A program that records the user's keystrokes defeats any secret typed at a terminal, the
+    passphrase and the password the first install asks for included. On an account with a `sudo`
+    rule that needs no password, the first install's `sudo -v` asks nothing, so it does not show
+    that a person is there; the install says so (A1.3).
+13. (fixed in 1.1)
+14. The passphrase step needs one of `sudo`, `doas`, `su -c` or `run0`, and `install`, in `/usr/bin`,
+    `/bin`, `/usr/sbin` or `/sbin`; on a system with none of the four the install sets no
+    passphrase, says so and exits with a failure (A1.3), and the commands only the user may run
+    stay DENIED until a passphrase is set.
+15. Starting a new session is recognised by the forms P1.4 lists, and a session a HELD session
+    starts inherits its holds when its parent chain or an inherited identity variable leads back
+    to that session (T1.9). A session started where neither leads back (handed to a scheduler or
+    a service that starts it for the agent, with the identity variables removed) does not inherit
+    them, and its prompt is recognised only by those forms: in a program's own code only as a
+    string after the program's name at the start of a list or call, in plain text the guard can
+    read, so a bracket in a comment between them, a quote mark earlier in the text, or a prompt
+    built at run time, is not.
+16. Where Hermes's folder for a `terminal` command cannot be read, a HELD agent's command that
+    names a relative path, or runs a program on the guard's list of programs that read their
+    folder, goes to the user (L1.1); a program not on that list that reads its folder is not
+    caught.
 17. Codex's hooks do not see everything an agent does. Codex's own documentation calls them "a useful
-    guardrail, not a complete enforcement boundary": a hosted tool such as web search reaches no
-    hook, and neither does input sent to a command already running. So `lunchroom install codex`
-    sets `unified_exec_tty = false`, for every Codex session of that user, which closes such input
-    and means those agents cannot keep a terminal program open; a Codex session is UNGUARDED without
-    it, and a session open when the install sets it is UNGUARDED until started anew. A session open
-    when the user sets it by hand, or started with it turned back on by a command-line option, can
-    still type into a shell it has open, and the guard does not see it. A Ctrl-C still reaches a
-    command that is running. A session no hook has seen when the install sets it is not caught, so
-    close open Codex sessions before the install or start them anew after it. Codex 0.166 runs
-    sessions in one server process: a session whose window you closed still shows as running until
-    that server ends, a message to it shows DELIVERED though no window shows it, and a thread resumed
-    under that server stays UNGUARDED, so start a new one.
-18. After `lunchroom approve`, a Codex agent is told, and may decline to run the call. An OpenClaw or
-    Hermes agent is not told: the call runs only if the agent tries it again by itself.
-19. An agent can change Lunchroom's records, your approvals and its holds included. They are files
-    your own user can write, and an agent runs as your user: the guard DENIES a call that shows those
-    files, and a script or a path built from pieces does not show them. Being HELD stops this only in
-    the Strict hold mode without a `lunchroom yolo`, and there the script comes to you (in Codex,
-    through `lunchroom approve`): you are shown the script, not what it writes. Putting the records out of an agent's reach takes a separate account, which this release
-    does not do.
+    guardrail, not a complete enforcement boundary". `lunchroom install codex` disables the two
+    paths known to reach no hook, input sent to a command already running (`unified_exec_tty =
+    false`, so those agents cannot keep a terminal program open) and the hosted web search
+    (`web_search = "disabled"`), and a Codex session where either is on, by a file, a profile or
+    its command line, is UNGUARDED (H1.4); while any `codex` window was started with such an
+    option, every session in Codex's shared server is UNGUARDED. A path Codex adds that reaches no
+    hook is not caught until Lunchroom knows it. A Ctrl-C still reaches a command that is running.
+    Codex 0.166 runs sessions in one server process: a session whose window you closed still shows
+    as running until that server ends, a message to it shows DELIVERED though no window shows it,
+    and a thread resumed under that server stays UNGUARDED, so start a new one.
+18. After `lunchroom approve`, the agent is told (A1.2) and decides itself whether to run the call;
+    a Hermes agent is told only when its next turn starts.
+19. (fixed in 1.1)
+20. On a file system so slow that a call's paths are not resolved within 8 seconds, a HELD agent's
+    ordinary read can reach the user (L1.1).
+21. A session resumed with a long transcript is HELD until the guard has read the transcript to
+    its end, 32 MiB at each of its hooks (T1.7), so a program's run (`claude -p`) on such a
+    transcript can stay HELD throughout.
+22. A `codex` command line with an option that the Codex release its adapter passed with (H1.2)
+    does not define counts as a program's prompt and as starting a session (P1.4, D1.8), so a person who runs a
+    newer Codex with such an option is told no notices in that session.
+23. (fixed in 1.1)
+24. (fixed in 1.1)
+25. A notice shown by a hook that was killed before it wrote its answer is shown again (D1.8).
+26. A Lunchroom 1.0.1 program that is still running keeps 1.0.1's rules until its session ends;
+    it no longer loses 1.1's fields (D1.2), and the install stops your running 1.0.1 listeners
+    before it moves the store (§17.2). Start sessions anew after an upgrade; `lunchroom doctor`
+    says so (C1.4).
+27. A HELD agent's `gdb` that starts a program of its own runs when it takes `-nx` and only
+    `run`, `r`, `bt`, `backtrace`, `continue`, `c`, `quit` or `q` as `-ex`, then `--args` and the
+    program; any other `gdb` call goes to you. gdb's `run` starts the program through `$SHELL` by
+    default (GDB manual, "Starting"), and the guard does not read what `$SHELL` names, so an
+    agent that has set `SHELL` to a program of its own can run it this way.
+
+### The console
+
+The console (`lunchroom console`) has these limits (§17.6): A person who walks away from an unlocked console for under 15 minutes leaves `unregister`, and what the console shows, open to whoever is at its keyboard; `approve`, the loosening actions and the approvals of item 9 ask the passphrase each time. The console's own terminal cannot be read by the developer's processes, but the developer's outer terminal, which relays to it, is owned by the developer, and a process that opens it can race to read keystrokes, the passphrase included.
 
 ## License
 

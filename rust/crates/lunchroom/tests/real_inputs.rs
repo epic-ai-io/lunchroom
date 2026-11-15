@@ -348,9 +348,9 @@ fn claude_guard_settings(program: &str, pre_matcher: Option<&str>, skip: Option<
         if skip == Some(event) {
             continue;
         }
-        let mut group = json!({"hooks": [{
-            "type": "command", "command": format!("{quoted} guard {mode}"), "timeout": 15
-        }]});
+        let mut hook = common::guard_hook(&quoted, mode, true);
+        hook["timeout"] = json!(15);
+        let mut group = json!({"hooks": [hook]});
         if let (Some(m), "PreToolUse") = (pre_matcher, event) {
             group["matcher"] = json!(m);
         }
@@ -387,7 +387,7 @@ fn only_the_complete_guard_set_makes_a_session_guarded_even_under_a_path_with_a_
         "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "t1",
     });
     let state = |settings_value: &Value| {
-        assert!(std::fs::write(&settings, settings_value.to_string()).is_ok());
+        common::write_settings_resolved(&settings, settings_value);
         let run = sb.run(&["guard", "pretool"], &pretool.to_string(), &interactive());
         assert_eq!(run.code, Some(0), "{}", run.stderr);
         sb.run(&["status"], "", &[]).stdout

@@ -5,6 +5,8 @@
 pub mod approvals;
 pub mod cards;
 pub mod classify;
+pub mod codex_cli;
+pub mod conversation;
 pub mod denial;
 pub mod fs;
 pub mod identity;
@@ -17,8 +19,10 @@ pub mod policy;
 pub mod secrets;
 pub mod setgid;
 pub mod shell;
+pub mod shown;
 pub mod steps;
 pub mod store;
+pub mod sudoers;
 pub mod vocab;
 
 /// The build folder this test runs from (`<target>/release/deps/<test>`), for scratch files.

@@ -22,6 +22,7 @@ import os
 import stat
 import re
 import subprocess
+import threading
 import time
 import uuid
 
@@ -57,7 +58,9 @@ ENVELOPE_LABELS = ("[LUNCHROOM MESSAGE", ENVELOPE_END.rstrip(), "[lr:")
 NO_RECORD_DENY = re.compile(
     r"\b(lunchroom|hermes|codex|claude|opencode|openclaw|acp|sessions_send|CLAUDE_CODE_SESSION_ID|"
     r"CODEX_THREAD_ID|HERMES_SESSION_ID|LUNCHROOM_SESSION|LUNCHROOM_HOME)\b|/api/sessions/",
-    re.IGNORECASE,
+    # ASCII word characters, as the OpenClaw plugin's pattern reads them: a letter beside the word
+    # does not hide it in either plugin.
+    re.IGNORECASE | re.ASCII,
 )
 SPELLING = re.compile(r"[\\\"'`]")
 
@@ -66,10 +69,47 @@ def names_no_record_rule(tool_input):
     """Whether a call's input names what the rules that need no record DENY; input that cannot be
     read cannot be shown free of them."""
     try:
-        text = json.dumps(tool_input, default=str)
-    except (TypeError, ValueError):
+        strings = []
+        _collect_strings(tool_input, strings, 0)
+    except (TypeError, ValueError, RecursionError):
         return True
-    return bool(NO_RECORD_DENY.search(text) or NO_RECORD_DENY.search(SPELLING.sub("", text)))
+    # The match runs on the decoded text, never on its JSON form: a tab or newline in the call is
+    # one character there, not a backslash and a letter that would join it to the next word. Each
+    # string stands alone and all of them stand together, one to a line. A literal backslash-n,
+    # -t or -r, which a shell turns into a separator, is read as one as well (`$'a\\nlunchroom'`).
+    decoded = "\n".join(strings)
+    for text in (decoded, _unescape(decoded), *strings):
+        if NO_RECORD_DENY.search(text) or NO_RECORD_DENY.search(SPELLING.sub("", text)):
+            return True
+    return False
+
+
+ESCAPES = re.compile(r"\\(?:([ntr])|u([0-9a-fA-F]{4}))")
+
+
+def _unescape(text):
+    """Backslash-n, -t and -r as a space, and backslash-uXXXX as its character: the text a shell or
+    a JSON string inside a string would read."""
+    def one(m):
+        return " " if m.group(1) else chr(int(m.group(2), 16))
+    return ESCAPES.sub(one, text)
+
+
+def _collect_strings(value, out, depth):
+    """Every string in a call's input, keys and values, at any depth; other values as text."""
+    if depth > 64:
+        raise ValueError("input nested too deeply to read")
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            out.append(key if isinstance(key, str) else str(key))
+            _collect_strings(item, out, depth + 1)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _collect_strings(item, out, depth + 1)
+    elif value is not None:
+        out.append(str(value))
 
 # Sessions another agent's text reached that the guard could not judge: a turn that was not the
 # user's typing, or a tool's output with Lunchroom's labels.
@@ -81,6 +121,16 @@ HANDED = {}
 # The input judged for each tool call, by call id, until its output is reported: a ``cd`` changes the
 # session's folder, so the report must carry the input the call was judged and approved with (A2.1).
 JUDGED = {}
+
+# The guard program's subcommand for the end of a call that Hermes's own prompt answered (D1.8). One
+# place, so a name changes in one edit.
+CALL_END_ARGS = ["guard", "callend"]
+
+# The calls the plugin sent to Hermes's prompt and has not reported, by (session id, call id):
+# ``{"session", "id"}``. ``post_tool_call`` runs on worker threads, so every use is under
+# ``ASKED_LOCK``; an entry is taken out by whoever reports it, so a call is reported once.
+ASKED = {}
+ASKED_LOCK = threading.Lock()
 
 
 def harness_version():
@@ -213,8 +263,11 @@ def run_guard(args, payload, program=None, timeout=None):
         return {"missing": True}
     except subprocess.TimeoutExpired:
         return {"failed": "no answer in time"}
-    except (OSError, ValueError) as exc:
-        return {"failed": str(exc)}
+    except Exception as exc:  # noqa: BLE001 -- input that cannot be written out is a guard that could not decide
+        try:
+            return {"failed": str(exc)}
+        except Exception:  # noqa: BLE001
+            return {"failed": "unreadable input"}
     if run.returncode < 0:
         return {"failed": f"stopped by signal {-run.returncode}"}
     # The guard answers with exit 0 or 2 (H1.5); any other exit is a guard that could not decide.
@@ -279,14 +332,48 @@ def _context(stdout):
     terminal surfaces this plugin serves do not have."""
     try:
         hook = json.loads(stdout.strip() or "{}").get("hookSpecificOutput") or {}
-        return hook.get("additionalContext") or ""
+        text = hook.get("additionalContext")
+        return text if isinstance(text, str) else ""
     except (ValueError, AttributeError):
         return ""
 
 
-def _approve(message, tool_call_id):
+def _approve(message, tool_call_id, session_id=""):
     # A rule key no other call has, even one with the same call id (A1.1).
+    if session_id and tool_call_id:
+        with ASKED_LOCK:
+            # A second request for a call still waiting shares its record: neither overwrites the other.
+            ASKED.setdefault((session_id, tool_call_id), {"session": session_id, "id": tool_call_id})
     return {"action": "approve", "message": message, "rule_key": f"lunchroom:{tool_call_id}:{uuid.uuid4().hex}"}
+
+
+def _take_asked(session_id, tool_call_id):
+    """The asked call under (session, id), taken out of the store: whoever takes it reports it."""
+    with ASKED_LOCK:
+        return ASKED.pop((session_id, tool_call_id), None)
+
+
+def _take_one_asked_of(session_id):
+    """One asked call of a session, taken out of the store; None when it has none."""
+    with ASKED_LOCK:
+        for key, value in ASKED.items():
+            if value["session"] == session_id:
+                return ASKED.pop(key)
+        return None
+
+
+def report_end(entry, outcome, program=None, timeout=None):
+    """Tell the guard how a call Hermes's prompt answered ended (D1.8): ``granted`` or ``denied``.
+    Never raises and never changes what Hermes does with the call."""
+    try:
+        run_guard(CALL_END_ARGS, {
+            "hook_event_name": "CallEnd",
+            "session_id": entry["session"],
+            "tool_use_id": entry["id"],
+            "outcome": outcome,
+        }, program, timeout=timeout)
+    except Exception:  # noqa: BLE001 -- a report that fails leaves the call's end to the next turn
+        pass
 
 
 def _base(session_id, event):
@@ -349,12 +436,27 @@ def shown(tool_name, tool_input):
     return f"\n\nThe call's input, in full ({tool_name}):\n{body}"
 
 
+def _text_id(value):
+    """An id as Hermes gives it: text, else none (a number, a list or an object names nothing)."""
+    return value if isinstance(value, str) else ""
+
+
 def on_pre_tool_call(tool_name="", args=None, session_id="", tool_call_id="", task_id="", program=None, **_):
-    """``pre_tool_call``: the guard's answer as Hermes's."""
+    """``pre_tool_call``: the guard's answer as Hermes's. Any error while reading the call keeps it
+    from running (H1.5)."""
+    session_id, tool_call_id = _text_id(session_id), _text_id(tool_call_id)
+    try:
+        return _on_pre_tool_call(tool_name, args, session_id, tool_call_id, task_id, program)
+    except Exception:  # noqa: BLE001 -- fail closed
+        return {"action": "block", "message": (
+            "Lunchroom could not check this call. This call is DENIED, because Lunchroom could not read it.")}
+
+
+def _on_pre_tool_call(tool_name, args, session_id, tool_call_id, task_id, program):
     channel = person_would_be_asked()
     tool_input = judged_input(tool_name, args, task_id)
     if tool_call_id:
-        JUDGED[tool_call_id] = tool_input
+        JUDGED[(session_id, tool_call_id)] = tool_input
 
     def not_judged(why):
         # A call the guard cannot judge goes to the user where a person can answer, else it is
@@ -370,7 +472,7 @@ def on_pre_tool_call(tool_name="", args=None, session_id="", tool_call_id="", ta
                 f"Lunchroom {why} Nobody can be asked in this session, so this call is DENIED.")}
         request = (f"Lunchroom {why} It needs your yes: answer this prompt (yes runs the call once, "
                    "no stops it). Lunchroom did not read any script this call runs.")
-        return _approve(f"{request}{shown(tool_name, tool_input)}", tool_call_id)
+        return _approve(f"{request}{shown(tool_name, tool_input)}", tool_call_id, session_id)
 
     # What the plugin knows that the guard's record may not: no session, or another agent's text
     # that reached the session unjudged. The guard still answers for the call when it can.
@@ -407,7 +509,7 @@ def on_pre_tool_call(tool_name="", args=None, session_id="", tool_call_id="", ta
             return {"action": "block", "message": reason or "Lunchroom: DENIED"}
         # A1.4: the guard's request shows the call; one with no text of its own is given it here.
         request = reason or f"Lunchroom: this call needs your yes.{shown(tool_name, tool_input)}"
-        return _approve(f"{request}\nLunchroom {held}" if held else request, tool_call_id)
+        return _approve(f"{request}\nLunchroom {held}" if held else request, tool_call_id, session_id)
     # The guard lets it run, but the plugin knows what the guard's record may not: the user decides.
     return not_judged(held) if held else None
 
@@ -416,8 +518,25 @@ def on_post_tool_call(tool_name="", args=None, result=None, session_id="", tool_
                       status="", task_id="", program=None, **_):
     """``post_tool_call``: another agent's text in a tool's output holds the session (T1). A call
     Hermes blocked or cancelled did not run, so it is not reported. When the guard cannot judge
-    an output carrying Lunchroom's labels, the plugin holds the session itself (H1.5)."""
-    judged = JUDGED.pop(tool_call_id, None) if tool_call_id else None
+    an output carrying Lunchroom's labels, the plugin holds the session itself (H1.5). An error
+    while reading the call holds the session too, and never reaches Hermes."""
+    session_id, tool_call_id = _text_id(session_id), _text_id(tool_call_id)
+    try:
+        return _on_post_tool_call(tool_name, args, result, session_id, tool_call_id, status, task_id, program)
+    except Exception:  # noqa: BLE001 -- fail closed
+        if session_id:
+            UNJUDGED.add(session_id)
+        return None
+
+
+def _on_post_tool_call(tool_name, args, result, session_id, tool_call_id, status, task_id, program):
+    judged = JUDGED.pop((session_id, tool_call_id), None) if tool_call_id else None
+    # A call Hermes's prompt answered ends here (D1.8): `ok` or `error` is Granted; `blocked`,
+    # `cancelled` and any other status is Denied, since there is no evidence the call ran.
+    asked = _take_asked(session_id, tool_call_id) if session_id and tool_call_id else None
+    if asked is not None:
+        report_end(asked, "granted" if status in ("ok", "error") else "denied", program)
+    # A call Hermes blocked or cancelled did not run, so its output is not judged.
     if not session_id or status in ("blocked", "cancelled"):
         return None
     run = run_guard(["guard", "posttool"], dict(
@@ -427,29 +546,62 @@ def on_post_tool_call(tool_name="", args=None, result=None, session_id="", tool_
         tool_use_id=tool_call_id,
         tool_response=result,
     ), program)
-    text = result if isinstance(result, str) else json.dumps(result)
+    try:
+        text = result if isinstance(result, str) else json.dumps(result, default=str)
+    except Exception:  # noqa: BLE001 -- output that cannot be written out cannot be shown free of the labels
+        text = ENVELOPE_LABELS[0]
     if "status" not in run and any(label in (text or "") for label in ENVELOPE_LABELS):
         UNJUDGED.add(session_id)
     return None
 
 
+def end_orphans(session_id, program, started, budget):
+    """A call sent to Hermes's prompt with no report when the session's next turn starts is told as
+    Denied, since the turn ended with the call not run (D1.8). Every such call is forgotten, so a
+    report that comes later changes nothing; one is reported only while the callback's budget has
+    time for it, and the guard's own prompt run closes any left."""
+    while True:
+        left = budget - (time.monotonic() - started)
+        # With no time left for one more report, the calls not yet taken stay in the store for a
+        # later turn (and the guard's own prompt run closes them in its record).
+        if left < 2 * MIN_LISTEN_SECONDS:
+            return
+        entry = _take_one_asked_of(session_id)
+        if entry is None:
+            return
+        report_end(entry, "denied", program, timeout=min(DEADLINE_SECONDS, left / 2))
+
+
 def on_pre_llm_call(session_id="", user_message=None, platform="", turn_id="", program=None, **_):
     """``pre_llm_call``: the turn's text reaches the guard, then the next waiting message is handed
     to the turn (D1.1). A subagent's turn is its parent session's text, reaching it through
-    Hermes's own delegation: another agent's text, which holds the subagent's session (T1)."""
+    Hermes's own delegation: another agent's text, which holds the subagent's session (T1). Any
+    error while reading the turn fails open, with the session held (H1.5)."""
+    session_id = _text_id(session_id)
     if not session_id:
         return None
-    typed = platform in TYPED_PLATFORMS
+    try:
+        return _on_pre_llm_call(session_id, user_message, platform, turn_id, program)
+    except Exception:  # noqa: BLE001 -- this hook cannot block a turn: hold the session instead
+        UNJUDGED.add(session_id)
+        return None
+
+
+def _on_pre_llm_call(session_id, user_message, platform, turn_id, program):
+    typed = isinstance(platform, str) and platform in TYPED_PLATFORMS
     # Hermes lets this hook fail open (only pre_tool_call fails closed), so text that is not the
     # user's is unjudged until the guard has judged it: a hook that dies here leaves it so (H1.5).
     was_unjudged = session_id in UNJUDGED
     if not typed:
         UNJUDGED.add(session_id)
-    text = user_message if isinstance(user_message, str) else json.dumps(user_message, default=str)
-    # One budget for the whole callback, under Hermes's limit for it (hook_budget): the guard's
-    # answer first, the next message with what is left.
+    # One budget for the whole callback, under Hermes's limit for it (hook_budget): the calls left
+    # with no report first, then the guard's answer, then the next message with what is left.
     started = time.monotonic()
     budget = hook_budget()
+    end_orphans(session_id, program, started, budget)
+    # A message that cannot be written out is a turn the guard cannot judge: the hook fails open
+    # with the session held (on_pre_llm_call).
+    text = user_message if isinstance(user_message, str) else json.dumps(user_message, default=str)
     try:
         judged = run_guard(["guard", "prompt"], dict(
             _base(session_id, "UserPromptSubmit"),
@@ -472,8 +624,8 @@ def on_pre_llm_call(session_id="", user_message=None, platform="", turn_id="", p
     if left < MIN_LISTEN_SECONDS:
         # No time left to hand the turn a message: it waits for the next turn.
         return {"context": told} if told else None
-    got = run_guard(["listen", "--once"], dict(_base(session_id, "Stop"), can_show_user=False), program,
-                    timeout=left)
+    got = run_guard(["listen", "--once"], dict(_base(session_id, "Stop"), can_show_user=False,
+                                               user_typed=typed), program, timeout=left)
     if got.get("status") == 2 and got["stderr"].strip():
         context = got["stderr"].strip()
         ids = _envelope_ids(context)

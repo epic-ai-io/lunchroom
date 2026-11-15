@@ -2,7 +2,7 @@
 # Proof 2, inside the container: Claude Code (Anthropic's apt package claude-code, installed at
 # $OLD) runs as a real session; the package is then upgraded with Anthropic's documented command
 # (`apt update && apt upgrade claude-code`) while the session runs. dpkg replaces /usr/bin/claude,
-# so the running session's /proc/<pid>/exe reads "/usr/bin/claude (deleted)". Lunchroom 1.1.0 must
+# so the running session's /proc/<pid>/exe reads "/usr/bin/claude (deleted)". Lunchroom 1.1 must
 # then give the reason "program replaced while running", not "release cannot be read".
 
 set -u
@@ -24,7 +24,8 @@ make_user
 export MOCK_API=1
 seed_claude
 install_lunchroom
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install claude-code finished" \
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install claude-code finished" \
     || { fail "lunchroom install claude-code did not finish"; finish; }
 SESSION_FLAGS=(--permission-mode default --allowedTools Bash)
 start_session before /usr/bin/claude "${SESSION_FLAGS[@]}"
@@ -79,7 +80,7 @@ case "$EXE1" in
 esac
 [ "$(/usr/bin/claude --version | head -1)" != "" ] && measured "the program now on disk says: $(/usr/bin/claude --version | head -1)"
 
-heading "3. what Lunchroom 1.1.0 says now"
+heading "3. what Lunchroom 1.1 says now"
 status > "$RUN/status.out"
 sed 's/^/    /' "$RUN/status.out"
 grep "^before	" "$RUN/status.out" | grep -q UNGUARDED \

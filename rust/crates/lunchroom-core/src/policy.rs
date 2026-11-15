@@ -37,6 +37,20 @@ impl ProtectedKinds {
     pub const fn contains(self, kind: ProtectedKind) -> bool {
         self.0 & (1 << kind as u16) != 0
     }
+
+    /// Every kind in either set.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// A PROTECTED kind is among them: any kind but the reply (PROTECTED in the Strict mode only,
+    /// decided by [`decide_call`]) and GATED, which is not PROTECTED (P1.4).
+    #[must_use]
+    pub const fn protected(self) -> bool {
+        let not_protected = (1 << ProtectedKind::Reply as u16) | (1 << ProtectedKind::Gated as u16);
+        self.0 & !not_protected != 0
+    }
 }
 
 /// A classified call: the one class shown for it, and every PROTECTED kind it raised. The class
@@ -71,6 +85,11 @@ impl Call {
             CallClass::Protected(_) if self.kinds.contains(ProtectedKind::GuardConfig) => {
                 CallClass::Protected(ProtectedKind::GuardConfig)
             }
+            // P1.1: a reply is shown as the kind the hold mode decides on, so a caller holding
+            // only a class cannot lose the Strict mode's rule.
+            CallClass::InSlip if self.kinds.contains(ProtectedKind::Reply) => {
+                CallClass::Protected(ProtectedKind::Reply)
+            }
             class => class,
         }
     }
@@ -98,6 +117,15 @@ pub enum ProtectedKind {
     UnknownTool,
     /// Text sent to another agent's session outside `lunchroom send` (Claude Code's `SendMessage`).
     OtherSession,
+    /// The reply, a command that is exactly one `lunchroom send` (P1.1). It is PROTECTED in the
+    /// Strict hold mode only (P1.4 item 4): [`decide_call`] reads the hold mode, so this kind
+    /// alone never makes a call go to the user in the Balanced or Relaxed mode.
+    Reply,
+    /// A merge, a deploy or a migration, or a call that runs something Lunchroom cannot read to
+    /// the end (P1.4). It is GATED, not PROTECTED: it is only ever a bit in [`ProtectedKinds`] (the
+    /// classifier never shows it as the class of a call), kept with the kinds so that one call can
+    /// be both (a `git push origin main`) and the policy reads every kind it raised.
+    Gated,
 }
 
 impl ProtectedKind {
@@ -200,8 +228,30 @@ pub const fn decide_call(call: Call, s: Situation) -> Decision {
         // P1.6 Relaxed: a HELD agent gets the same, except writing the guard itself (R3.1). This
         // follows every kind the call raised, not only the one shown for it.
         _ if call.kinds.contains(ProtectedKind::GuardConfig) => true,
+        // P1.4, P1.6, R2.4: a call that is both GATED and PROTECTED goes to the user in every hold
+        // mode and under every YOLO. A command the guard cannot parse is PROTECTED (F1.2) and, since
+        // Lunchroom cannot read it to the end, also GATED.
+        _ if call.kinds.contains(ProtectedKind::Unparsed)
+            || (call.kinds.contains(ProtectedKind::Gated) && call.kinds.protected()) =>
+        {
+            true
+        }
+        // P1.4, R2.4: a GATED call goes to the user in every hold mode, the Relaxed one included,
+        // unless a `lunchroom yolo` covers the agent; the harness's own YOLO alone does not.
+        _ if call.kinds.contains(ProtectedKind::Gated)
+            && !matches!(s.yolo, YoloSource::Lunchroom) =>
+        {
+            true
+        }
         _ if matches!(s.mode, HoldMode::Relaxed) => return Decision::Run,
-        CallClass::InSlip => false,
+        // P1.1, P1.4 item 4, R2.4: in the Strict hold mode the reply is PROTECTED, so it goes to
+        // the user also under a `lunchroom yolo`, whatever else the call is.
+        _ if call.kinds.contains(ProtectedKind::Reply) && matches!(s.mode, HoldMode::Strict) => {
+            true
+        }
+        // P1.1: the reply alone is PROTECTED in the Strict hold mode only (decided above); in the
+        // Balanced mode it is inside the slip.
+        CallClass::InSlip | CallClass::Protected(ProtectedKind::Reply) => false,
         // Strict (P1.3, R2.4): under a lunchroom yolo the user set, ordinary calls run; under the
         // harness's own YOLO alone they still go to the user. Balanced: they run (P1.6).
         CallClass::Ordinary => {
@@ -328,7 +378,9 @@ mod tests {
                         // Without the guard's configuration the mode still decides.
                         let plain = Call::of(CallClass::Protected(shown));
                         assert_eq!(plain.folded(), CallClass::Protected(shown));
-                        if matches!(mode, HoldMode::Relaxed) {
+                        // P1.6: a command the guard cannot parse is GATED too (P1.4), which goes to
+                        // the user in the Relaxed mode as well; any other PROTECTED kind runs.
+                        if matches!(mode, HoldMode::Relaxed) && shown != Unparsed {
                             assert_eq!(decide_call(plain, held), Decision::Run, "{shown:?}");
                         }
                     }
@@ -460,5 +512,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    const fn at(held: bool, yolo: YoloSource, channel: bool, mode: HoldMode) -> Situation {
+        Situation {
+            held,
+            yolo,
+            approval_channel: channel,
+            mode,
+        }
+    }
+
+    const fn reply() -> Call {
+        Call {
+            class: CallClass::InSlip,
+            kinds: ProtectedKinds::NONE.with(ProtectedKind::Reply),
+        }
+    }
+
+    // §6::8, §6::9, §6::35 — the reply is inside the slip in the Balanced and Relaxed
+    // hold modes, and PROTECTED in the Strict hold mode, under every YOLO.
+    #[test]
+    fn p1_1_the_reply_is_protected_in_the_strict_mode_only() {
+        for yolo in [Off, HarnessOnly, Lunchroom] {
+            assert_eq!(
+                decide_call(reply(), at(true, yolo, true, HoldMode::Strict)),
+                Decision::AskUser,
+                "Strict {yolo:?}"
+            );
+            // The class a caller holding only a class decides on is the same.
+            assert_eq!(
+                decide(reply().folded(), at(true, yolo, true, HoldMode::Strict)),
+                Decision::AskUser,
+                "Strict folded {yolo:?}"
+            );
+            for mode in [HoldMode::Balanced, HoldMode::Relaxed] {
+                assert_eq!(
+                    decide_call(reply(), at(true, yolo, true, mode)),
+                    Decision::Run,
+                    "{mode:?} {yolo:?}"
+                );
+                assert_eq!(
+                    decide(reply().folded(), at(true, yolo, true, mode)),
+                    Decision::Run,
+                    "{mode:?} folded {yolo:?}"
+                );
+            }
+        }
+    }
+
+    // §6::35 — a reply of an agent that is not HELD runs in every mode.
+    #[test]
+    fn p1_1_the_reply_of_an_agent_that_is_not_held_runs() {
+        for mode in [HoldMode::Strict, HoldMode::Balanced, HoldMode::Relaxed] {
+            assert_eq!(
+                decide_call(reply(), at(false, Off, true, mode)),
+                Decision::Run
+            );
+        }
+    }
+
+    // §6::57 — a Codex agent has no approval channel: in the Strict hold mode its reply
+    // is DENIED (and kept for `lunchroom approve`, which the hook does); in the Balanced and
+    // Relaxed modes it runs.
+    #[test]
+    fn p1_1_a_codex_reply_in_strict_is_denied_for_approve() {
+        for yolo in [Off, HarnessOnly, Lunchroom] {
+            assert_eq!(
+                decide_call(reply(), at(true, yolo, false, HoldMode::Strict)),
+                Decision::Deny(DenyReason::NoApprovalChannel),
+                "{yolo:?}"
+            );
+        }
+        for mode in [HoldMode::Balanced, HoldMode::Relaxed] {
+            assert_eq!(
+                decide_call(reply(), at(true, Off, false, mode)),
+                Decision::Run
+            );
+        }
+    }
+
+    // A reply that is also another PROTECTED kind (a reply naming a credential) follows that kind
+    // in the Balanced mode, and the Strict rule still holds with it.
+    #[test]
+    fn p1_1_a_reply_that_is_also_another_kind_follows_that_kind() {
+        let both = Call {
+            class: CallClass::Protected(ProtectedKind::Credential),
+            kinds: ProtectedKinds::NONE
+                .with(ProtectedKind::Reply)
+                .with(ProtectedKind::Credential),
+        };
+        for (mode, want) in [
+            (HoldMode::Strict, Decision::AskUser),
+            (HoldMode::Balanced, Decision::AskUser),
+            (HoldMode::Relaxed, Decision::Run),
+        ] {
+            assert_eq!(decide_call(both, at(true, Lunchroom, true, mode)), want);
+        }
+    }
+
+    // The kinds of two calls join, and the join holds both.
+    #[test]
+    fn protected_kinds_union_holds_both() {
+        let a = ProtectedKinds::NONE.with(ProtectedKind::Delete);
+        let b = ProtectedKinds::NONE.with(ProtectedKind::Reply);
+        let u = a.union(b);
+        assert!(u.contains(ProtectedKind::Delete) && u.contains(ProtectedKind::Reply));
+        assert!(!u.contains(ProtectedKind::Network));
     }
 }

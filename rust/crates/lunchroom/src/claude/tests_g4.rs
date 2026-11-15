@@ -131,10 +131,11 @@ fn the_permission_prompt_text_leads_with_the_whole_answer() {
             me: &me,
             tool: "Bash",
             tool_input: &input,
+            judged_input: &input,
             dir: "/work",
             call,
         };
-        let Ok(HookOut::Ask(text)) = ask_user(&store, &judged, "t1") else {
+        let Ok(HookOut::Ask(text)) = ask_user(&store, &judged, "t1", &env_in(&dir, 0)) else {
             unreachable!("no permission prompt");
         };
         let lines: Vec<&str> = text.lines().collect();
@@ -751,9 +752,17 @@ fn waiting_notices_are_taken_per_channel() {
     }
 }
 
-/// The ids a read of the transcript at `path` found, reading at most `cap` bytes.
+/// The ids of the messages Lunchroom has a record of, in these tests.
+fn known_ids() -> std::collections::BTreeSet<String> {
+    (1..=9).map(|n| format!("lr-{n:08}")).collect()
+}
+
+/// The ids a read of the transcript at `path` found, from its start, reading at most `cap` bytes.
 fn transcript_ids(path: &Path, cap: u64) -> Vec<String> {
-    read_transcript(path, cap, TRANSCRIPT_IDS).ids
+    read_transcript(path, 0, cap, &known_ids())
+        .ids
+        .into_iter()
+        .collect()
 }
 
 fn write_transcript(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
@@ -799,11 +808,11 @@ fn a_transcript_is_searched_in_blocks_up_to_a_cap() {
     );
 }
 
-// G4-13: the transcript is searched once. A hook marks it searched before the search runs (the
-// search is outside the store's lock), so a search the deadline cuts off is not repeated by every
-// later call; and what the search finds holds the session.
+// G4-13, T1.7 (`§5::32`, `§5::34`, `§5::36`): the transcript is read from where the last
+// read ended. The read is outside the store's lock; what it finds holds the session once the
+// transcript is read to its end; a hook after that reads nothing.
 #[test]
-fn the_transcript_is_searched_once_and_outside_the_lock() {
+fn the_transcript_is_read_from_its_kept_offset_and_outside_the_lock() {
     let dir = scratch("once");
     let Ok(store) = Store::<Mail>::open(&dir.join("store")) else {
         unreachable!("the store could not be opened");
@@ -835,13 +844,27 @@ fn the_transcript_is_searched_once_and_outside_the_lock() {
     ) else {
         unreachable!("the input did not parse");
     };
-    // The first hook is told to search; the second is not, however the first one ended.
-    let first = store.update(|m| observe(m, &me, &input, None, &dir));
-    let second = store.update(|m| observe(m, &me, &input, None, &dir));
-    assert_eq!((first.ok(), second.ok()), (Some(true), Some(false)));
-    assert_eq!(store.update(|m| m.is_held(&me)).ok(), Some(false));
-    assert_eq!(search_transcript(&store, &me, &input), Ok(true));
+    let len = transcript_len(&input);
+    assert!(len > 0);
+    // The first hook is due a read from the start and holds the session at once (the transcript is
+    // not read to its end); the read ends the hold and holds it by the message the transcript names.
+    let first = store.update(|m| observe(m, &me, &input, None, &dir, len));
+    let Ok(Some(due)) = first else {
+        unreachable!("no read was due at the first hook");
+    };
+    assert_eq!(due.from, 0);
     assert_eq!(store.update(|m| m.is_held(&me)).ok(), Some(true));
+    assert_eq!(search_transcript(&store, &me, &due), Ok(true));
+    let held_by = store.read().map(|m| {
+        m.holding(&me)
+            .iter()
+            .map(|h| h.message.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(held_by.ok(), Some(vec![id.clone()]));
+    // After it, no read is due.
+    let second = store.update(|m| observe(m, &me, &input, None, &dir, len));
+    assert!(matches!(second, Ok(None)));
     // A transcript that names no message of Lunchroom's holds nothing.
     let quiet = write_transcript(
         &dir,
@@ -854,7 +877,12 @@ fn the_transcript_is_searched_once_and_outside_the_lock() {
     ) else {
         unreachable!("the input did not parse");
     };
-    assert_eq!(search_transcript(&store, &other, &quiet_input), Ok(false));
+    let quiet_len = transcript_len(&quiet_input);
+    let due = store.update(|m| observe(m, &other, &quiet_input, None, &dir, quiet_len));
+    let Ok(Some(due)) = due else {
+        unreachable!("no read was due");
+    };
+    assert_eq!(search_transcript(&store, &other, &due), Ok(false));
     assert_eq!(store.update(|m| m.is_held(&other)).ok(), Some(false));
 }
 
@@ -1067,46 +1095,57 @@ fn a_denied_path_way_names_the_path_the_call_wrote() {
     }
 }
 
-// DV-18 (T1.7): a read of the transcript says whether it reached the file's end. It did not when
-// the size cap stopped it before the end (a file exactly the cap long was read whole), when the id
-// limit stopped it, or when the file could not be read to the end. A missing or empty file has no
-// text that was left unread.
+// DV-18 (T1.7): a read of the transcript says whether it reached the file's end, and where it
+// reached. It did not reach the end when the size cap stopped it before it (a file exactly the cap
+// long was read whole). A missing or empty file has no text that was left unread. A read that did
+// not reach the end stops where no label it cut begins, so the next read, from there, finds it.
 #[test]
-fn a_transcript_read_says_whether_it_reached_the_end() {
+fn a_transcript_read_says_whether_it_reached_the_end_and_where() {
     let dir = scratch("whole");
     let cap = 5000_u64;
+    let known = known_ids();
     let at_cap = write_transcript(&dir, "at-cap.jsonl", &vec![b'x'; 5000]);
-    assert!(read_transcript(&at_cap, cap, TRANSCRIPT_IDS).whole);
+    let read = read_transcript(&at_cap, 0, cap, &known);
+    assert!(read.at_end && read.reached == 5000);
     let past_cap = write_transcript(&dir, "past-cap.jsonl", &vec![b'x'; 5001]);
-    assert!(!read_transcript(&past_cap, cap, TRANSCRIPT_IDS).whole);
-    assert!(read_transcript(&past_cap, 6000, TRANSCRIPT_IDS).whole);
+    let read = read_transcript(&past_cap, 0, cap, &known);
+    assert!(!read.at_end && read.reached == 5000);
+    assert!(read_transcript(&past_cap, 0, 6000, &known).at_end);
+    // From the offset the first read reached, the rest is read to the end.
+    let rest = read_transcript(&past_cap, 5000, cap, &known);
+    assert!(rest.at_end && rest.reached == 5001 && rest.from == 5000);
     let empty = write_transcript(&dir, "empty.jsonl", b"");
-    assert!(read_transcript(&empty, cap, TRANSCRIPT_IDS).whole);
-    let missing = read_transcript(&dir.join("missing.jsonl"), cap, TRANSCRIPT_IDS);
-    assert!(missing.whole && missing.ids.is_empty());
-    // The id limit: two ids with a limit of two stop the read (the rest, if any, is unread).
-    let three = write_transcript(
-        &dir,
-        "three.jsonl",
-        b"[lr:lr-00000001] [lr:lr-00000002] [lr:lr-00000003]",
+    assert!(read_transcript(&empty, 0, cap, &known).at_end);
+    let missing = read_transcript(&dir.join("missing.jsonl"), 0, cap, &known);
+    assert!(missing.at_end && missing.ids.is_empty());
+    // A label cut by the cap: the read stops at the label's `[`, and the next read finds it whole.
+    let mut cut = vec![b'x'; 4990];
+    cut.extend_from_slice(b"[lr:lr-00000003] and more text after it");
+    let cut = write_transcript(&dir, "cut.jsonl", &cut);
+    let first = read_transcript(&cut, 0, cap, &known);
+    assert!(!first.at_end && first.ids.is_empty());
+    assert_eq!(first.reached, 4990, "stopped where the cut label begins");
+    let second = read_transcript(&cut, first.reached, cap, &known);
+    assert!(second.at_end);
+    assert_eq!(
+        second.ids.into_iter().collect::<Vec<_>>(),
+        vec!["lr-00000003".to_owned()]
     );
-    let limited = read_transcript(&three, cap, 2);
-    assert_eq!(limited.ids.len(), 2);
-    assert!(!limited.whole);
-    let all = read_transcript(&three, cap, 3);
-    assert_eq!(all.ids.len(), 3);
-    assert!(
-        !all.whole,
-        "a read stopped by the limit is not known to be whole"
+    // An id Lunchroom has no message for is not kept.
+    let unknown = write_transcript(&dir, "unknown.jsonl", b"[lr:lr-12345678] [lr:lr-00000001]");
+    assert_eq!(
+        read_transcript(&unknown, 0, cap, &known)
+            .ids
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["lr-00000001".to_owned()]
     );
-    let fewer = read_transcript(&three, cap, 4);
-    assert!(fewer.whole && fewer.ids.len() == 3);
 }
 
-// DV-18 (T1.7): a transcript the search could not read to the end holds the session as a tool
-// output the guard did not judge does ("unjudged", source "transcript (not read to the end)"), even
-// when it names no message; the user typing clears the hold; a transcript read whole that names
-// none holds nothing; and the search is not repeated (it is marked done by `observe`).
+// DV-18, T1.7 (`§5::38`-`§5::40`): a transcript not read to its end holds the session as a
+// tool output the guard did not judge does ("unjudged", source "transcript (not read to the end)"),
+// even when it names no message; the read that reaches the end ends that hold; the user typing ends
+// it too, and it does not come back at the next hook.
 #[test]
 fn a_transcript_not_read_to_the_end_holds_the_session_until_the_user_types() {
     let dir = scratch("unfinished");
@@ -1114,25 +1153,23 @@ fn a_transcript_not_read_to_the_end_holds_the_session_until_the_user_types() {
         unreachable!("the store could not be opened");
     };
     let me = Identity::new(Harness::ClaudeCode, "big");
-    assert!(store.update(|m| m.observe(&me)).is_ok());
     let transcript = write_transcript(&dir, "big.jsonl", &vec![b'x'; 6000]);
     let Ok(input) = HookInput::parse(
         &json!({ "session_id": "big", "cwd": "/w", "transcript_path": transcript }).to_string(),
     ) else {
         unreachable!("the input did not parse");
     };
-    // Read whole: nothing named, nothing held.
-    assert_eq!(
-        search_transcript_to(&store, &me, &input, 6000, TRANSCRIPT_IDS),
-        Ok(false)
-    );
-    assert_eq!(store.update(|m| m.is_held(&me)).ok(), Some(false));
-    // Cut off by the cap: HELD, by the source the spec names.
-    assert_eq!(
-        search_transcript_to(&store, &me, &input, 5999, TRANSCRIPT_IDS),
-        Ok(true)
-    );
-    assert_eq!(store.update(|m| m.is_held(&me)).ok(), Some(true));
+    let due = |store: &Store<Mail>| {
+        store
+            .update(|m| observe(m, &me, &input, None, &dir, 6000))
+            .ok()
+            .flatten()
+    };
+    let Some(first) = due(&store) else {
+        unreachable!("no read was due");
+    };
+    // Cut off by the cap: HELD, by the source the spec names, and the offset is kept.
+    assert_eq!(search_transcript_to(&store, &me, &first, 5999), Ok(true));
     let marks = store.read().map(|m| {
         m.holding(&me)
             .iter()
@@ -1146,9 +1183,39 @@ fn a_transcript_not_read_to_the_end_holds_the_session_until_the_user_types() {
             "unjudged:transcript (not read to the end)".to_owned()
         )])
     );
-    // The user typing clears it.
-    assert!(store.update(|m| m.user_typed(&me)).is_ok());
+    // The next hook goes on from the offset, and the read that reaches the end ends the hold.
+    let Some(second) = due(&store) else {
+        unreachable!("the transcript is not read to its end, so a read is due");
+    };
+    assert_eq!(second.from, 5999);
+    assert_eq!(search_transcript_to(&store, &me, &second, 5999), Ok(false));
     assert_eq!(store.update(|m| m.is_held(&me)).ok(), Some(false));
+    assert!(due(&store).is_none());
+    // A transcript the user typed over before its end is read: typing clears the hold, and the
+    // next hook does not hold the session again for the text still unread.
+    let again = Identity::new(Harness::ClaudeCode, "typed");
+    let Ok(typed_input) = HookInput::parse(
+        &json!({ "session_id": "typed", "cwd": "/w", "transcript_path": transcript }).to_string(),
+    ) else {
+        unreachable!("the input did not parse");
+    };
+    let typed_due = |store: &Store<Mail>| {
+        store
+            .update(|m| observe(m, &again, &typed_input, None, &dir, 6000))
+            .ok()
+            .flatten()
+    };
+    let Some(first) = typed_due(&store) else {
+        unreachable!("no read was due");
+    };
+    assert_eq!(search_transcript_to(&store, &again, &first, 100), Ok(true));
+    assert!(store.update(|m| m.user_typed(&again)).is_ok());
+    assert_eq!(store.update(|m| m.is_held(&again)).ok(), Some(false));
+    let Some(next) = typed_due(&store) else {
+        unreachable!("the read goes on");
+    };
+    assert!(next.from > 0);
+    assert_eq!(store.update(|m| m.is_held(&again)).ok(), Some(false));
 }
 
 // DV-18 (T1.7, H1.5): the guard's deadline passed while it was reading the transcript. The hook

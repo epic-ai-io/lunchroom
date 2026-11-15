@@ -1,7 +1,7 @@
 #!/bin/bash
-# Proof 3 (mixed): the public 1.0.1 release program and the 1.1.0 program on one store.
+# Proof 3 (mixed): the public 1.0.1 release program and the 1.1 program on one store.
 #
-#   LUNCHROOM_102=<static program> rust/tests/realworld/mixed/prove.sh | tee mixed.txt
+#   LUNCHROOM_11=<static program> rust/tests/realworld/mixed/prove.sh | tee mixed.txt
 #
 # Downloads lunchroom-v1.0.1-x86_64-unknown-linux-musl.tar.gz and SHA256SUMS from the GitHub
 # release epic-ai-io/lunchroom v1.0.1 with `gh release download` (needs gh and its login), checks

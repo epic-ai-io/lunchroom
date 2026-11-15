@@ -11,16 +11,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use lunchroom_core::approvals::{Request, TellKind};
 use lunchroom_core::identity::Identity;
 use lunchroom_core::mail::Mail;
 use lunchroom_core::store::Store;
 
 use crate::checks::clock_now;
 use crate::codex::{
-    Again, CHILD_ENV, Delivered, FailedAs, UNREADABLE_ENV, failed, fits_one_argument, guarded,
-    recipient_env, recipient_program, settled, update,
+    Again, CHILD_ENV, Delivered, FailedAs, UNREADABLE_ENV, failed, guarded, recipient_env,
+    recipient_program, settled, update,
 };
-use crate::delivery::envelope;
+use crate::delivery::{Handed, handover_line};
 use crate::evidence::evidence;
 use crate::home::Env;
 
@@ -159,7 +160,7 @@ fn hand_over(
         m.handed_over(&message.id);
         Some((
             message.id.clone(),
-            envelope(&message, m.hold_mode()),
+            handover_line(&message.id, Handed::Message),
             record.process,
             record.entry,
         ))
@@ -167,15 +168,6 @@ fn hand_over(
     let Some((id, text, process, entry)) = next else {
         return Ok(Delivered::Nothing);
     };
-    // The envelope is one command argument: one the system would refuse is a failed attempt.
-    if !fits_one_argument(&text) {
-        return failed(
-            store,
-            id,
-            "the envelope does not fit one command argument".to_owned(),
-            clock_now(env),
-        );
-    }
     // A recipient's `openclaw` program that cannot be established says nothing about the
     // recipient: the message stays QUEUED, uncounted and not handed over (D1.3).
     let (program, bin) = match openclaw_command(&process, entry.as_deref()) {
@@ -246,6 +238,76 @@ fn hand_over(
             Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(200)),
             // Still running: the turn goes on without Lunchroom waiting for it (D1.3).
             Ok(None) | Err(_) => return settled(store, id),
+        }
+    }
+}
+
+/// Tells the OpenClaw session of `request` of the user's decision `id` (A1.2, §17.10) through the
+/// hand-over of D1.1 (`openclaw agent`): one line naming only the id, which the agent reads with
+/// `lunchroom read <id>`, so the call's text never stands on a command line. The line adds no hold
+/// and clears none: the plugin's `before_agent_run` hands it to the guard's prompt hook, which knows
+/// the id of a decision told to the session. Like a message's hand-over it does not wait for the
+/// turn to end: an `openclaw agent` that fails to start, or exits with an error, is reported.
+///
+/// # Errors
+/// Why the session could not be told.
+pub fn tell(
+    env: &Env,
+    store: &Store<Mail>,
+    request: &Request,
+    id: &str,
+    kind: TellKind,
+) -> Result<(), String> {
+    let text = handover_line(
+        id,
+        match kind {
+            TellKind::Approved => Handed::Approved,
+            TellKind::Refused => Handed::Refused,
+        },
+    );
+    let record = store
+        .read()
+        .map_err(|e| e.to_string())?
+        .session(&request.session)
+        .cloned()
+        .ok_or("the session is not recorded")?;
+    let (program, bin) = openclaw_command(&record.process, record.entry.as_deref())?;
+    let variables = gateway_env(&record.process).ok_or(UNREADABLE_ENV)?;
+    let mut command = Command::new(&program);
+    command
+        .args(bin)
+        .args([
+            "agent",
+            "--session-key",
+            &request.session.session,
+            "--message",
+            &text,
+        ])
+        .env_clear()
+        .env("HOME", &env.home)
+        .envs(variables)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    lunchroom_core::setgid::drop_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("openclaw agent could not start: {e}"))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "openclaw agent exited {}",
+                    status.code().unwrap_or(-1)
+                ));
+            }
+            Ok(None) if start.elapsed() < START_CHECK => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // Still running: the turn goes on without Lunchroom waiting for it.
+            Ok(None) | Err(_) => return Ok(()),
         }
     }
 }

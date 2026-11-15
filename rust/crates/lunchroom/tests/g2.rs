@@ -106,9 +106,17 @@ fn status_keeps_the_fields_it_does_not_know() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let raw: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap_or_default())
         .unwrap_or(Value::Null);
-    assert_eq!(raw["future_top"], json!({ "a": 1 }));
-    assert_eq!(raw["messages"][id.as_str()]["future_message"], "kept");
+    // D1.2: the fields this program does not know move to the second file, with the fields 1.1
+    // adds, and the state file holds what 1.0.1 knows and the layout number.
+    assert_eq!(raw.get("future_top"), None);
+    assert_eq!(raw["messages"][id.as_str()].get("future_message"), None);
     assert_eq!(raw["schema"], json!(2));
+    let side: Value = serde_json::from_str(
+        &std::fs::read_to_string(file.with_file_name("state.side.json")).unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
+    assert_eq!(side["top"]["future_top"], json!({ "a": 1 }));
+    assert_eq!(side["messages"][id.as_str()]["future_message"], "kept");
 }
 
 // G2-4: a message to a Claude Code session that was offered and never confirmed, with no listener

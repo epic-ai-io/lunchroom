@@ -203,7 +203,12 @@ fn the_delivered_age_is_counted_to_the_confirmation() {
     assert!(m.attempt_failed(&id, "codex queue exited 1", 10).is_some());
     let _ = m.take_user_notices();
     assert_eq!(m.confirm_at(&codex("x1"), &id, 4000), Confirmation::Show);
-    let told = m.take_user_notices();
+    // (§16 item 5: the line "codex is HELD." has no message id; the DELIVERED notice does.)
+    let told: Vec<Notice> = m
+        .take_user_notices()
+        .into_iter()
+        .filter(|n| !n.message.is_empty())
+        .collect();
     assert_eq!(told.len(), 1, "{told:?}");
     assert_eq!(
         told[0].text,
@@ -437,8 +442,15 @@ fn the_store_file_keeps_unknown_fields_and_stamps_the_schema() {
     assert!(store.update(|m| m.observe(&claude("c9"))).is_ok());
     let raw: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap_or_default())
         .unwrap_or(Value::Null);
-    assert_eq!(raw["future"], json!(7));
+    // D1.2: a field this program does not know is kept in the second file, not in the state file,
+    // which holds the fields 1.0.1 knows and the layout number.
+    assert_eq!(raw.get("future"), None);
     assert_eq!(raw["schema"], json!(SCHEMA));
+    let side: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("state.side.json")).unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
+    assert_eq!(side["top"]["future"], json!(7));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -610,4 +622,38 @@ fn a_check_in_one_senders_process_offers_again_only_that_senders_message() {
     assert_eq!(m.present_again_from(&x1, Some(&other), due), None);
     assert_eq!(m.message(&first).map(|d| d.failed_attempts), Some(1));
     assert_eq!(m.message(&second).map(|d| d.failed_attempts), Some(0));
+}
+
+// D1.2 (a 1.0.1 program still running loses none of the fields 1.1 adds, and every program keeps
+// each field it does not know): the fields the released 1.0.1 writes at the top of the store file
+// stay in the store file at a 1.1 write; only the fields 1.0.1 has no name for go to the second
+// file. 2026-11-14 real-world kit `mixed`: `codex_setting`, `codex_setting_open` and `titles`, all
+// fields of released 1.0.1 (tag v1.0.1, mail.rs lines 240, 243, 293), were moved to the second
+// file, so a 1.0.1 still running lost them. Fails before the change: the three were in `top`.
+#[test]
+fn the_fields_released_1_0_1_writes_stay_in_the_store_file() {
+    let mut main = json!({
+        "schema": 2,
+        "codex_setting": ["/home/u/.codex/config.toml", 1],
+        "codex_setting_open": ["codex:s1"],
+        "titles": {"claude-code:s1": "build"},
+        "a_field_1_0_1_does_not_know": 1
+    });
+    let side = super::side::split(&mut main);
+    for kept in ["codex_setting", "codex_setting_open", "titles"] {
+        assert!(
+            main.get(kept).is_some(),
+            "{kept} left the store file: {main} / {side}"
+        );
+        assert!(
+            side.get("top").and_then(|t| t.get(kept)).is_none(),
+            "{kept} is in the second file: {side}"
+        );
+    }
+    assert!(main.get("a_field_1_0_1_does_not_know").is_none(), "{main}");
+    assert_eq!(
+        side["top"]["a_field_1_0_1_does_not_know"],
+        json!(1),
+        "{side}"
+    );
 }

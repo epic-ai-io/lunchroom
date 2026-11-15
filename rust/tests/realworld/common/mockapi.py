@@ -7,6 +7,8 @@ requests, with no model:
 
 - a prompt holding `DENYTEST <label>` is answered with a Bash tool call `codex queue other hi`;
 - a prompt holding `CONTROLTEST <label>` is answered with a Bash tool call `ls /opt/proof`;
+- a prompt holding `FILETEST <label>` is answered with a Bash tool call whose command is the exact
+  text of /run/sess/cmd-<label>.txt (a proof writes the file first);
 - a request whose last message is the tool's result is answered with a short text, and the
   result Claude Code gave back (the output of the command, or the hook's refusal) is appended as
   one JSON line to $MOCK_LOG (default /run/sess/mock.log): {"label": ..., "tool": ..., "result": ...};
@@ -23,7 +25,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = os.environ.get("MOCK_LOG", "/run/sess/mock.log")
-MARKER = re.compile(r"\b(DENYTEST|CONTROLTEST|VARTEST)\s+(\w+)")
+MARKER = re.compile(r"\b(DENYTEST|CONTROLTEST|VARTEST|FILETEST)\s+(\w+)")
 LOCK = threading.Lock()
 COUNTER = [0]
 
@@ -65,6 +67,13 @@ def plan(body):
         found = MARKER.search(text_of(content))
         if found:
             command = {"DENYTEST": "codex queue other hi", "VARTEST": "echo variant-ran"}.get(found.group(1), "ls /opt/proof")
+            if found.group(1) == "FILETEST":
+                # The Bash command is the exact text of /run/sess/cmd-<label>.txt, written by the proof.
+                try:
+                    with open("/run/sess/cmd-%s.txt" % found.group(2)) as f:
+                        command = f.read()
+                except OSError:
+                    command = "echo no-command-file"
             return ("tool", command), None
     return ("text", "ok"), None
 

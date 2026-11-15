@@ -44,6 +44,35 @@ impl Approval {
 /// How many calls waiting for the user's approval are kept; older ones are dropped.
 pub const REQUESTS_KEPT: usize = 20;
 
+/// `dir` with its `.` and empty parts dropped and each `..` taken against the part before it, so
+/// two spellings of one folder (`/work/a`, `/work/b/../a/`) are one call's folder (§17.10, A2.1). A
+/// `..` at the top of an absolute path stays at the top; a relative path keeps the `..` it cannot
+/// take. Symbolic links are not followed: the guard judges the folder as the hook named it.
+#[must_use]
+pub fn normal_dir(dir: &str) -> String {
+    let absolute = dir.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in dir.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|p| *p != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
 /// A call the guard DENIED because nobody could be asked in that session (A1.2), kept so the user
 /// can approve that exact call with `lunchroom approve` before the agent tries it again (A1.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +92,279 @@ pub struct Request {
     pub at: u64,
 }
 
+/// The store's own name for a waiting call: the key under which it keeps one request, so no two
+/// waiting calls have the same one (the session, the tool, the folder and the SHA-256 of the
+/// input; the second the call was made in is not part of it).
+#[must_use]
+pub fn call_key(request: &Request) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        request.session.key(),
+        request.tool,
+        request.cwd,
+        input_hash(&request.input)
+    )
+}
+
+/// The SHA-256 of what the user is shown of a waiting call: the agent, the tool, the folder, the
+/// rule and the input. A waiting call that is shown differently has another one.
+#[must_use]
+pub fn call_shown_hash(request: &Request) -> String {
+    input_hash(&serde_json::json!([
+        request.agent,
+        request.tool,
+        request.cwd,
+        request.rule,
+        request.input
+    ]))
+}
+
+/// How many lines telling an agent of an approval or a refusal are kept.
+pub const TELLS_KEPT: usize = 100;
+
+/// How long such a line is kept: a day.
+pub const TELL_SECS: u64 = 86_400;
+
+/// What the user decided about a waiting call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TellKind {
+    Approved,
+    Refused,
+}
+
+/// The line that tells an agent of the user's approval or refusal of one of its calls (A1.2,
+/// §17.10): what `lunchroom read <id>` prints for its id, never put on a command line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tell {
+    pub id: String,
+    pub session: Identity,
+    pub kind: TellKind,
+    /// The whole line: the decision, its id, the tool and the exact call.
+    pub line: String,
+    pub at: u64,
+    /// Waiting for a Hermes session's next turn, which takes it through the plugin's
+    /// `pre_llm_call` (A1.2); the other harnesses are handed an id-only line when it is made.
+    pub pending: bool,
+    /// Fields a later program wrote that this one does not know, carried through every read and
+    /// write (D1.2).
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+/// A call the user refused (§17.10): the same call tried again is DENIED until the user approves
+/// that exact call, or until the hold that carried it ends (no message of `holding` still holds the
+/// session). It never lapses by time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub session: Identity,
+    pub tool: String,
+    pub input_hash: String,
+    pub cwd: String,
+    pub at: u64,
+    pub id: String,
+    /// The ids of the messages that held the session when the user declined, sorted (A2.1). Empty
+    /// when none did: the decline then has no hold to end.
+    #[serde(default)]
+    pub holding: Vec<String>,
+    /// Fields a later program wrote that this one does not know, carried through every read and
+    /// write (D1.2).
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+/// The line telling an agent that the user `kind` its call `id` (A1.2, §17.10). Neither adds a hold
+/// nor clears one (A2.1). The tool and the input are the agent's own text, written out as the
+/// prompt showed them.
+#[must_use]
+pub fn tell_line(kind: TellKind, id: &str, tool: &str, input: &Value) -> String {
+    let what = match kind {
+        TellKind::Approved => format!(
+            "the user approved one call of yours with `lunchroom approve` ({id}). It is not another \
+             agent's message. You may run it again now, exactly as it was, once; you stay HELD."
+        ),
+        TellKind::Refused => format!(
+            "the user declined one call of yours ({id}). It is not another agent's message. The call \
+             stays DENIED: running it again is DENIED, and the reason says the user declined it."
+        ),
+    };
+    format!(
+        "Lunchroom: {what}\nTool: {}\nThe call's input:\n{}",
+        visible(tool),
+        shown(input),
+    )
+}
+
 impl Mail {
+    /// Keeps the line that tells `session` of the decision `id` (A1.2, §17.10); `pending` for a
+    /// session that takes it at its next turn. The oldest go past [`TELLS_KEPT`].
+    pub fn keep_tell(
+        &mut self,
+        id: &str,
+        session: &Identity,
+        kind: TellKind,
+        line: String,
+        now: u64,
+        pending: bool,
+    ) {
+        self.tells.retain(|t| t.id != id);
+        self.tells.push(Tell {
+            id: id.to_owned(),
+            session: session.clone(),
+            kind,
+            line,
+            at: now,
+            pending,
+            extra: std::collections::BTreeMap::new(),
+        });
+        // Past the bound the oldest line already read goes first: a line still waiting for a Hermes
+        // turn is dropped only when every line kept is waiting (A1.2: told at its next turn).
+        while self.tells.len() > TELLS_KEPT {
+            let at = self.tells.iter().position(|t| !t.pending).unwrap_or(0);
+            self.tells.remove(at);
+        }
+    }
+
+    /// What `lunchroom read <id>` prints for `id` when run by `me`: the line telling `me` of the
+    /// decision. `None` for an id that does not exist and for one told to another session, which
+    /// the command DENIES (D1.1).
+    #[must_use]
+    pub fn tell_line_for(&self, me: &Identity, id: &str) -> Option<&str> {
+        self.tells
+            .iter()
+            .find(|t| t.id == id && t.session == *me)
+            .map(|t| t.line.as_str())
+    }
+
+    /// `id` is a decision of the user told to `me`, whether or not it is still in force: the line
+    /// that tells of it reaches the session's prompt hook, which adds no hold for it (A1.2).
+    #[must_use]
+    pub fn is_tell_of(&self, me: &Identity, id: &str) -> bool {
+        self.tells.iter().any(|t| t.id == id && t.session == *me)
+    }
+
+    /// A line waits for the Hermes session `me`'s next turn.
+    #[must_use]
+    pub fn has_pending_tell(&self, me: &Identity) -> bool {
+        self.tells.iter().any(|t| t.pending && t.session == *me)
+    }
+
+    /// The oldest line waiting for the Hermes session `me`, marked as told: it goes to the turn's
+    /// context once.
+    pub fn take_pending_tell(&mut self, me: &Identity) -> Option<String> {
+        let tell = self
+            .tells
+            .iter_mut()
+            .find(|t| t.pending && t.session == *me)?;
+        tell.pending = false;
+        Some(tell.line.clone())
+    }
+
+    /// Drops the lines older than [`TELL_SECS`] at `now` (a line stamped ahead is kept, and one
+    /// still waiting for a Hermes turn) and the declines whose hold has ended
+    /// ([`Mail::end_declines`]); a decline never lapses by time.
+    pub fn forget_old_tells(&mut self, now: u64) {
+        self.tells
+            .retain(|t| t.pending || now < t.at.saturating_add(TELL_SECS));
+        self.end_declines();
+    }
+
+    /// §17.10: ends each decline whose hold has ended: one made while messages held the session
+    /// stands only while at least one of them still holds it (A2.1 binds an approval to the same
+    /// ids). A decline made when no message held the session has no hold to end, and stands until
+    /// the user approves that exact call. An ended decline is dropped, so a message that holds the
+    /// session later never revives it.
+    pub fn end_declines(&mut self) {
+        let holds = &self.holds;
+        self.declined.retain(|d| {
+            d.holding.is_empty()
+                || holds
+                    .get(&d.session.key())
+                    .is_some_and(|held| held.iter().any(|h| d.holding.contains(&h.message)))
+        });
+    }
+
+    /// The user refuses the exact call of the waiting request at `index` (§17.10) and it is removed,
+    /// only if it is still `expected`. The call is DENIED from now on, until the user approves that
+    /// exact call or the hold that carried it ends ([`Mail::end_declines`]): a retry is DENIED with
+    /// the reason that the user refused it ([`Mail::refused_at`]), and a line tells the agent
+    /// through its harness's channel ([`Mail::tell_line_for`]).
+    ///
+    /// # Errors
+    /// [`Changed`] when the request is gone or different.
+    pub fn refuse_request(
+        &mut self,
+        index: usize,
+        expected: &Request,
+        now: u64,
+    ) -> Result<String, Changed> {
+        let r = self.requests.get(index).ok_or(Changed)?;
+        // A request that has waited as long as an approval lasts is no longer waiting: nothing is
+        // declined, as nothing could be approved.
+        if r != expected || now >= r.at.saturating_add(APPROVAL_SECS) {
+            return Err(Changed);
+        }
+        // No id is left to give when the counter has run out: nothing is recorded.
+        let next = self.next_approval.checked_add(1).ok_or(Changed)?;
+        let r = self.requests.remove(index);
+        self.expire_requests(now);
+        self.forget_old_tells(now);
+        self.next_approval = next;
+        let id = format!("rf-{:08}", self.next_approval);
+        let hash = input_hash(&r.input);
+        let holding = self.holding_ids(&r.session);
+        let cwd = normal_dir(&r.cwd);
+        self.declined.retain(|f| {
+            !(f.session == r.session && f.tool == r.tool && f.cwd == cwd && f.input_hash == hash)
+        });
+        self.declined.push(Refusal {
+            session: r.session.clone(),
+            tool: r.tool.clone(),
+            input_hash: hash,
+            cwd,
+            at: now,
+            id: id.clone(),
+            holding,
+            extra: std::collections::BTreeMap::new(),
+        });
+        let line = tell_line(TellKind::Refused, &id, &r.tool, &r.input);
+        let pending = r.session.harness == crate::identity::Harness::Hermes;
+        self.keep_tell(&id, &r.session, TellKind::Refused, line, now, pending);
+        // D1.8 (F2-AC52): a call the guard kept stops waiting, Denied, told to the user and the
+        // agents waiting on it. The agent that asked hears it through A1.2's channel (the line
+        // above; in Claude Code the retry's reason), so it is not added here.
+        if let Some(call) = self.kept_call_id(&r) {
+            self.call_ends_in(
+                &r.session,
+                &call,
+                crate::mail::calls::Outcome::Denied,
+                now,
+                None,
+            );
+        }
+        Ok(id)
+    }
+
+    /// When the user refused this exact call of `session` (tool, input and folder), if that is
+    /// still in force: the guard DENIES the retry with the reason that the user refused it (§17.10).
+    /// It stands until the user approves that exact call or the hold that carried it ends.
+    #[must_use]
+    pub fn refused_at(
+        &self,
+        session: &Identity,
+        tool: &str,
+        input: &Value,
+        cwd: &str,
+    ) -> Option<u64> {
+        let hash = input_hash(input);
+        let cwd = normal_dir(cwd);
+        self.declined
+            .iter()
+            .find(|f| {
+                f.session == *session && f.tool == tool && f.input_hash == hash && f.cwd == cwd
+            })
+            .map(|f| f.at)
+    }
+
     /// Keeps a call waiting for the user's approval; the same call again replaces the older entry.
     /// A call that has waited [`APPROVAL_SECS`] or more by the time of this one is dropped.
     pub fn request(&mut self, request: Request) {
@@ -137,10 +438,31 @@ impl Mail {
         }
         let now_shown = self.approval_prompt(&r.session, &r.agent, &r.tool, &r.input, &r.cwd);
         if r != expected || now_shown != shown {
+            // A2.2 (D1.8): the call stops waiting, void, with the first cause that is true.
+            self.kept_call_void(expected, now);
             return Err(Changed);
         }
         let r = self.requests.remove(index);
-        Ok(self.approve(&r.session, &r.tool, &r.input, &r.cwd, now))
+        // The approval of a call the guard kept has that call's id (A1.2), and the call stops
+        // waiting: Granted, told to the user and the agents waiting (in Claude Code, which A1.2
+        // gives no line, the agent that asked hears it by D too).
+        let call = self.kept_call_id(&r);
+        let id = self.approve_as(call.as_deref(), &r.session, &r.tool, &r.input, &r.cwd, now);
+        // The line that tells the agent (A1.2); Hermes takes it at its next turn.
+        let line = tell_line(TellKind::Approved, &id, &r.tool, &r.input);
+        let pending = r.session.harness == crate::identity::Harness::Hermes;
+        self.keep_tell(&id, &r.session, TellKind::Approved, line, now, pending);
+        if let Some(call) = call {
+            let asker = (r.session.harness == crate::identity::Harness::ClaudeCode).then_some(true);
+            self.call_ends_in(
+                &r.session,
+                &call,
+                crate::mail::calls::Outcome::Granted,
+                now,
+                asker,
+            );
+        }
+        Ok(id)
     }
 }
 
@@ -161,7 +483,12 @@ pub fn visible(text: &str) -> String {
             c if c.is_control()
                 || matches!(
                     c,
-                    '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    '\u{ad}'
+                        | '\u{61c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'..='\u{202e}'
+                        | '\u{2060}'..='\u{2069}'
+                        | '\u{feff}'
                 ) =>
             {
                 let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
@@ -229,9 +556,34 @@ impl Mail {
         cwd: &str,
         now: u64,
     ) -> String {
+        self.approve_as(None, session, tool, input, cwd, now)
+    }
+
+    /// [`Mail::approve`] with the id of the kept call it approves (A1.2), when there is one.
+    pub(crate) fn approve_as(
+        &mut self,
+        call: Option<&str>,
+        session: &Identity,
+        tool: &str,
+        input: &Value,
+        cwd: &str,
+        now: u64,
+    ) -> String {
+        // An approval unused 10 minutes after it was given is told before it is forgotten.
+        self.settle_unused(now);
         self.approvals.retain(|a| a.live(now));
-        self.next_approval += 1;
-        let id = format!("ap-{:08}", self.next_approval);
+        // A yes given after a refusal of the same call is the user's later word.
+        let hash = input_hash(input);
+        let folder = normal_dir(cwd);
+        self.declined.retain(|f| {
+            !(f.session == *session && f.tool == tool && f.cwd == folder && f.input_hash == hash)
+        });
+        let id = if let Some(call) = call {
+            call.to_owned()
+        } else {
+            self.next_approval = self.next_approval.saturating_add(1);
+            format!("ap-{:08}", self.next_approval)
+        };
         let approval = Approval {
             id: id.clone(),
             session: session.clone(),

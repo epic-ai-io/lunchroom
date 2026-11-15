@@ -23,7 +23,21 @@ make_user
 export MOCK_API=1
 seed_claude
 install_lunchroom
-[ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && pass "lunchroom install claude-code finished" || { fail "install did not finish"; finish; }
+# 1.1, spec section 17 item 2: the install is finished when the setgid program and /var/lib/lunchroom/<uid> are in place.
+lr_installed && pass "lunchroom install claude-code finished" || { fail "install did not finish"; finish; }
+
+# 1.1, spec section 13 item 5 (H1.5): the tool-call hook is `<program> guard pretool || exit 2` and,
+# in Claude Code, carries "onFailure": "block"; the prompt hook carries neither.
+python3 - "$DEVHOME/.claude/settings.json" "$LR" <<'PY' && pass "PreToolUse is '<program> guard pretool || ... exit 2' with onFailure block; UserPromptSubmit has neither (H1.5 item 5)" || fail "the hooks do not have the fail-closed form of H1.5 item 5"
+import json, sys
+s = json.load(open(sys.argv[1]))
+pre = [h for g in s["hooks"]["PreToolUse"] for h in g["hooks"] if sys.argv[2] in h["command"]]
+prompt = [h for g in s["hooks"]["UserPromptSubmit"] for h in g["hooks"] if sys.argv[2] in h["command"]]
+ok = bool(pre) and bool(prompt)
+ok = ok and all("guard pretool" in h["command"] and "exit 2" in h["command"] and h.get("onFailure") == "block" for h in pre)
+ok = ok and all("exit 2" not in h["command"] and "onFailure" not in h for h in prompt)
+sys.exit(0 if ok else 1)
+PY
 
 cp "$PROOF/variant-hook.sh" /usr/local/bin/variant-hook.sh
 chmod 755 /usr/local/bin/variant-hook.sh
@@ -85,6 +99,23 @@ for pair in "a LINE1" "b LINE1" "c SYS1" "c REASON1" "d SYS1"; do
     eval "dv=\${SEEN_${1}_${2}_default:-absent}; xv=\${SEEN_${1}_${2}_expanded:-absent}"
     echo "form $1, ${2} first line: default screen = $dv, after ctrl+o = $xv"
 done
+
+heading "the tool-call hook fails closed: with Lunchroom's program gone, a call is blocked (1.1, section 13 item 5)"
+# Spec: "with the guard's program removed ... a tool call is blocked in Claude Code and in Codex and the
+# blocked call's text names `lunchroom doctor`, while a prompt the user types still reaches the agent".
+echo off > "$SESS/hookmode"
+mv "$LR" "$LR.gone"
+F=$(probe s1 CONTROLTEST fc1)
+mv "$LR.gone" "$LR"
+echo "MEASURED control call with the program removed: Claude Code gave back: $(echo "$F" | head -c 600)"
+case "$F" in
+    *lib.sh*) fail "the control call RAN with Lunchroom's program gone: the hook failed open" ;;
+    "") fail "no result came back for the call made with the program gone" ;;
+    *"lunchroom doctor"*) pass "the call was blocked and its text names 'lunchroom doctor'" ;;
+    *) fail "the call did not run, but its text does not name 'lunchroom doctor': $(echo "$F" | head -c 300)" ;;
+esac
+G=$(probe s1 CONTROLTEST fc2)
+case "$G" in *lib.sh*) pass "with the program put back the control call runs again" ;; *) fail "with the program put back the control call did not run: '${G:-nothing}'" ;; esac
 
 # What each form must do (docs): a, b, c block the call (the model's result is the refusal); d does not.
 echo a > "$SESS/hookmode"

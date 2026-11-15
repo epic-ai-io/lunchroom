@@ -1,6 +1,6 @@
 # cargo deny: every dependency's license is compatible with Apache-2.0, crates come from crates.io.
 [licenses]
-allow = ["Apache-2.0", "MIT", "Zlib", "Unicode-3.0", "Unlicense"]
+allow = ["Apache-2.0", "MIT", "Zlib", "Unicode-3.0", "Unlicense", "BSD-3-Clause"]
 confidence-threshold = 0.9
 
 [bans]

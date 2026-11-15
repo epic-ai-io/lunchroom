@@ -16,19 +16,26 @@ mod cli;
 mod codex;
 #[cfg(feature = "console")]
 mod console;
+#[cfg(feature = "console")]
+mod controller;
 #[cfg(test)]
 mod corpus;
 mod delivery;
+mod echo;
 mod evidence;
 mod home;
 mod install;
 mod openclaw;
 mod process;
 mod records;
+mod send_lines;
 mod terminal;
 mod user;
+#[cfg(feature = "console")]
+mod wall;
 
 use std::io::{Read as _, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -68,8 +75,13 @@ fn run_hook(
     // D1.7: every guard hook starts a check of the QUEUED messages' time limits, which it does not
     // wait for; a listener runs the check itself (`delivery::listen`). The guard starts it after
     // its answer is written (`guard`), never before the decision (G3-12).
+    // D1.8: a plugin reports the end of a call it asked about (no hook input: no folder).
+    if mode == "callend" {
+        return claude::callend(text, &env);
+    }
     let input = claude::HookInput::parse(text)?;
     match mode {
+        "notices" => claude::notices(&input, &env),
         "pretool" => claude::pretool(&input, &env),
         "prompt" => claude::prompt(&input, &env),
         "posttool" => claude::posttool(&input, &env),
@@ -278,16 +290,39 @@ fn guard(mode: Option<&str>, env: Result<home::Env, String>) -> ExitCode {
         && !timed_out
     {
         checks::start(&env);
+        // F2 design, "The agents on the console": the session's own guard is judged for the
+        // console in a process of its own, after the answer, at most every 30 s.
+        if matches!(mode, Some("pretool" | "prompt"))
+            && let Some(key) = claude::own_finding_due(&text, &env)
+        {
+            start_judge(&key);
+        }
     }
     ExitCode::from(code)
+}
+
+/// Starts `lunchroom judge <key>` in its own process group, its output going nowhere: the
+/// harness ending the hook's group does not end it, and the hook does not wait for it.
+fn start_judge(key: &str) {
+    let Ok(program) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(program)
+        .args(["judge", key])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
 }
 
 /// The commands an agent may run, in the order `USAGE` lists them under "Agents may run" (A1.3).
 /// One list: the help text, and the Configuration denial that names them
 /// ([`agent_commands_text`]), take their names from here.
-pub(crate) const AGENT_COMMANDS: [&str; 5] = ["send", "status", "codex-threads", "help", "version"];
+pub(crate) const AGENT_COMMANDS: [&str; 6] =
+    ["send", "read", "status", "codex-threads", "help", "version"];
 
-/// [`AGENT_COMMANDS`] as a sentence part: `lunchroom send`, `lunchroom status`, …, `lunchroom help`
+/// [`AGENT_COMMANDS`] as a sentence part: `lunchroom send`, `lunchroom read`, …, `lunchroom help`
 /// and `lunchroom version`.
 #[must_use]
 pub(crate) fn agent_commands_text() -> String {
@@ -310,6 +345,7 @@ usage: lunchroom <command>
 
 Agents may run:
   send <name> [--reply-to <id>] <text>    message another agent (text `-` reads standard input)
+  read <id>                               print a message handed to you by its id
   status                                  agents, their states and queued messages
   codex-threads [-n COUNT]                recent Codex threads, to name one with `register`
   help, version
@@ -322,18 +358,25 @@ Only you, in a terminal outside every agent session; each one that changes somet
 passphrase, which it checks against /etc/lunchroom/<uid>.verifier, a file only root can write:
   passphrase                              set your passphrase, or change it (asks for the current one)
   install [claude-code|codex|openclaw|hermes]   no harness named: offers each one found
+  install console                         set the console up (`install` ends by doing this; run this to
+                                          run only that step again)
+  console                                 open the console, a full screen in a terminal of your own
+                                          (runs as user lunchroom; asks your sudo password, then
+                                          your passphrase)
+                                          {open_console}
   uninstall claude-code|codex|openclaw|hermes   remove Lunchroom's hooks; every other hook stays
+  uninstall console                       remove the console's public key; the sudo rule file stays
   register <name> <harness>:<session id>  let a session receive messages as <name>
   unregister <name>                       stop a session receiving messages as <name>
   approve [<n>]                           list the calls waiting for you, or approve one
   yolo <name,name,...|all> till <HH:MM>   let those agents act without asking until then (UTC);
-                                          separate names with commas; it works for Claude Code
-                                          agents only, and `all` or a list that names any other
-                                          agent changes none: name just the Claude Code agents
+                                          separate names with commas; it works for agents of
+                                          every harness, and `till now` ends it at once
   mode [relaxed|balanced|strict]          how much another agent's message limits an agent
   rate <messages> <seconds>               set the message rate limit
   slip                                    show what a HELD agent may still do
   repair                                  put back the last good store when it cannot be read
+  clear <path>                            take a recorded path out of the record (`status` lists them)
   doctor                                  check your setup, one PASS or FAIL line each, with the
                                           fix for each FAIL (a HELD agent is shown as HELD, which
                                           is neither); changes nothing; exit 0 when none FAILs
@@ -341,8 +384,15 @@ passphrase, which it checks against /etc/lunchroom/<uid>.verifier, a file only r
 HELD: a message from another agent is in a session, so Lunchroom restricts what that agent may do.
 UNGUARDED: an agent is running, but Lunchroom has no evidence that its guard runs, so it delivers nothing to it.
 
-Exit codes: 0 done, 1 store unusable, 2 usage, 3 not permitted, 4 HALTED, 5 rate limit, 7 DENIED.
+Exit codes: 0 done, 1 store unusable, 2 usage, 3 not permitted, 4 HALTED, 5 rate limit,
+6 installed, console not set up, 7 DENIED.
 ";
+
+/// The help text: [`USAGE`] with `{open_console}` replaced by [`cli::OPEN_CONSOLE_LINE`], the one
+/// place that line is written (F2 design, "Finding and starting the console", item 3).
+fn usage() -> String {
+    USAGE.replace("{open_console}", cli::OPEN_CONSOLE_LINE)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -351,6 +401,9 @@ fn main() -> ExitCode {
         // The console reads no environment but `SUDO_UID`; it runs before `Env::from_process`.
         #[cfg(feature = "console")]
         Some("console") => return console::run(&args[1..]),
+        // The echo watchdog (A1.3): started by the program itself, not listed in `help`; it reads
+        // no environment and no store.
+        Some(echo::SUBCOMMAND) => return echo::watch(&args[1..]),
         Some("listen") => {
             let once = args.get(1).map(String::as_str) == Some("--once");
             let mode = if once { "listen-once" } else { "listen" };
@@ -367,6 +420,7 @@ fn main() -> ExitCode {
     };
     let outcome = match args.first().map(String::as_str) {
         Some("send") => cli::send(&args[1..], &env),
+        Some("read") => cli::read(&args[1..], &env),
         Some("status") => cli::status(&env),
         Some("codex-threads") => cli::codex_threads(&args[1..], &env),
         Some("approve") => user::approve(&args[1..], &env, &mut terminal::OsSystem),
@@ -378,15 +432,23 @@ fn main() -> ExitCode {
         Some("install") => install::install(&args[1..], &env, &mut terminal::OsSystem),
         Some("uninstall") => install::uninstall(&args[1..], &env, &mut terminal::OsSystem),
         Some("repair") => user::repair(&env, &mut terminal::OsSystem),
+        Some("clear") => user::clear(&args[1..], &env, &mut terminal::OsSystem),
         Some("passphrase") => user::passphrase(&env, &mut terminal::OsSystem),
         Some("mode") => user::mode(&args[1..], &env, &mut terminal::OsSystem),
         Some("doctor") => cli::doctor(&env, &terminal::OsSystem),
         // D1.7: the check a guard hook starts; not listed in `help`.
         Some("check") => checks::check(&env, &args[1..]),
-        Some("help" | "--help" | "-h") => cli::Outcome::ok(USAGE.to_owned()),
+        // F2 design, "The agents on the console": the judgment a guard hook starts; not listed.
+        Some("judge") => {
+            if let Some(key) = args.get(1) {
+                claude::keep_finding(&env, key);
+            }
+            cli::Outcome::ok(String::new())
+        }
+        Some("help" | "--help" | "-h") => cli::Outcome::ok(usage()),
         Some("version" | "--version") => cli::Outcome::ok(format!("{}\n", cli::VERSION)),
         _ => {
-            write(None, Some(USAGE.trim_end()));
+            write(None, Some(usage().trim_end()));
             return ExitCode::from(2);
         }
     };
@@ -421,11 +483,11 @@ mod tests {
             assert!(found.is_some(), "{name} in {section}");
             at += found.unwrap_or_default() + name.len();
         }
-        assert_eq!(agent_section().len(), 4, "{section}");
+        assert_eq!(agent_section().len(), 5, "{section}");
         assert_eq!(
             agent_commands_text(),
-            "`lunchroom send`, `lunchroom status`, `lunchroom codex-threads`, `lunchroom help` \
-             and `lunchroom version`"
+            "`lunchroom send`, `lunchroom read`, `lunchroom status`, `lunchroom codex-threads`, \
+             `lunchroom help` and `lunchroom version`"
         );
     }
 
@@ -442,8 +504,60 @@ mod tests {
             USAGE.contains(&format!("  {usage}   let those agents act without asking")),
             "{USAGE}"
         );
-        assert!(USAGE.contains("it works for Claude Code\n"), "{USAGE}");
+        assert!(
+            USAGE.contains("it works for agents of\n")
+                && USAGE.contains("`till now` ends it at once"),
+            "{USAGE}"
+        );
+        assert!(!USAGE.contains("Claude Code agents"), "{USAGE}");
         assert!(!USAGE.contains("name those that can"), "{USAGE}");
+    }
+
+    // F2 design, "Finding and starting the console", item 3; failure class "help without the line".
+    // The help names `install console` and `console` in the section for the user alone, and the
+    // open line follows `console` (and only there: the placeholder is gone). Fails before the
+    // change: `usage` does not exist, and the old text names neither command.
+    #[test]
+    fn the_help_text_says_how_to_open_the_console() {
+        let help = usage();
+        let open = cli::OPEN_CONSOLE_LINE;
+        assert_eq!(help.matches(open).count(), 1, "{help}");
+        assert!(!help.contains("{open_console}"), "{help}");
+        assert!(help.contains("\n  install console   "), "{help}");
+        let console = help.find("\n  console   ");
+        assert!(
+            console.is_some_and(|c| help[c..].contains(open)
+                && help.find(open) < help.find("\n  uninstall claude-code")),
+            "{help}"
+        );
+        // Both sit under the user-only section, after the agents' own.
+        let user_only = help.find("Only you, in a terminal outside every agent session");
+        assert!(user_only < console, "{help}");
+    }
+
+    // F2 design item 3; failure class "README without the line". Both READMEs have a section "The
+    // console" holding the open line, and say it runs as user lunchroom and asks the sudo
+    // password and then the passphrase. Fails before the change: neither has the section.
+    #[test]
+    fn both_readmes_have_the_console_section_with_the_open_line() {
+        for file in ["README.md", "public-overlay/README.md"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join(file);
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let section = text
+                .split("\n## ")
+                .find(|s| s.starts_with("The console\n"))
+                .unwrap_or_default();
+            assert!(
+                section.contains(cli::OPEN_CONSOLE_LINE),
+                "{file}: {section}"
+            );
+            assert!(section.contains("full screen"), "{file}");
+            assert!(section.contains("user `lunchroom`"), "{file}");
+            assert!(section.contains("sudo password"), "{file}");
+            assert!(section.contains("passphrase"), "{file}");
+        }
     }
 
     // G3-9: HELD and UNGUARDED are explained in the help text, where a first-time user meets them.

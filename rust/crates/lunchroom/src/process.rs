@@ -79,6 +79,82 @@ pub fn ancestors(pid: u32) -> Vec<u32> {
     chain
 }
 
+/// The processes of user `uid` that are `program` running `listen`: a Lunchroom listener of the
+/// earlier program (§17.2). `proc_root` is `/proc`, or a folder laid out like it. A process whose
+/// program file was deleted since it started (`/proc/<pid>/exe` ends in ` (deleted)`) counts.
+#[must_use]
+pub fn listeners_in(proc_root: &std::path::Path, uid: u32, program: &std::path::Path) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let me = std::process::id();
+    let mut found: Vec<u32> = entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != me)
+        .filter(|pid| {
+            let dir = proc_root.join(pid.to_string());
+            let owner = std::fs::read_to_string(dir.join("status"))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("Uid:"))?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u32>()
+                        .ok()
+                });
+            if owner != Some(uid) {
+                return false;
+            }
+            let exe = std::fs::read_link(dir.join("exe")).ok();
+            let exe_text = exe.as_deref().and_then(std::path::Path::to_str);
+            let same = exe_text.is_some_and(|t| {
+                std::path::Path::new(t.strip_suffix(" (deleted)").unwrap_or(t)) == program
+            });
+            let listens = std::fs::read(dir.join("cmdline"))
+                .is_ok_and(|raw| raw.split(|b| *b == 0).nth(1) == Some(b"listen".as_slice()));
+            same && listens
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// Whether `pid` runs: it has a folder in `proc_root` and is not a zombie.
+#[must_use]
+pub fn running_in(proc_root: &std::path::Path, pid: u32) -> bool {
+    std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"))
+        .ok()
+        .and_then(|stat| Some(stat.rsplit_once(')')?.1.trim_start().chars().next()? != 'Z'))
+        .unwrap_or(false)
+}
+
+/// Sends SIGTERM to each of `pids` and waits up to `wait` for them to end; the ones still
+/// running, which did not stop.
+#[must_use]
+pub fn terminate(proc_root: &std::path::Path, pids: &[u32], wait: std::time::Duration) -> Vec<u32> {
+    for pid in pids {
+        if let Some(target) = i32::try_from(*pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(target, rustix::process::Signal::TERM);
+        }
+    }
+    let end = std::time::Instant::now() + wait;
+    loop {
+        let alive: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|p| running_in(proc_root, *p))
+            .collect();
+        if alive.is_empty() || std::time::Instant::now() >= end {
+            return alive;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +215,111 @@ mod tests {
         assert_eq!(key(pid), None, "a zombie is not running");
         let _ = child.wait();
         assert_eq!(key(pid), None, "a collected process is not running");
+    }
+
+    fn fake_proc(name: &str) -> std::path::PathBuf {
+        let dir = crate::test_target()
+            .join("process-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn fake_process(proc: &std::path::Path, pid: u32, uid: u32, exe: &str, argv: &[&str]) {
+        let dir = proc.join(pid.to_string());
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("status"),
+            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        );
+        let _ = std::os::unix::fs::symlink(exe, dir.join("exe"));
+        let _ = std::fs::write(dir.join("cmdline"), argv.join("\0") + "\0");
+    }
+
+    // §17.2: the listeners the install stops are the user's processes whose program is the
+    // earlier one and whose first argument is `listen`: not another user's, not another program,
+    // not another command of the same program, and a program whose file was replaced counts.
+    #[test]
+    fn only_the_users_listeners_of_the_earlier_program_are_found() {
+        let proc = fake_proc("listeners");
+        let old = "/home/u/.lunchroom/bin/lunchroom";
+        fake_process(&proc, 100, 1000, old, &[old, "listen"]);
+        fake_process(
+            &proc,
+            101,
+            1000,
+            "/home/u/.lunchroom/bin/lunchroom (deleted)",
+            &[old, "listen", "--x"],
+        );
+        fake_process(&proc, 102, 1001, old, &[old, "listen"]);
+        fake_process(&proc, 103, 1000, "/usr/bin/sleep", &[old, "listen"]);
+        fake_process(&proc, 104, 1000, old, &[old, "status"]);
+        fake_process(&proc, 105, 1000, old, &[old]);
+        fake_process(
+            &proc,
+            106,
+            1000,
+            "/usr/local/lib/lunchroom/lunchroom",
+            &["x", "listen"],
+        );
+        let _ = std::fs::create_dir_all(proc.join("self"));
+        let _ = std::fs::write(proc.join("loadavg"), "0 0 0");
+        assert_eq!(
+            listeners_in(&proc, 1000, std::path::Path::new(old)),
+            vec![100, 101]
+        );
+        assert_eq!(
+            listeners_in(
+                &proc,
+                1000,
+                std::path::Path::new("/usr/local/lib/lunchroom/lunchroom")
+            ),
+            vec![106]
+        );
+        assert_eq!(
+            listeners_in(&proc, 1000, std::path::Path::new("/nowhere")).len(),
+            0
+        );
+        assert_eq!(
+            listeners_in(&proc.join("missing"), 1000, std::path::Path::new(old)).len(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&proc);
+    }
+
+    // §17.2: SIGTERM stops a process that obeys it, and a process that ignores it is reported as
+    // still running after the wait.
+    #[test]
+    fn terminate_stops_one_that_obeys_and_reports_one_that_ignores_sigterm() {
+        let proc = std::path::Path::new("/proc");
+        let spawn = |script: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+        let (Ok(mut obeys), Ok(mut ignores)) = (
+            spawn("exec sleep 30"),
+            spawn("trap '' TERM; while :; do sleep 1; done"),
+        ) else {
+            return;
+        };
+        // Let the shell set its trap before the signal comes.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(running_in(proc, obeys.id()) && running_in(proc, ignores.id()));
+        let left = terminate(
+            proc,
+            &[obeys.id(), ignores.id()],
+            std::time::Duration::from_millis(1500),
+        );
+        assert_eq!(left, vec![ignores.id()]);
+        assert!(!running_in(proc, obeys.id()));
+        let _ = ignores.kill();
+        let _ = ignores.wait();
+        let _ = obeys.wait();
+        assert!(!running_in(proc, u32::MAX));
     }
 }

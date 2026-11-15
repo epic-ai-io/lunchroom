@@ -8,20 +8,26 @@
 //!
 //! Rules that hold in every session are always checked. The rest change nothing for an agent that
 //! is not HELD (P1.2), so they are checked only while it is HELD, which keeps the guard's
-//! file-system work off every call such an agent makes.
+//! file-system work off every call such an agent makes. What a call reads, searches and writes
+//! ([`Access`]) is recorded in every session, since a session that is not HELD is held by what it
+//! then reads (§5 T1.8).
 //!
-//! What the guard judges is the call itself (spec §15 K1.8). A script the call runs, and code it
-//! hands to a program such as `python -c`, are searched only for the rules that are DENIED in every
-//! session (fences, identity, Lunchroom commands; a shell script the reader can read also for
-//! Lunchroom's stores).
+//! What the guard judges is the call itself (spec §15 K1.8) and what it runs. A script the call
+//! runs is judged as a command of its own would be, with the session's own state (§6 P1.4): while
+//! the session is HELD each part of it that would be PROTECTED makes the call PROTECTED, and each
+//! part that would be DENIED makes it DENIED; so is a file the call writes and then runs (a heredoc,
+//! `printf` or `echo` redirected into it), judged on the text written. Code handed to a program
+//! such as `python -c` is searched for the rules that are DENIED in every session (fences,
+//! identity, Lunchroom commands, terminals, `ptrace`), for paths of Lunchroom's and for commands of
+//! a PROTECTED kind that it spells out in strings.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::fs::{Fs, Script, WalkEnd, fnmatch};
-use crate::paths::{Layout, absolute, literal_prefix, normalize};
+use crate::paths::{Layout, absolute, literal_prefix, normalize, proc_secret_folder};
 use crate::policy::{Call, CallClass, DenyReason, ProtectedKind, ProtectedKinds};
 use crate::shell::{self, Parsed, Word};
 
@@ -43,6 +49,18 @@ impl std::fmt::Debug for Guard<'_> {
             .field("held", &self.held)
             .finish_non_exhaustive()
     }
+}
+
+/// A judged call: the class and kinds ([`Call`]), what the rule behind a DENIED class found at
+/// fault (V1.4), and the paths the call reads, searches and writes ([`Access`], T1.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Judged {
+    /// The class shown and every PROTECTED kind raised.
+    pub call: Call,
+    /// The path, program, word or text at fault for a DENIED class.
+    pub fault: Option<String>,
+    /// What the call reads, searches and writes.
+    pub access: Access,
 }
 
 /// Tools that only read Lunchroom-internal or harness-internal lists.
@@ -124,8 +142,10 @@ const NOT_A_PROMPT: [&str; 41] = [
 const LUNCHROOM_NAMES: [&str; 1] = ["lunchroom"];
 
 /// Lunchroom commands an agent may run; every other one is the user's alone (A1.3).
-const LUNCHROOM_OPEN: [&str; 8] = [
+const LUNCHROOM_OPEN: [&str; 9] = [
     "send",
+    // P1.1, D1.1: `lunchroom read <id>` prints a message addressed to the session; it is a read.
+    "read",
     "status",
     "codex-threads",
     "help",
@@ -251,9 +271,12 @@ const GREPS: [&str; 4] = ["grep", "egrep", "fgrep", "zgrep"];
 const COPIERS: [&str; 5] = ["tar", "zip", "cp", "rsync", "scp"];
 
 /// Lunchroom commands that only the user may run, as they are spotted in code (A1.3).
-const LUNCHROOM_USER_ONLY: [&str; 18] = [
+const LUNCHROOM_USER_ONLY: [&str; 19] = [
     // 1.1: the console is the user's own screen; an agent that ran it would see and press its keys.
     "console",
+    // T1.8: forgets the paths recorded as holding messages; an agent that ran it would clear its
+    // own hold (§5 T1.8, A1.3).
+    "clear",
     "approve",
     // Runs the check of the QUEUED messages (D1.7), which counts hand-overs failed and offers
     // messages again through the recipients' own programs. The hooks start it; an agent that ran
@@ -281,9 +304,6 @@ const LUNCHROOM_USER_ONLY: [&str; 18] = [
     "doctor",
 ];
 
-/// Programs that attach to another process or trace it (1.1, rule 3).
-const DEBUGGERS: [&str; 6] = ["gdb", "gdbserver", "lldb", "strace", "ltrace", "ptrace"];
-
 /// Programs that signal processes by id or by name (1.1, rule 2).
 const KILLERS: [&str; 3] = ["kill", "pkill", "killall"];
 
@@ -298,26 +318,351 @@ fn names_word(text: &str, word: &str) -> bool {
 /// `doas`, `runuser` and `pkexec` with the user or group option naming it, `su` and
 /// `machinectl shell` with it as an operand. A word `lunchroom` that is no user (a package name)
 /// is not one.
-fn becomes_lunchroom(name: &str, args: &[&str]) -> bool {
+///
+/// §17.5, §7 A1.3: `sudo`, `su`, `runuser`, `machinectl shell`, `pkexec`, `doas` and `run0` to the
+/// user `lunchroom`. The user is named by its name or by its numeric id (`-u '#998'`, `ids`: the
+/// ids the layout knows for the user and group `lunchroom`). Options are read as the programs read
+/// them: a cluster (`-nu lunchroom`, `-Hulunchroom`), a long option with `=` or a separate value,
+/// and options end at the command, so `sudo ls -u lunchroom` gives `ls` its own `-u`.
+fn becomes_lunchroom(name: &str, args: &[&str], ids: &[u32]) -> bool {
     const WHO: &str = "lunchroom";
-    match name {
-        "sudo" | "doas" | "runuser" | "pkexec" => args.iter().enumerate().any(|(k, a)| {
-            let attached = a
-                .strip_prefix("--user=")
-                .or_else(|| a.strip_prefix("--group="))
-                .or_else(|| a.strip_prefix("-u"))
-                .or_else(|| a.strip_prefix("-g"))
-                .or_else(|| a.strip_prefix("-l").filter(|_| name == "runuser"));
-            let separate = *a == WHO
-                && k > 0
-                && (matches!(args[k - 1], "-u" | "-g" | "--user" | "--group")
-                    || (name == "runuser" && args[k - 1] == "-l"));
-            attached == Some(WHO) || separate
-        }),
-        "su" | "machinectl" => args
-            .iter()
-            .any(|a| *a == WHO || a.starts_with("lunchroom@")),
-        _ => false,
+    let names = |v: &str| {
+        v == WHO
+            || v.strip_prefix('#')
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| ids.contains(&n))
+    };
+    // The one-letter options that take a value, which of them name a user or a group, the long
+    // options that name one, and every long option the program has (`true`: it takes a value).
+    // From `sudo --help` and `runuser --help` of this host, and the manuals of run0 and pkexec.
+    let (value_letters, who_letters, who_long, longs): (&str, &str, &[&str], &[(&str, bool)]) =
+        match name {
+            "sudo" => ("ughpCDrtTRU", "ug", &["user", "group"], SUDO_LONG),
+            "doas" => ("uC", "u", &[], &[]),
+            "run0" => ("ugD", "ug", &["user", "group"], RUN0_LONG),
+            "pkexec" => ("", "", &["user"], PKEXEC_LONG),
+            "runuser" => (
+                "ugGcsw",
+                "ugG",
+                &["user", "group", "supp-group"],
+                RUNUSER_LONG,
+            ),
+            "su" | "machinectl" => {
+                // `su` and `machinectl shell` take the user as an operand, anywhere, or as the
+                // value of `--uid=`, `--group=` and the like.
+                return args.iter().enumerate().any(|(k, a)| {
+                    names(a)
+                        || a.starts_with("lunchroom@")
+                        || a.split_once('=')
+                            .is_some_and(|(o, v)| o.starts_with("--") && names(v))
+                        || (name == "su"
+                            && matches!(*a, "-g" | "--group" | "-G" | "--supp-group")
+                            && args.get(k + 1).is_some_and(|v| names(v)))
+                });
+            }
+            _ => return false,
+        };
+    let mut operand = 0usize;
+    // An option this module does not know may take the next word: the words after it are read for
+    // the user too, wherever the command starts.
+    let mut unknown = false;
+    let mut k = 0;
+    while let Some(a) = args.get(k).copied() {
+        k += 1;
+        if a == "--" {
+            break;
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            let (opt, attached) = rest
+                .split_once('=')
+                .map_or((rest, None), |(o, v)| (o, Some(v)));
+            // getopt_long takes any unambiguous prefix of a long option.
+            let Some((full, takes)) = resolve_long(opt, longs) else {
+                unknown = true;
+                continue;
+            };
+            let value = if attached.is_some() || !takes {
+                attached
+            } else {
+                let v = args.get(k).copied();
+                k += 1;
+                v
+            };
+            if who_long.contains(&full) && value.is_some_and(names) {
+                return true;
+            }
+            // `run0 --property=User=lunchroom` (or `Group=`).
+            if full == "property"
+                && value
+                    .and_then(|v| v.split_once('='))
+                    .is_some_and(|(key, v)| matches!(key, "User" | "Group") && names(v))
+            {
+                return true;
+            }
+            continue;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            let cluster = &a[1..];
+            for (at, c) in cluster.char_indices() {
+                if value_letters.contains(c) {
+                    let rest = &cluster[at + c.len_utf8()..];
+                    let value = if rest.is_empty() {
+                        let v = args.get(k).copied();
+                        k += 1;
+                        v
+                    } else {
+                        Some(rest)
+                    };
+                    if who_letters.contains(c) && value.is_some_and(names) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        // A variable assignment before the command (`sudo FOO=1 cmd`) is not the command.
+        if a.contains('=') && matches!(name, "sudo") {
+            continue;
+        }
+        // `runuser [options] [-] [user [argument...]]`: the first operand is the user.
+        if name == "runuser" && operand == 0 && a != "-" {
+            operand += 1;
+            if names(a) {
+                return true;
+            }
+            continue;
+        }
+        break;
+    }
+    unknown && args[k.min(args.len())..].iter().any(|a| names(a))
+}
+
+/// The long options of `sudo`: name, and whether it takes a value (`sudo --help`).
+const SUDO_LONG: &[(&str, bool)] = &[
+    ("askpass", false),
+    ("background", false),
+    ("bell", false),
+    ("close-from", true),
+    ("chdir", true),
+    ("preserve-env", false),
+    ("edit", false),
+    ("group", true),
+    ("set-home", false),
+    ("help", false),
+    ("host", true),
+    ("login", false),
+    ("remove-timestamp", false),
+    ("reset-timestamp", false),
+    ("list", false),
+    ("non-interactive", false),
+    ("preserve-groups", false),
+    ("prompt", true),
+    ("chroot", true),
+    ("role", true),
+    ("stdin", false),
+    ("shell", false),
+    ("type", true),
+    ("command-timeout", true),
+    ("other-user", true),
+    ("user", true),
+    ("version", false),
+    ("validate", false),
+];
+
+/// The long options of `runuser` (`runuser --help`).
+const RUNUSER_LONG: &[(&str, bool)] = &[
+    ("user", true),
+    ("group", true),
+    ("supp-group", true),
+    ("preserve-environment", false),
+    ("whitelist-environment", true),
+    ("login", false),
+    ("command", true),
+    ("session-command", true),
+    ("fast", false),
+    ("shell", true),
+    ("pty", false),
+    ("help", false),
+    ("version", false),
+];
+
+/// The long options of `run0` (run0(1)); `--background` and `--lightweight` take their value
+/// only after `=`.
+const RUN0_LONG: &[(&str, bool)] = &[
+    ("user", true),
+    ("group", true),
+    ("unit", true),
+    ("property", true),
+    ("description", true),
+    ("slice", true),
+    ("slice-inherit", false),
+    ("nice", true),
+    ("chdir", true),
+    ("setenv", true),
+    ("background", false),
+    ("machine", true),
+    ("shell-prompt-prefix", true),
+    ("area", true),
+    ("lightweight", false),
+    ("pty", false),
+    ("pipe", false),
+    ("no-ask-password", false),
+    ("help", false),
+    ("version", false),
+];
+
+/// The long options of `su` and `runuser`: name, and whether it takes a value (su(1), `runuser
+/// --help`).
+const SU_LONG: &[(&str, bool)] = &[
+    ("command", true),
+    ("session-command", true),
+    ("fast", false),
+    ("login", false),
+    ("preserve-environment", false),
+    ("shell", true),
+    ("group", true),
+    ("supp-group", true),
+    ("whitelist-environment", true),
+    ("user", true),
+    ("pty", false),
+    ("help", false),
+    ("version", false),
+];
+
+/// The long options of `script` (script(1)).
+const SCRIPT_LONG: &[(&str, bool)] = &[
+    ("append", false),
+    ("command", true),
+    ("echo", true),
+    ("return", false),
+    ("flush", false),
+    ("force", false),
+    ("log-in", true),
+    ("log-out", true),
+    ("log-io", true),
+    ("log-timing", true),
+    ("logging-format", true),
+    ("output-limit", true),
+    ("quiet", false),
+    ("timing", false),
+    ("version", false),
+    ("help", false),
+];
+
+/// The long options of `flock` (flock(1)).
+const FLOCK_LONG: &[(&str, bool)] = &[
+    ("shared", false),
+    ("exclusive", false),
+    ("unlock", false),
+    ("nonblock", false),
+    ("no-fork", false),
+    ("timeout", true),
+    ("wait", true),
+    ("conflict-exit-code", true),
+    ("close", false),
+    ("command", true),
+    ("verbose", false),
+    ("help", false),
+    ("version", false),
+];
+
+/// The texts `su` and `runuser` run through the shell: the value of `-c`, `--command` and
+/// `--session-command`, written as the programs read them: separate, attached (`-ccmd`), after
+/// `=`, in a cluster of options (`-lc cmd`), a unique prefix of a long name (`--comm`), before or
+/// after the user operand, and after `--` (the arguments there are the shell's).
+fn su_commands<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    command_option_values(
+        args,
+        "cgGswu",
+        SU_LONG,
+        'c',
+        &["command", "session-command"],
+    )
+}
+
+/// The command texts a program is given through an option, read as getopt reads them: `short`
+/// is the one-letter option that carries one and `valued` every one-letter option that takes a
+/// value (so `-qc cmd` is `-q` and `-c cmd`, and `-ccmd` has the value attached); `longs` are the
+/// long options (name, takes a value) and `command` the long names that carry one, each by a
+/// unique prefix, with the value after `=` or as the next word.
+fn command_option_values<'a>(
+    args: &[&'a str],
+    valued: &str,
+    longs: &[(&str, bool)],
+    short: char,
+    command: &[&str],
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut k = 0;
+    while let Some(a) = args.get(k).copied() {
+        k += 1;
+        // After `--` the arguments go to the user's shell, which reads `-c` as su does.
+        if a == "--" {
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            let (opt, attached) = rest
+                .split_once('=')
+                .map_or((rest, None), |(o, v)| (o, Some(v)));
+            let Some((full, takes)) = resolve_long(opt, longs) else {
+                continue;
+            };
+            let value = if attached.is_some() || !takes {
+                attached
+            } else {
+                let v = args.get(k).copied();
+                k += 1;
+                v
+            };
+            if command.contains(&full) {
+                out.extend(value);
+            }
+            continue;
+        }
+        if a.len() > 1 && a.starts_with('-') {
+            let cluster = &a[1..];
+            for (at, c) in cluster.char_indices() {
+                if valued.contains(c) {
+                    let rest = &cluster[at + c.len_utf8()..];
+                    let value = if rest.is_empty() {
+                        let v = args.get(k).copied();
+                        k += 1;
+                        v
+                    } else {
+                        Some(rest)
+                    };
+                    if c == short {
+                        out.extend(value);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The long options of `pkexec` (pkexec(1)).
+const PKEXEC_LONG: &[(&str, bool)] = &[
+    ("user", true),
+    ("keep-cwd", false),
+    ("disable-internal-agent", false),
+    ("help", false),
+    ("version", false),
+];
+
+/// The option `opt` names among `longs`: the exact name, else the one name it is a prefix of.
+fn resolve_long<'a>(opt: &str, longs: &'a [(&'a str, bool)]) -> Option<(&'a str, bool)> {
+    if let Some(&(n, v)) = longs.iter().find(|(n, _)| *n == opt) {
+        return Some((n, v));
+    }
+    let mut hits = longs
+        .iter()
+        .filter(|(n, _)| !opt.is_empty() && n.starts_with(opt));
+    match (hits.next(), hits.next()) {
+        (Some(&(n, v)), None) => Some((n, v)),
+        _ => None,
     }
 }
 
@@ -374,7 +719,7 @@ const COMMAND_OPTIONS: [(&str, &[&str]); 10] = [
 /// Programs that run none of their arguments as commands, except through [`COMMAND_OPTIONS`]. After
 /// any other program, the words that follow are judged as if that program could run them (an
 /// unknown wrapper).
-const NEVER_RUNS: [&str; 73] = [
+const NEVER_RUNS: &[&str] = &[
     "rg",
     "git",
     "sed",
@@ -448,6 +793,9 @@ const NEVER_RUNS: [&str; 73] = [
     "rm",
     "gh",
     "lunchroom",
+    // Their command is the text of `-c`, judged where it is read (`nested_at`).
+    "runuser",
+    "su",
 ];
 
 /// `word` is longer than the system takes as a path, or holds a name longer than it takes.
@@ -460,6 +808,7 @@ const MAX_NESTING: usize = 4;
 
 /// The most severe class seen so far (the one shown), and every PROTECTED kind seen: the policy
 /// follows the kinds, so choosing a class to show never discards a restriction (P1.6, R3.1).
+#[allow(clippy::struct_excessive_bools)] // independent facts about one call, read separately
 struct Acc {
     class: CallClass,
     kinds: ProtectedKinds,
@@ -476,6 +825,256 @@ struct Acc {
     /// How many path-like strings this call has had resolved against the file system
     /// ([`MAX_RESOLVED`]).
     resolved: usize,
+    /// What the call reads, searches and writes ([`Access`]).
+    access: Access,
+    /// The call has more path-like strings than the guard resolves ([`MAX_RESOLVED`]) and is not a
+    /// reply: DENIED at the end of the call unless a narrower rule already denied it.
+    too_many: bool,
+    /// The statements of a script the reader could not read whole are being judged one by one: the
+    /// folder each runs in is not known (a `cd` may sit in a construct the reader skipped), so a
+    /// program named by a relative path is not required to exist.
+    lenient: bool,
+    /// The files this call writes with text it shows (P1.4: a file written and then run in one
+    /// call is judged on the text written).
+    written: Vec<WrittenFile>,
+}
+
+/// How a command uses the path a word names ([`Access`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dir {
+    Read,
+    Write,
+    Both,
+    /// Judged by the path rules, but no path the call reads or writes: the name of a program the
+    /// system finds through `PATH`.
+    Skip,
+}
+
+impl Acc {
+    /// Records `paths` in the call's access, as read, written or both.
+    fn note(&mut self, dir: Dir, paths: &[PathBuf]) {
+        for p in paths {
+            if matches!(dir, Dir::Read | Dir::Both) {
+                self.access.reads.insert(p.clone());
+            }
+            if matches!(dir, Dir::Write | Dir::Both) {
+                self.access.writes.insert(p.clone());
+            }
+        }
+    }
+}
+
+/// A file one call writes, for the commands of the call that run it.
+struct WrittenFile {
+    /// The file as the call spells it.
+    literal: String,
+    /// The file, made absolute and lexically normal from the call's working folder.
+    path: PathBuf,
+    /// The text written, where the call shows it whole.
+    body: Option<String>,
+    /// The text is being judged now (a file that runs itself is judged once).
+    active: bool,
+}
+
+/// The words of one piece of text that run a file: a program named by a path, the script a shell or
+/// an interpreter is given, and the file `source` reads, each with how it is run.
+fn run_targets(t: &[&str]) -> Vec<(usize, RunAs)> {
+    let positions = program_positions(t);
+    let runnable = runnable_positions(t, &positions);
+    let mut out: Vec<(usize, RunAs)> = positions
+        .iter()
+        .filter(|&&p| t[p].contains('/'))
+        .map(|&p| (p, RunAs::Auto))
+        .collect();
+    for k in script_positions(t, &runnable) {
+        let runner = runnable
+            .iter()
+            .rev()
+            .find(|&&p| p < k)
+            .map(|&p| basename(t[p]));
+        let how = if runner.is_some_and(|n| SHELLS.contains(&n)) {
+            RunAs::Shell
+        } else {
+            RunAs::Code
+        };
+        out.push((k, how));
+    }
+    for &p in &positions {
+        if matches!(basename(t[p]), "source" | ".") && p + 1 < t.len() {
+            out.push((p + 1, RunAs::Shell));
+        }
+    }
+    out
+}
+
+/// How a command runs a file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunAs {
+    /// By its path or its `#!` line, or its name's ending.
+    Auto,
+    /// As a script of a shell.
+    Shell,
+    /// As code of an interpreter.
+    Code,
+}
+
+/// Text written to a file is code of an interpreter, not a shell script: it starts with a `#!`
+/// line naming one that is no shell, or (with no such line) its name ends as a program of one does.
+fn script_is_code(text: &str, name: &str) -> bool {
+    if let Some(line) = text.strip_prefix("#!") {
+        let first = line.lines().next().unwrap_or_default();
+        let mut words = first.split_whitespace();
+        let mut prog = words.next().map(basename);
+        if prog == Some("env") {
+            prog = words.find(|a| !a.starts_with('-') && !is_assignment(a));
+        }
+        return !prog.is_some_and(|n| SHELLS.contains(&n));
+    }
+    Path::new(name).extension().is_some_and(|e| {
+        matches!(
+            e.to_str().unwrap_or_default(),
+            "py" | "pl" | "rb" | "js" | "mjs" | "cjs" | "php" | "lua" | "r" | "ts" | "tcl" | "awk"
+        )
+    })
+}
+
+/// One statement of a shell script, ready to be judged as a command of its own: the control words
+/// of the shell off its front, a function's header off, `for x in …` as the words it lists, a `[[ … ]]`
+/// test as the words in it; `None` for nothing left (a comment, `fi`, `done`, `{`).
+fn script_piece(raw: &str) -> Option<String> {
+    const CONTROL: [&str; 17] = [
+        "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time",
+        "esac", ";;", "in", "function",
+    ];
+    let mut s = raw.trim();
+    loop {
+        let before = s;
+        // `name() {`, `name () {`
+        if let Some(open) = s.find("()") {
+            let name = s[..open].trim();
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+            {
+                s = s[open + 2..].trim_start();
+            }
+        }
+        let first = s.split_whitespace().next().unwrap_or_default();
+        if CONTROL.contains(&first) {
+            s = s[first.len()..].trim_start();
+        }
+        if s == before {
+            break;
+        }
+    }
+    if s.is_empty() || s.starts_with('#') {
+        return None;
+    }
+    // `for x in a b c` / `select x in a b c`: the words listed are data the loop hands on.
+    if let Some(rest) = s.strip_prefix("for ").or_else(|| s.strip_prefix("select ")) {
+        return Some(match rest.split_once(" in ") {
+            Some((_, list)) => format!(": {}", list.trim()),
+            None => ":".to_owned(),
+        });
+    }
+    if let Some(inner) = s.strip_prefix("[[") {
+        return Some(format!(": {}", inner.trim().trim_end_matches("]]").trim()));
+    }
+    Some(s.to_owned())
+}
+
+/// What `text` writes and reads, per word, for the words of one command: a redirect target that
+/// opens its file for writing, and the operands the command's program writes ([`Access`]).
+fn word_dirs(words: &[Word], texts: &[&str], positions: &[usize]) -> Vec<Dir> {
+    let mut dirs: Vec<Dir> = words
+        .iter()
+        .enumerate()
+        .map(|(k, w)| {
+            if w.write {
+                Dir::Write
+            } else if positions.contains(&k) && !w.text.contains('/') && !w.redirect {
+                Dir::Skip
+            } else {
+                Dir::Read
+            }
+        })
+        .collect();
+    for &p in positions {
+        let name = basename(texts[p]);
+        let idx: Vec<usize> = (p + 1..texts.len())
+            .filter(|&k| !words[k].redirect)
+            .collect();
+        let args: Vec<&str> = idx.iter().map(|&k| texts[k]).collect();
+        for (i, both) in writes::operand_writes(name, &args) {
+            dirs[idx[i]] = if both { Dir::Both } else { Dir::Write };
+        }
+    }
+    dirs
+}
+
+/// The end of the path segment that begins `s`: its first `/`, white space, quote or separator
+/// outside a `$(…)`, a `${…}` and a pair of backquotes.
+fn segment_end(s: &str) -> usize {
+    let b = s.as_bytes();
+    let (mut depth, mut tick, mut i) = (0usize, false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'`' => tick = !tick,
+            b'$' if matches!(b.get(i + 1), Some(b'(' | b'{')) => {
+                depth += 1;
+                i += 1;
+            }
+            b'(' | b'{' if depth > 0 => depth += 1,
+            b')' | b'}' if depth > 0 => depth -= 1,
+            c if depth == 0
+                && !tick
+                && (c == b'/'
+                    || c.is_ascii_whitespace()
+                    || matches!(c, b'"' | b'\'' | b';' | b'&' | b'|')) =>
+            {
+                return i;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// A segment that is not written out: a variable, a substitution, a wildcard, `$$`.
+fn unwritten_segment(seg: &str) -> bool {
+    seg.contains(['$', '`', '{', '(', '*', '?', '['])
+}
+
+/// §17.5: a path `/proc/<pid>/{mem,environ,fd,maps}` (or `/proc/<pid>/task/<tid>/…`) in text the
+/// guard cannot read in full, whose process id (or thread id) is not written: a variable, a
+/// substitution, `$$`. The path as the call wrote it.
+fn proc_secret_unwritten(text: &str) -> Option<String> {
+    let mut rest = text;
+    while let Some(k) = rest.find("/proc/") {
+        let after = &rest[k + "/proc/".len()..];
+        let (seg, tail) = after.split_at(segment_end(after));
+        if let Some(next) = tail.strip_prefix('/') {
+            let (mut name, mut after_name) = next.split_at(segment_end(next));
+            let mut unwritten = unwritten_segment(seg);
+            // `/proc/<pid>/task/<tid>/environ`
+            if name == "task"
+                && let Some(t) = after_name.strip_prefix('/')
+            {
+                let (tid, tail) = t.split_at(segment_end(t));
+                unwritten |= unwritten_segment(tid);
+                let u = tail.strip_prefix('/').unwrap_or_default();
+                (name, after_name) = u.split_at(segment_end(u));
+            }
+            let _ = after_name;
+            if unwritten && matches!(name, "mem" | "environ" | "fd" | "maps") {
+                return Some(format!("/proc/{seg}/{name}"));
+            }
+        }
+        rest = after;
+    }
+    None
 }
 
 const fn rank(c: CallClass) -> u8 {
@@ -502,7 +1101,42 @@ impl Acc {
             reply: false,
             fault: None,
             resolved: 0,
+            access: Access {
+                reads: BTreeSet::new(),
+                searches: BTreeSet::new(),
+                writes: BTreeSet::new(),
+            },
+            written: Vec::new(),
+            too_many: false,
+            lenient: false,
         }
+    }
+
+    /// Takes what a part of the call (a script it runs) found: DENIED with what it found at
+    /// fault, every PROTECTED kind and class, a new session, the paths resolved and the access.
+    fn absorb(&mut self, sub: Self) {
+        // The reason a rule gave first stays the one shown (F1.2: `unparsed` is the reason within
+        // its class only where no rule named a narrower one).
+        if !self.denied() {
+            self.deny_from(&sub);
+        }
+        self.kinds = self.kinds.union(sub.kinds);
+        if let CallClass::Protected(_) = sub.class {
+            self.raise(sub.class);
+        }
+        self.new_session |= sub.new_session;
+        self.too_many |= sub.too_many;
+        self.resolved = sub.resolved;
+        self.access.extend(sub.access);
+        self.written = sub.written;
+    }
+
+    /// The file written by this call under the spelling `f`, from `here`.
+    fn written_as(&self, f: &str, here: &Path, home: &Path) -> Option<&WrittenFile> {
+        let path = normalize(f, here, home);
+        self.written
+            .iter()
+            .find(|w| w.path == path || w.literal == f)
     }
 
     /// Raises DENIED for `r`, noting `what` (V1.4) when this rule's class is the one shown and no
@@ -541,9 +1175,16 @@ impl Acc {
     }
 
     const fn call(&self) -> Call {
+        // P1.4: a command the guard cannot parse is PROTECTED (F1.2) and, since Lunchroom cannot
+        // read it to the end, also GATED: the call carries both kinds.
+        let kinds = if self.kinds.contains(ProtectedKind::Unparsed) {
+            self.kinds.with(ProtectedKind::Gated)
+        } else {
+            self.kinds
+        };
         Call {
             class: self.class,
-            kinds: self.kinds,
+            kinds,
         }
     }
 }
@@ -557,6 +1198,10 @@ struct Forms {
     capped: Option<PathBuf>,
     /// The file could not be settled: it may be anywhere.
     unresolved: bool,
+    /// It was left unsettled because a look at it was cut short by the time (L1.1: one Lunchroom
+    /// could not check), not because it cannot be followed. Known per path, never from the call's
+    /// other paths.
+    timed_out: bool,
 }
 
 impl Forms {
@@ -675,9 +1320,16 @@ fn tokens(text: &str) -> Vec<&str> {
 
 /// The most path-like strings one call has looked up in the file system (links, wildcards,
 /// folders). Past it a string is judged by its text alone, which still finds a store or transcript
-/// path written out in full, and a HELD call is PROTECTED as unparsed unless it is a reply, whose
-/// words are text to send, not files.
+/// path written out in full, and the call is DENIED in every session (§11 L1.1) with a message that
+/// says to split it, unless it is a reply, whose words are text to send, not files: a HELD reply is
+/// PROTECTED as unparsed for the strings left unread.
 const MAX_RESOLVED: usize = 1_000;
+
+/// What a call with more than [`MAX_RESOLVED`] path-like strings is DENIED for, as the message
+/// shows it (V1.4, the part at fault). The reason is `unparsed`: the guard cannot read the call in
+/// full.
+pub const TOO_MANY_PATHS: &str =
+    "more than 1,000 path-like strings in one call; split it into smaller calls";
 
 /// The path-like strings in one word: the word, its parts, and each part from its first `/` or `~`;
 /// each once (a set, not a search of the list: a text of thousands of words took time in
@@ -728,6 +1380,20 @@ fn prog_names(w: &Word) -> Vec<&str> {
 fn has_flag(args: &[&str], set: &[&str]) -> bool {
     args.iter()
         .any(|a| set.contains(&a.split('=').next().unwrap_or(a)))
+}
+
+/// P1.4: Claude Code is started without the user's settings, which hold the guard's hooks:
+/// `--bare`, or `--setting-sources` with a list (comma-separated) that does not name `user`.
+fn without_user_settings(args: &[&str]) -> bool {
+    has_flag(args, &["--bare"])
+        || args.iter().enumerate().any(|(k, a)| {
+            let list = if *a == "--setting-sources" {
+                Some(args.get(k + 1).copied().unwrap_or_default())
+            } else {
+                a.strip_prefix("--setting-sources=")
+            };
+            list.is_some_and(|l| !l.split(',').any(|s| s.trim() == "user"))
+        })
 }
 
 /// One of `letters` is in a cluster of short options (`-rc`).
@@ -786,27 +1452,38 @@ fn fence_args(prog: &str, args: &[&str]) -> bool {
 ///
 /// `bare`: a prompt given with no option or command counts. It does for a command; it does not for
 /// the words of a script or code, where a name followed by any word is prose (`claude is good`).
-fn starts_session(prog: &str, args: &[&str], bare: bool) -> bool {
+#[must_use]
+pub fn starts_session(prog: &str, args: &[&str], bare: bool) -> bool {
     let first = args.iter().find(|a| !a.starts_with('-'));
     match prog {
         // `claude [options] [command] [prompt]`: `-p`/`--print`, `--bg`, or a first word that is
-        // not one of its commands. `--help` and `--version` start nothing.
+        // not one of its commands. `--help` and `--version` start nothing. P1.4: Claude Code
+        // started without the user's settings, which hold the guard's hooks, is one as well.
         "claude" => {
             !has_flag(args, &["--help", "-h", "--version", "-v"])
                 && (has_flag(args, &["--print", "--bg", "--background"])
                     || has_cluster(args, &['p'])
+                    || without_user_settings(args)
                     || (bare && first.is_some_and(|a| !NOT_A_PROMPT.contains(a))))
         }
         // `codex [OPTIONS] [PROMPT]`; `exec`, `e`, `review` and `fork` are not in `NOT_A_PROMPT`.
+        // P1.4: each option before the first word is passed over as the option table of Codex
+        // 0.163.0 defines it (`codex_cli`), so `codex -m <model> exec` is recognised; an option
+        // that table does not hold makes the command count as starting a session.
         "codex" => {
             !has_flag(args, &["--help", "-h", "--version", "-V"])
-                && first.is_some_and(|a| {
-                    if bare {
-                        !NOT_A_PROMPT.contains(a)
-                    } else {
-                        matches!(*a, "exec" | "e" | "review" | "fork")
+                && match crate::codex_cli::first_word(args) {
+                    crate::codex_cli::FirstWord::UnknownOption => true,
+                    crate::codex_cli::FirstWord::None => false,
+                    crate::codex_cli::FirstWord::Word(at) => {
+                        let a = args[at];
+                        if bare {
+                            !NOT_A_PROMPT.contains(&a)
+                        } else {
+                            matches!(a, "exec" | "e" | "review" | "fork")
+                        }
                     }
-                })
+                }
         }
         // `opencode run [message..]`, `opencode pr <n>`, and the default interface's `--prompt`.
         "opencode" => has_flag(args, &["--prompt"]) || matches!(first, Some(&("run" | "pr"))),
@@ -829,9 +1506,19 @@ fn starts_session(prog: &str, args: &[&str], bare: bool) -> bool {
 /// (`codex` … `queue`), a Lunchroom command only the user may run, or a local session chat API. A
 /// name alone (a comment, a message) is not a match.
 fn code_rules(text: &str) -> Option<DenyReason> {
+    code_rules_as_written(text)
+        .or_else(|| escapes::decode(text).and_then(|d| code_rules_as_written(&d)))
+}
+
+/// [`code_rules`] on the text as it stands.
+fn code_rules_as_written(text: &str) -> Option<DenyReason> {
     // I1.2 first: an identity variable named, or the environment cleared, in any statement.
     if mentions_identity(text) {
         return Some(DenyReason::Fence);
+    }
+    // F1.4: `TIOCSTI` or its number types into a terminal's input.
+    if names_tiocsti(text) {
+        return Some(DenyReason::Configuration);
     }
     for stmt in statements(text) {
         // Words with a letter or digit in them; quotes, commas and brackets between are skipped.
@@ -845,25 +1532,204 @@ fn code_rules(text: &str) -> Option<DenyReason> {
             if FENCE_PROGRAMS.contains(&name) && fence_args(name, after) {
                 return Some(DenyReason::Fence);
             }
-            // A Lunchroom command only the user may run (A1.3; §15 limit 8: a mention counts).
-            // After help (`--help approve`) a user-only command still counts. Any other word
-            // after the name runs nothing: Lunchroom takes its command from its first argument
-            // and prints its usage for anything else (main.rs), so `--repo
-            // epic-ai-io/lunchroom --pattern x` is not a Lunchroom command.
-            let lead = after
-                .iter()
-                .take_while(|n| matches!(**n, "help" | "--help" | "-h" | "--version"))
-                .count();
-            if LUNCHROOM_NAMES.contains(&name)
-                && after
-                    .get(lead)
-                    .is_some_and(|n| LUNCHROOM_USER_ONLY.contains(n))
-            {
+            if names_user_only_command(name, after) {
                 return Some(DenyReason::Configuration);
             }
         }
     }
     names_chat_api(text).then_some(DenyReason::Fence)
+}
+
+/// A Lunchroom command only the user may run (A1.3; §15 limit 8: a mention counts): `name` is
+/// Lunchroom's, and `after` begins with one of [`LUNCHROOM_USER_ONLY`]. After help (`--help
+/// approve`) a user-only command still counts. Any other word after the name runs nothing:
+/// Lunchroom takes its command from its first argument and prints its usage for anything else
+/// (main.rs), so `--repo epic-ai-io/lunchroom --pattern x` is not a Lunchroom command.
+fn names_user_only_command(name: &str, after: &[&str]) -> bool {
+    let lead = after
+        .iter()
+        .take_while(|n| matches!(**n, "help" | "--help" | "-h" | "--version"))
+        .count();
+    LUNCHROOM_NAMES.contains(&name)
+        && after
+            .get(lead)
+            .is_some_and(|n| LUNCHROOM_USER_ONLY.contains(n))
+}
+
+/// §7 A1.3: script or code text, other than Lunchroom's own program, mentions a Lunchroom command
+/// only the user may run, anywhere in its text, a string it only prints included.
+fn lunchroom_mention(text: &str) -> Option<String> {
+    lunchroom_mention_as_written(text)
+        .or_else(|| escapes::decode(text).and_then(|d| lunchroom_mention_as_written(&d)))
+}
+
+/// [`lunchroom_mention`] on the text as it stands.
+fn lunchroom_mention_as_written(text: &str) -> Option<String> {
+    statements(text).into_iter().find_map(|stmt| {
+        let words: Vec<&str> = tokens(stmt)
+            .into_iter()
+            .filter(|t| t.chars().any(char::is_alphanumeric))
+            .collect();
+        words.iter().enumerate().find_map(|(k, t)| {
+            let after = words.get(k + 1..).unwrap_or_default();
+            names_user_only_command(basename(t), after).then(|| {
+                let lead = after
+                    .iter()
+                    .take_while(|n| matches!(**n, "help" | "--help" | "-h" | "--version"))
+                    .count();
+                format!("{t} {}", after[lead])
+            })
+        })
+    })
+}
+
+/// Code names `ptrace`, or calls `syscall` with the number of `ptrace` (26 on 32-bit x86 and Arm,
+/// 101 on x86-64, 117 on 64-bit Arm).
+///
+/// The target of a call is set when the code runs, and the guard judges code by its text (K1.8), so
+/// the text is read as written, with its escapes decoded and with the pieces of a string joined
+/// (`'pt' + 'race'`, `chr(112) + …`); a system call whose number is not one integer literal
+/// (`syscall(n, …)`, `syscall(100 + 1, …)`) and a name written reversed or encoded (rot13,
+/// base64, hex) count as well, since no text shows which call they make.
+fn names_ptrace(text: &str) -> bool {
+    let mut views = vec![text.to_owned()];
+    views.extend(escapes::decode(text));
+    for k in 0..views.len() {
+        views.extend(escapes::fold(&views[k]));
+    }
+    views.iter().any(|v| names_ptrace_as_written(v))
+}
+
+/// [`names_ptrace`] on the text as it stands.
+fn names_ptrace_as_written(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // `ptrace` as it is, reversed, in rot13, in base64 (`cHRyYWNl`) and in hex.
+    lower.contains("ptrace")
+        || lower.contains("ecartp")
+        || lower.contains("cgenpr")
+        || text.contains("cHRyYWNl")
+        || text.contains("UFRSQUNF")
+        || lower.contains("707472616365")
+        || syscall_number_unwritten(&lower)
+        || statements(text).into_iter().any(|stmt| {
+            let words = number_words(stmt);
+            stmt.to_ascii_lowercase().contains("syscall")
+                && words.iter().any(|n| matches!(n, 26 | 101 | 117))
+        })
+}
+
+/// The commands a debugger is given on its command line: the value of `-ex`, `-iex`,
+/// `--eval-command`, `--init-eval-command` (gdb) and `-o`, `-O`, `--one-line`,
+/// `--one-line-before-file` (lldb), after a space or an `=`.
+fn debugger_payloads<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    const OPTIONS: [&str; 8] = [
+        "-ex",
+        "-iex",
+        "-eval-command",
+        "-init-eval-command",
+        "-o",
+        "-O",
+        "-one-line",
+        "-one-line-before-file",
+    ];
+    let mut out = Vec::new();
+    let mut k = 0;
+    while let Some(a) = args.get(k).copied() {
+        k += 1;
+        let plain = a.trim_start_matches('-');
+        let (name, attached) = match plain.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (plain, None),
+        };
+        if a.starts_with('-') && OPTIONS.iter().any(|o| o.trim_start_matches('-') == name) {
+            if let Some(v) = attached {
+                out.push(v);
+            } else if let Some(v) = args.get(k).copied() {
+                out.push(v);
+                k += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Code calls `syscall(` with a first argument that is not one integer literal: its number is a
+/// variable or an expression, which may be that of `ptrace`.
+fn syscall_number_unwritten(lower: &str) -> bool {
+    let mut rest = lower;
+    while let Some(k) = rest.find("syscall") {
+        let after = rest[k + "syscall".len()..].trim_start();
+        rest = &rest[k + "syscall".len()..];
+        let Some(args) = after.strip_prefix('(') else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let end = args
+            .char_indices()
+            .find(|(_, c)| match c {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    false
+                }
+                ')' | ']' | '}' => {
+                    if depth == 0 {
+                        return true;
+                    }
+                    depth -= 1;
+                    false
+                }
+                ',' => depth == 0,
+                _ => false,
+            })
+            .map_or(args.len(), |(i, _)| i);
+        let first = args[..end].trim();
+        let literal = first.starts_with(|c: char| c.is_ascii_digit())
+            && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && number_words(first).len() == 1;
+        if !first.is_empty() && !literal {
+            return true;
+        }
+    }
+    false
+}
+
+/// The values of the integer literals in `text` (decimal, `0x`, `0o`, `0b`, a leading `0` for
+/// octal), whatever the base they are written in. A literal too large for 64 bits is left out.
+fn number_words(text: &str) -> Vec<u64> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter_map(|w| {
+            let w = w.replace('_', "");
+            let lower = w.to_ascii_lowercase();
+            let (digits, radix) = if let Some(h) = lower.strip_prefix("0x") {
+                (h.to_owned(), 16)
+            } else if let Some(o) = lower.strip_prefix("0o") {
+                (o.to_owned(), 8)
+            } else if let Some(b) = lower.strip_prefix("0b") {
+                (b.to_owned(), 2)
+            } else if lower.len() > 1 && lower.starts_with('0') {
+                (lower[1..].to_owned(), 8)
+            } else {
+                (lower, 10)
+            };
+            // A suffix such as `L` or `UL` on a C-style literal.
+            let digits = digits.trim_end_matches(['l', 'u']);
+            u64::from_str_radix(digits, radix).ok()
+        })
+        .collect()
+}
+
+/// §12 F1.4: code names `TIOCSTI`, the ioctl that types into a terminal's input, or its number
+/// (`0x5412`, `21522`, or the same value in any other base).
+fn names_tiocsti(text: &str) -> bool {
+    names_tiocsti_as_written(text)
+        || escapes::decode(text).is_some_and(|d| names_tiocsti_as_written(&d))
+}
+
+/// [`names_tiocsti`] on the text as it stands.
+fn names_tiocsti_as_written(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| w.eq_ignore_ascii_case("tiocsti"))
+        || number_words(text).contains(&0x5412)
 }
 
 /// Script or code text names a program that starts a new agent session, in a statement, as
@@ -933,6 +1799,54 @@ fn passes_a_prompt(text: &str) -> bool {
     })
 }
 
+/// The PROTECTED kinds ([`protected_kind`]) of the commands that code spells out as strings: each
+/// quoted string read as a command (`os.system('git push')`), and each list of strings as the
+/// words of one (`run(['git', 'push'])`). Code builds a command in ways no text shows, which only
+/// fewer kinds are found in; a string that reads as a command of one of the kinds counts, whatever
+/// the code does with it.
+fn code_kinds(text: &str) -> Vec<ProtectedKind> {
+    let mut out: Vec<ProtectedKind> = Vec::new();
+    let mut judge = |command: &str| {
+        let Parsed::Commands(cmds) = shell::parse(command, "/") else {
+            return;
+        };
+        for c in &cmds {
+            let t: Vec<&str> = c.words.iter().map(|w| w.text.as_str()).collect();
+            for p in program_positions(&t) {
+                if let Some(kind) = protected_kind(basename(t[p]), &t[p + 1..])
+                    && !out.contains(&kind)
+                {
+                    out.push(kind);
+                }
+            }
+        }
+    };
+    let spans = quoted_spans(text);
+    for (start, end) in &spans {
+        judge(&text[start + 1..*end]);
+    }
+    // A list or a call's arguments: strings separated by commas only, after `[` or `(`.
+    for (k, (start, end)) in spans.iter().enumerate() {
+        if !text[..*start].trim_end().ends_with(['[', '(']) {
+            continue;
+        }
+        let mut words = vec![&text[start + 1..*end]];
+        let mut from = *end;
+        for (s, e) in &spans[k + 1..] {
+            let between = &text[from + 1..*s];
+            if !between.contains(',') || between.contains([')', ']', ';']) {
+                break;
+            }
+            words.push(&text[s + 1..*e]);
+            from = *e;
+        }
+        if words.len() > 1 {
+            judge(&words.join(" "));
+        }
+    }
+    out
+}
+
 /// The most files one `apply_patch` call is judged by. A patch naming more is judged by the first
 /// this many and the HELD call is then PROTECTED as unparsed.
 const MAX_PATCH_PATHS: usize = 200;
@@ -990,7 +1904,7 @@ fn string_leaves<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
 /// backslash: quoted text is one word (field, 2026-11-02: `grep "fn bash(&self" x.rs` split at the
 /// `&` made a program `self" x.rs`, missing, DENIED in every session). A quote never closed runs
 /// to the end. Each piece is the original text, quotes and all.
-fn split_unquoted(text: &str) -> Vec<&str> {
+pub(super) fn split_unquoted(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut start = 0;
     let mut quote: Option<char> = None;
@@ -1032,7 +1946,7 @@ fn split_unquoted(text: &str) -> Vec<&str> {
 /// Shell text with each heredoc's body lines removed: after a line holding `<<WORD` (`<<-`,
 /// quoted or not), the lines up to the one that is `WORD` alone. A heredoc never closed takes the
 /// rest of the text. A line of an unquoted body holding a substitution stays: the shell runs it.
-fn without_heredoc_bodies(text: &str) -> String {
+pub(super) fn without_heredoc_bodies(text: &str) -> String {
     let mut out = String::new();
     let mut closing: Vec<(String, bool)> = Vec::new();
     for line in text.lines() {
@@ -1078,8 +1992,25 @@ fn runs_text(name: &str) -> bool {
     SHELLS.contains(&name)
         || INTERPRETERS.contains(&name)
         || name.starts_with("python")
+        || DEFERRED_RUNNERS.contains(&name)
         || matches!(name, "eval" | "source" | "." | "ssh" | "su" | "watch")
 }
+
+/// Programs that start a job to run later or in a session of its own, with text the call hands them
+/// (§7 A1.3 and item 61: "a detached process … a scheduled job"). `setsid`, `nohup` and `xargs`
+/// run their command at once, and are wrappers ([`wrapper_inner`]).
+const DEFERRED_RUNNERS: [&str; 10] = [
+    "at",
+    "batch",
+    "crontab",
+    "systemd-run",
+    "tmux",
+    "screen",
+    "dtach",
+    "abduco",
+    "daemonize",
+    "start-stop-daemon",
+];
 
 /// A channel's name, or a Lunchroom command only the user may run, at the `live` positions.
 fn names_channel(toks: &[&str], live: &[usize]) -> bool {
@@ -1258,7 +2189,8 @@ fn script_positions(texts: &[&str], runnable: &[usize]) -> Vec<usize> {
 /// I1.2 in script or code text: some statement names an identity variable or clears the
 /// environment ([`changes_identity`]).
 fn mentions_identity(text: &str) -> bool {
-    statements(text).into_iter().any(changes_identity)
+    let named = |t: &str| statements(t).into_iter().any(changes_identity);
+    named(text) || escapes::decode(text).is_some_and(|d| named(&d))
 }
 
 /// I1.2 in one statement of script or code: it names an identity variable, or it clears the whole
@@ -1428,7 +2360,57 @@ fn protected_kind(prog: &str, args: &[&str]) -> Option<ProtectedKind> {
 
 /// Where a wrapper (`sudo`, `env`, `timeout`, ...) at `i` starts the program it runs.
 fn wrapper_inner(texts: &[&str], i: usize) -> Option<usize> {
+    wrapper_scan(texts, i).map(|(j, _)| j)
+}
+
+/// The `-ex` commands of a gdb that starts a program of its own, each of which only runs, shows or
+/// ends that program.
+const GDB_COMMANDS: [&str; 8] = ["run", "r", "bt", "backtrace", "continue", "c", "quit", "q"];
+
+/// §17 item 5 (decision of 2026-11-14, "Follow spec, narrowly", and "Your pick, as chosen"): the gdb at
+/// `i` starts a program of its own in the chosen form: `-nx` (`--nx`, `-n`: no `.gdbinit`
+/// is read), then only `--batch`/`-batch` and `-q`/`-quiet`/`-silent` (each with one or two
+/// dashes, none of which runs a command) and `-ex`/`--eval-command` options whose value is one of
+/// [`GDB_COMMANDS`], ending with `--args` and the program. The position of the program and of the
+/// `-ex` values; `None` for any other gdb call (an `-ex` not on the list, `-x`, an init file),
+/// which stays unreadable. Stated limit (chosen with this known): gdb's `run` starts the
+/// program through `$SHELL` by default (GDB manual, "Starting"), which the guard does not read.
+fn gdb_starts_its_own(texts: &[&str], i: usize) -> Option<(usize, Vec<usize>)> {
+    let mut nx = false;
+    let mut values = Vec::new();
+    let mut j = i + 1;
+    while let Some(a) = texts.get(j) {
+        let bare = a.strip_prefix("--").or_else(|| a.strip_prefix('-'));
+        match bare {
+            Some("args") => {
+                return (nx && j + 1 < texts.len()).then_some((j + 1, values));
+            }
+            Some("nx" | "n") => nx = true,
+            Some("batch" | "q" | "quiet" | "silent") => {}
+            Some("ex" | "eval-command") => {
+                if !GDB_COMMANDS.contains(texts.get(j + 1)?) {
+                    return None;
+                }
+                values.push(j + 1);
+                j += 1;
+            }
+            _ => return None,
+        }
+        j += 1;
+    }
+    None
+}
+
+/// [`wrapper_inner`], with the positions of the words that are the values of the wrapper's options.
+#[allow(clippy::too_many_lines)] // the option table of each wrapper
+fn wrapper_scan(texts: &[&str], i: usize) -> Option<(usize, Vec<usize>)> {
     let name = basename(texts[i]);
+    // §17 item 5: gdb that starts a program of its own runs, read through to that program, in the
+    // one form whose every command the guard reads (F2 design, "Guard rules"); any other gdb
+    // call wraps nothing the guard can read.
+    if name == "gdb" {
+        return gdb_starts_its_own(texts, i);
+    }
     let with_value: &[&str] = match name {
         "sudo" => &[
             "-u",
@@ -1447,11 +2429,58 @@ fn wrapper_inner(texts: &[&str], i: usize) -> Option<usize> {
             "--host",
             "--prompt",
             "--chdir",
+            "--chroot",
+            "--close-from",
+            "--command-timeout",
             "--role",
             "--type",
             "--other-user",
         ],
         "doas" => &["-u", "-C"],
+        "pkexec" => &["--user"],
+        // run0(1): the options that take a value.
+        "run0" => &[
+            "-u",
+            "-g",
+            "-D",
+            "--user",
+            "--group",
+            "--chdir",
+            "--unit",
+            "--property",
+            "--description",
+            "--slice",
+            "--nice",
+            "--setenv",
+            "--machine",
+            "--shell-prompt-prefix",
+            "--area",
+        ],
+        // `runuser -u user [--] command` runs a command; without `-u` the first operand is the
+        // user and the command is the text of `-c`, which is judged where it is read.
+        "runuser"
+            if texts[i + 1..].iter().any(|a| {
+                matches!(*a, "-u" | "--user")
+                    || a.starts_with("--user=")
+                    || (a.starts_with('-') && !a.starts_with("--") && a.contains('u'))
+            }) =>
+        {
+            &[
+                "-u",
+                "-g",
+                "-G",
+                "-s",
+                "-w",
+                "-c",
+                "--user",
+                "--group",
+                "--supp-group",
+                "--shell",
+                "--whitelist-environment",
+                "--command",
+                "--session-command",
+            ]
+        }
         "env" => &["-u", "-C", "--unset", "--chdir"],
         "timeout" => &["-k", "-s", "--kill-after", "--signal"],
         "nice" => &["-n", "--adjustment"],
@@ -1488,6 +2517,7 @@ fn wrapper_inner(texts: &[&str], i: usize) -> Option<usize> {
         _ => return None,
     };
     let mut j = i + 1;
+    let mut values = Vec::new();
     while let Some(a) = texts.get(j) {
         if *a == "--" {
             j += 1;
@@ -1500,12 +2530,28 @@ fn wrapper_inner(texts: &[&str], i: usize) -> Option<usize> {
         if !a.starts_with('-') {
             break;
         }
-        j += if with_value.contains(a) { 2 } else { 1 };
+        if with_value.contains(a) {
+            values.push(j + 1);
+            j += 2;
+        } else {
+            j += 1;
+        }
     }
     if matches!(name, "timeout" | "taskset" | "flock" | "chroot") {
         j += 1; // the duration, CPU mask, lock file or new root before the program
     }
-    Some(j)
+    // `flock FILE -c 'text'` runs the text through a shell: no program follows the lock file.
+    if name == "flock"
+        && !command_option_values(&texts[i + 1..], "wEc", FLOCK_LONG, 'c', &["command"]).is_empty()
+    {
+        j = texts.len();
+    }
+    Some((j, values))
+}
+
+/// The words that are the values of the options of the wrapper at `i` (`sudo --prompt X`).
+fn wrapper_values(texts: &[&str], i: usize) -> Vec<usize> {
+    wrapper_scan(texts, i).map_or_else(Vec::new, |(_, values)| values)
 }
 
 /// The positions in a command that hold the program it runs, through any wrappers.
@@ -1542,7 +2588,13 @@ fn program_positions(texts: &[&str]) -> Vec<usize> {
 /// The positions the always-DENIED rules judge as programs: the known program positions, and every
 /// later word of a program that is not known never to run its arguments (`mywrap codex queue`).
 fn runnable_positions(texts: &[&str], positions: &[usize]) -> Vec<usize> {
+    // The value of a wrapper's option (`sudo --prompt X`, `timeout -s KILL`) is data, not a program.
+    let values: Vec<usize> = positions
+        .iter()
+        .flat_map(|&p| wrapper_values(texts, p))
+        .collect();
     (0..texts.len())
+        .filter(|&i| !values.contains(&i))
         .filter(|&i| {
             positions.contains(&i)
                 || positions
@@ -1672,6 +2724,15 @@ impl Guard<'_> {
         input: &Value,
         cwd: &Path,
     ) -> (Call, Option<String>) {
+        let j = self.judge(tool, input, cwd);
+        (j.call, j.fault)
+    }
+
+    /// [`Guard::classify_explained`], with the paths the call reads, searches and writes
+    /// ([`Access`], T1.8): what the guard judged before the call ran.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // one arm per tool
+    pub fn judge(&self, tool: &str, input: &Value, cwd: &Path) -> Judged {
         // H1.7: the step named if the guard's time runs out here.
         let _step = crate::steps::begin(format!("judging the {tool} call"));
         let field = |k: &str| input.get(k).and_then(Value::as_str);
@@ -1695,7 +2756,10 @@ impl Guard<'_> {
                 }
             }
             "Glob" => {
-                let root = field("path").map_or_else(|| cwd.to_path_buf(), PathBuf::from);
+                let root = field("path").map_or_else(
+                    || cwd.to_path_buf(),
+                    |p| absolute(p, cwd, &self.layout.home),
+                );
                 match field("pattern") {
                     Some(p) => self.glob_tool(p, &root, &mut acc),
                     None => self.when_held(&mut acc, CallClass::Protected(ProtectedKind::Unparsed)),
@@ -1711,7 +2775,7 @@ impl Guard<'_> {
                 // P1.4: a file-write call with no path the guard can read is DENIED in every
                 // session, since it may write Lunchroom's stores.
                 match field(key).filter(|p| !p.is_empty()) {
-                    Some(p) => self.write_path(p, cwd, &mut acc),
+                    Some(p) => self.write_path(p, cwd, tool != "Write", &mut acc),
                     None => acc.deny(DenyReason::Unparsed, &format!("{tool} with no path")),
                 }
             }
@@ -1730,7 +2794,7 @@ impl Guard<'_> {
                     );
                 }
                 for p in paths {
-                    self.write_path(p, cwd, &mut acc);
+                    self.write_path(p, cwd, true, &mut acc);
                 }
                 if cut {
                     self.when_held(&mut acc, CallClass::Protected(ProtectedKind::Unparsed));
@@ -1740,12 +2804,19 @@ impl Guard<'_> {
                 // §6 item 1: a reply, a command that is exactly one `lunchroom send`, is inside
                 // every slip; its words are still judged below.
                 acc.reply = field("command").is_some_and(|c| self.is_reply(c, cwd));
-                if !acc.reply {
+                // §6 item 1, D1.1: `lunchroom read <id>` is a read, and is inside every slip.
+                let read = field("command").is_some_and(|c| self.is_read(c, cwd));
+                if !acc.reply && !read {
                     acc.raise(CallClass::Ordinary);
                 }
                 match field("command") {
                     Some(c) => self.shell_text(c, cwd, 0, &mut acc),
                     None => self.when_held(&mut acc, CallClass::Protected(ProtectedKind::Unparsed)),
+                }
+                // P1.1: the reply is PROTECTED in the Strict hold mode only, which the policy
+                // decides from this kind (the classifier does not know the mode).
+                if acc.reply {
+                    acc.kinds = acc.kinds.with(ProtectedKind::Reply);
                 }
             }
             t if SLIP_TOOLS.contains(&t) => {}
@@ -1761,7 +2832,7 @@ impl Guard<'_> {
                 let mut texts = Vec::new();
                 string_leaves(input, &mut texts);
                 for t in texts {
-                    self.word_paths(t, cwd, false, &mut acc);
+                    self.word_paths(t, cwd, false, Dir::Read, &mut acc);
                 }
             }
         }
@@ -1769,8 +2840,17 @@ impl Guard<'_> {
         if acc.new_session {
             self.when_held(&mut acc, CallClass::Protected(ProtectedKind::OtherSession));
         }
+        // §11 L1.1: a call, other than the reply, with more path-like strings than the guard
+        // resolves is DENIED in every session; its message says to split it.
+        if acc.too_many && !acc.denied() {
+            acc.deny(DenyReason::TooManyPaths, TOO_MANY_PATHS);
+        }
         let fault = if acc.denied() { acc.fault.take() } else { None };
-        (acc.call(), fault)
+        Judged {
+            call: acc.call(),
+            fault,
+            access: acc.access,
+        }
     }
 
     fn when_held(&self, acc: &mut Acc, c: CallClass) {
@@ -1808,6 +2888,7 @@ impl Guard<'_> {
             let (head, tail) = split_wild(&joined);
             let base = self.fs.resolve(&head);
             f.unresolved = !base.complete;
+            f.timed_out = f.unresolved && self.fs.cut(&head);
             let mut pattern = base.path.clone();
             for c in tail.components() {
                 match c {
@@ -1822,11 +2903,18 @@ impl Guard<'_> {
                 }
             }
             f.push(self.fs.real(&lexical));
+            let mut looked = vec![lexical.clone()];
             f.push(lexical);
             let e = self.fs.expand(&pattern);
+            looked.push(pattern.clone());
             for m in e.matches {
                 f.push(self.fs.real(&m));
+                looked.push(m.clone());
                 f.push(m);
+            }
+            // A `real` look cut short by the time leaves that path unsettled, however it is spelled.
+            if looked.iter().any(|p| self.fs.cut(p)) {
+                (f.unresolved, f.timed_out) = (true, true);
             }
             if e.capped && f.capped.is_none() {
                 f.capped = Some(literal_prefix(&pattern));
@@ -1834,8 +2922,12 @@ impl Guard<'_> {
         } else {
             let r = self.fs.resolve(&joined);
             f.unresolved = !r.complete;
+            f.timed_out = f.unresolved && self.fs.cut(&joined);
             f.push(r.path);
             f.push(self.fs.real(&lexical));
+            if self.fs.cut(&lexical) {
+                (f.unresolved, f.timed_out) = (true, true);
+            }
             f.push(lexical);
         }
         f
@@ -1846,14 +2938,14 @@ impl Guard<'_> {
     /// operating system would fail it too); one a shell word names, with no direction, may be
     /// read or written, so it is PROTECTED as everything it could be: unparsed text, a credential,
     /// the guard's configuration. Nothing changes for an agent that is not HELD (P1.2).
-    fn unresolved(&self, reads: bool, what: &str, acc: &mut Acc) {
+    fn unresolved(&self, reads: bool, timed_out: bool, what: &str, acc: &mut Acc) {
         if !self.held {
             return;
         }
         // H1.5, L1.1: a path left unsettled because the guard's time ran out is one Lunchroom could
         // not check, which goes to the user (as a search cut short does); only a path that cannot be
         // followed at all is DENIED.
-        if reads && self.fs.out_of_time() {
+        if reads && timed_out {
             acc.raise(CallClass::Protected(ProtectedKind::Credential));
             return;
         }
@@ -1878,7 +2970,7 @@ impl Guard<'_> {
         let f = self.layout.facts(p);
         // 1.1: another terminal's screen and keys, and another process's memory, environment and
         // descriptors, are not read in any session.
-        if CONSOLE && f.terminal {
+        if f.terminal {
             acc.deny(DenyReason::Configuration, named);
         }
         self.other_process(f.secret_pid, named, acc);
@@ -1904,6 +2996,13 @@ impl Guard<'_> {
         for f in &forms.paths {
             self.read_facts(f, raw, acc);
         }
+        // T1.8: a path the tool opens is read; a folder a search is given is searched.
+        let (_, files): (Vec<PathBuf>, Vec<PathBuf>) = forms
+            .paths
+            .iter()
+            .cloned()
+            .partition(|f| search && self.fs.is_dir(f));
+        acc.note(Dir::Read, &files);
         if search {
             for f in forms.paths.iter().filter(|f| self.fs.is_dir(f)) {
                 self.search_from(f, raw, acc);
@@ -1913,7 +3012,7 @@ impl Guard<'_> {
             self.search_from(&prefix, raw, acc);
         }
         if forms.unresolved {
-            self.unresolved(true, raw, acc);
+            self.unresolved(true, forms.timed_out, raw, acc);
         }
     }
 
@@ -1929,7 +3028,7 @@ impl Guard<'_> {
         self.search_from(&base.path, &named, acc);
         // A `..` after a wildcard leaves a folder not yet known.
         if !base.complete || tail.components().any(|c| c == Component::ParentDir) {
-            self.unresolved(true, pattern, acc);
+            self.unresolved(true, !base.complete && self.fs.cut(&head), pattern, acc);
         }
     }
 
@@ -1943,6 +3042,7 @@ impl Guard<'_> {
     /// found below it: what the walk found is where other sessions' files are, which a HELD agent
     /// must not learn from the message (L1.1).
     fn search_from(&self, dir: &Path, named: &str, acc: &mut Acc) {
+        acc.access.searches.insert(dir.to_path_buf());
         self.read_facts(dir, named, acc);
         let fault = format!("a search of {named}");
         if self.layout.denied_below(dir) {
@@ -1977,16 +3077,17 @@ impl Guard<'_> {
     }
 
     /// P1.4 for one path a call writes.
-    fn write_path(&self, raw: &str, cwd: &Path, acc: &mut Acc) {
+    fn write_path(&self, raw: &str, cwd: &Path, also_read: bool, acc: &mut Acc) {
         let forms = self.forms(raw, cwd);
         for f in &forms.paths {
             self.path_rules(f, raw, false, acc);
         }
+        acc.note(if also_read { Dir::Both } else { Dir::Write }, &forms.paths);
         if let Some(prefix) = forms.capped {
             self.capped_rules(&prefix, raw, acc);
         }
         if forms.unresolved {
-            self.unresolved(false, raw, acc);
+            self.unresolved(false, forms.timed_out, raw, acc);
         }
     }
 
@@ -2003,7 +3104,7 @@ impl Guard<'_> {
         }
         // 1.1: a terminal device that is not the agent's own controlling terminal, in every
         // session: another terminal's keys and screen are the user's (the console among them).
-        if CONSOLE && f.terminal {
+        if f.terminal {
             acc.deny(DenyReason::Configuration, named);
         }
         // 1.1: the installed program is root's; it is named only to run it.
@@ -2044,13 +3145,22 @@ impl Guard<'_> {
     /// full is still found, and a HELD call is PROTECTED as unparsed for the rest (links and
     /// wildcards in it were not looked at), unless it is a reply.
     fn lexical_rules(&self, c: &str, cwd: &Path, acc: &mut Acc) {
-        self.path_rules(&normalize(c, cwd, &self.layout.home), c, false, acc);
+        let lexical = normalize(c, cwd, &self.layout.home);
+        self.path_rules(&lexical, c, false, acc);
         if !acc.reply {
+            acc.note(Dir::Read, &[lexical]);
+        }
+        // §11 L1.1: "a call with more, other than the reply, is DENIED in every session, and its
+        // message says to split it into smaller calls". The reply's words are text to send, which
+        // it opens as no file; a HELD reply is PROTECTED as unparsed for the strings left unread.
+        if acc.reply {
             self.when_held(acc, CallClass::Protected(ProtectedKind::Unparsed));
+        } else {
+            acc.too_many = true;
         }
     }
 
-    fn word_paths(&self, text: &str, cwd: &Path, runs_it: bool, acc: &mut Acc) {
+    fn word_paths(&self, text: &str, cwd: &Path, runs_it: bool, dir: Dir, acc: &mut Acc) {
         for c in candidates(text) {
             if acc.resolved >= MAX_RESOLVED {
                 self.lexical_rules(c, cwd, acc);
@@ -2061,12 +3171,31 @@ impl Guard<'_> {
             for f in &forms.paths {
                 self.path_rules(f, c, runs_it && c == text, acc);
             }
+            // The words of a reply are text to send, not paths the call opens.
+            if !acc.reply {
+                acc.note(dir, &forms.paths);
+            }
             if let Some(prefix) = forms.capped {
                 self.capped_rules(&prefix, c, acc);
             }
             // A long reply's text is too long for the system to take as a path at all.
             if forms.unresolved && !(acc.reply && unspellable(c)) {
-                self.unresolved(false, c, acc);
+                self.unresolved(false, forms.timed_out, c, acc);
+            }
+        }
+    }
+
+    /// K2: a shell expands braces before it opens a path (`/etc/{lunchroom,x}/f`), and a word that
+    /// holds one is read by the words it makes; a word ending in a path the call writes is a write.
+    fn brace_paths(&self, text: &str, targets: &[String], cwd: &Path, acc: &mut Acc) {
+        for w in text.split_whitespace().filter(|w| w.contains('{')) {
+            let dir = if targets.iter().any(|t| w.ends_with(t.as_str())) {
+                Dir::Write
+            } else {
+                Dir::Read
+            };
+            for e in braces::expand(w).iter().filter(|e| *e != w) {
+                self.word_paths(e, cwd, false, dir, acc);
             }
         }
     }
@@ -2078,6 +3207,11 @@ impl Guard<'_> {
     /// commit message, a heredoc written to a file); text handed to a shell or an interpreter
     /// counts in full, heredoc bodies included.
     fn unparsed(&self, text: &str, cwd: &Path, acc: &mut Acc) {
+        // K1.8: a text that holds escapes (`$'a\nb'`, `printf 'a\x0ab'`) is read as written and as
+        // the program decodes it.
+        if let Some(decoded) = escapes::decode(text) {
+            self.unparsed(&decoded, cwd, acc);
+        }
         let home = self.home();
         let text = text.replace("${HOME}", &home).replace("$HOME", &home);
         // Field, 2026-11-02: quoted text is one word, never a place a command starts. A split that
@@ -2115,19 +3249,54 @@ impl Guard<'_> {
         }
         // 1.1: the console's wall holds for text the guard cannot read in full, at each piece's
         // programs.
-        for (t, ps) in pieces.iter().zip(&at).filter(|_| CONSOLE) {
+        for (t, ps) in pieces.iter().zip(&at) {
             for p in runnable_positions(t, ps) {
-                self.console_wall(t, p, &text, acc);
+                self.console_wall(t, p, &text, cwd, acc);
+            }
+        }
+        // §17.5: `/proc/<pid>/{mem,environ,fd,maps}` of a process whose id the call does not write.
+        if let Some(path) = proc_secret_unwritten(&text) {
+            acc.deny(DenyReason::DeniedPath, &path);
+        }
+        // P1.4: a file this call writes and then runs is judged on the text written, in the order
+        // of the call: a run counts the writes before it, and a later write replaces an earlier
+        // text for the runs after it.
+        let per_piece = writes::scan_pieces(&raw, writes::heredoc_bodies(&text));
+        let mut written_before = Vec::with_capacity(raw.len());
+        let mut targets: Vec<String> = Vec::new();
+        for ((piece, t), ws) in raw.iter().zip(&pieces).zip(per_piece) {
+            written_before.push(
+                program_word(piece)
+                    .filter(|w| w.contains('/'))
+                    .is_some_and(|w| acc.written_as(w, cwd, &self.layout.home).is_some()),
+            );
+            for (k, how) in run_targets(t) {
+                // The piece that writes a file is not a run of it.
+                if !ws.iter().any(|w| w.target == t[k]) {
+                    self.run_written(t[k], cwd, how, 1, acc);
+                }
+            }
+            for w in ws {
+                targets.push(w.target.clone());
+                self.note_written(w, cwd, acc);
             }
         }
         for t in toks {
-            self.word_paths(t, cwd, false, acc);
+            let dir = if targets.iter().any(|w| w == t) {
+                Dir::Write
+            } else {
+                Dir::Read
+            };
+            self.word_paths(t, cwd, false, dir, acc);
         }
+        self.brace_paths(&text, &targets, cwd, acc);
         // A path at a program's place that does not exist is DENIED, as in a command the guard
-        // can read, unless an earlier piece builds.
+        // can read, unless an earlier piece builds or this call has written it by then.
         let mut built = false;
-        for (piece, t) in raw.iter().zip(&pieces) {
+        for (k, (piece, t)) in raw.iter().zip(&pieces).enumerate() {
             if !built
+                && !acc.lenient
+                && !written_before[k]
                 && let Some(w) = program_word(piece).filter(|w| w.contains('/'))
                 && !self.fs.exists(&self.physical(w, cwd))
             {
@@ -2138,14 +3307,35 @@ impl Guard<'_> {
             }
             built |= builds(t);
         }
-        self.when_held(acc, CallClass::Protected(ProtectedKind::Unparsed));
+        // P1.4: text the strict reader refused only for what it builds at run time (a command
+        // substitution, an expansion) is read by the GATED reader and is GATED, not PROTECTED as
+        // text the guard cannot parse is (F1.2); the PROTECTED kinds of the commands it reads
+        // still stand.
+        match gated::run_time_commands(&text) {
+            Some(cmds) => {
+                for c in &cmds {
+                    let t: Vec<&str> = c.iter().map(String::as_str).collect();
+                    for p in program_positions(&t) {
+                        if let Some(kind) = protected_kind(basename(t[p]), &t[p + 1..]) {
+                            self.when_held(acc, CallClass::Protected(kind));
+                        }
+                    }
+                }
+            }
+            None => self.when_held(acc, CallClass::Protected(ProtectedKind::Unparsed)),
+        }
     }
 
     fn shell_text(&self, text: &str, cwd: &Path, depth: usize, acc: &mut Acc) {
+        // P1.4: a merge, a deploy or a migration, or something the guard cannot read to the end.
+        self.gated_text(text, cwd, depth, acc);
         if depth > MAX_NESTING {
             self.unparsed(text, cwd, acc);
             return;
         }
+        // F1.2: a variable the text itself gave a literal is that literal, not an unknown word.
+        let literal = literals::substitute(text);
+        let text = literal.as_deref().unwrap_or(text);
         let parsed = shell::parse(text, &self.home());
         // I1.2: text the command hands to a shell is code the command runs, where any mention
         // of an identity variable counts as a change; text it cannot parse shows `unparsed`
@@ -2159,13 +3349,49 @@ impl Guard<'_> {
             let word = tokens(text).into_iter().find(|t| is_identity(t));
             acc.deny(reason, word.unwrap_or(text));
         }
+        // A1.3, F1.4: code the command hands to a shell is a script it runs, where a mention of a
+        // Lunchroom command only the user may run, a string it only prints included, and a
+        // mention of `TIOCSTI` or its number make the call DENIED.
+        if depth > 0 {
+            Self::code_mentions(text, "text a shell is given", acc);
+        }
         match parsed {
             Parsed::Unparsed => self.unparsed(text, cwd, acc),
             Parsed::Commands(cmds) => {
+                // §7 A1.3: a job started here to run later (`at`, `crontab`, a detached tmux or
+                // screen session) runs text the call hands it, which is code the call runs.
+                let deferred = |own: bool| {
+                    cmds.iter().any(|c| {
+                        let t: Vec<&str> = c.words.iter().map(|w| w.text.as_str()).collect();
+                        program_positions(&t).iter().any(|&p| {
+                            let n = basename(t[p]);
+                            DEFERRED_RUNNERS.contains(&n)
+                                && (own || !matches!(n, "tmux" | "screen"))
+                        })
+                    })
+                };
+                if deferred(true) {
+                    self.code_text(text, "text a job started here would run", acc);
+                }
+                // The text of `at`, `batch`, `crontab` and the like is read by its words, any of
+                // which may start a command (the commands `at` reads, the lines of a crontab):
+                // the console's wall holds at each of them. (`tmux` and `screen` have their own
+                // reading of their commands.)
+                if deferred(false) {
+                    let toks = tokens(text);
+                    for p in 0..toks.len() {
+                        self.console_wall(&toks, p, text, cwd, acc);
+                    }
+                }
                 let mut here = cwd.to_path_buf();
                 let mut built = false;
                 for c in &cmds {
+                    let at = here.clone();
                     self.command(&c.words, text, &mut here, depth, &mut built, acc);
+                    // P1.4: what this command writes counts for the commands after it.
+                    for w in writes::command_writes(&c.words) {
+                        self.note_written(w, &at, acc);
+                    }
                 }
             }
         }
@@ -2173,6 +3399,7 @@ impl Guard<'_> {
 
     /// `built`: an earlier command of the same text is a build or an install ([`builds`]); this
     /// command adds itself to it.
+    #[allow(clippy::too_many_lines)] // the rules of one command, in the order they are judged
     fn command(
         &self,
         words: &[Word],
@@ -2204,8 +3431,8 @@ impl Guard<'_> {
             }
         }
         // 1.1: the console's wall, after the rules above, so a reason they gave stays the one shown.
-        for &p in runnable.iter().filter(|_| CONSOLE) {
-            self.console_wall(&texts, p, full, acc);
+        for &p in &runnable {
+            self.console_wall(&texts, p, full, here, acc);
         }
         // Settings before the program: `CODEX_THREAD_ID=x cmd`, `GIT_SSH_COMMAND=... git`.
         let first = positions.first().copied().unwrap_or(texts.len());
@@ -2244,6 +3471,11 @@ impl Guard<'_> {
             });
             self.lunchroom_at(&texts, p, here, acc);
             self.recursive_write_at(&texts, p, here, acc);
+            // P1.4: a program run by a path this call writes is judged on the text written, and
+            // on the file as it is now where there is one (the run may come before the write).
+            if texts[p].contains('/') {
+                self.run_written(texts[p], here, RunAs::Auto, depth, acc);
+            }
             self.shebang_at(&texts, p, here, depth, acc);
         }
         // F1.2: a program run by a path that does not exist can run only if this call makes it.
@@ -2254,7 +3486,11 @@ impl Guard<'_> {
         // (`cargo build && ./target/release/app`); a redirection or any other command may not
         // (`echo x > s.sh && ./s.sh`).
         for &p in &positions {
-            if !*built && texts[p].contains('/') && !self.fs.exists(&self.physical(texts[p], here))
+            if !*built
+                && !acc.lenient
+                && texts[p].contains('/')
+                && acc.written_as(texts[p], here, &self.layout.home).is_none()
+                && !self.fs.exists(&self.physical(texts[p], here))
             {
                 acc.deny(
                     DenyReason::Unparsed,
@@ -2272,12 +3508,25 @@ impl Guard<'_> {
             self.lunchroom_at(&texts, k, here, acc);
         }
         let text = text_positions(words, &texts, &positions);
+        let dirs = word_dirs(words, &texts, &positions);
         for (k, w) in words.iter().enumerate().filter(|(k, _)| !text.contains(k)) {
+            // A program named with no `/` is found on the search path, never in the working
+            // folder: `cd /dev/pts && echo` opens no file named `/dev/pts/echo`.
+            if matches!(dirs[k], Dir::Skip) {
+                // It still counts among the strings of the call (L1.1: 1,000 of them).
+                acc.resolved += candidates(&w.text).len();
+                continue;
+            }
             let runs_it = positions.contains(&k) || scripts.contains(&k);
-            self.word_paths(&w.text, here, runs_it, acc);
+            self.word_paths(&w.text, here, runs_it, dirs[k], acc);
+        }
+        // L1.1: the folders a search enters. Judged while HELD; recorded in every session, since
+        // a session that is not HELD is held by what it then searches (T1.8).
+        for &i in &runnable {
+            self.recursive_read_at(&texts, i, here, acc);
         }
         if self.held {
-            self.held_rules(words, &texts, &positions, &runnable, here, acc);
+            Self::held_rules(words, &texts, &positions, &runnable, acc);
         }
         // `cd` changes where the commands after it run.
         if let Some(&p) = positions.first() {
@@ -2401,12 +3650,10 @@ impl Guard<'_> {
 
     /// P1.4's kinds, and L1.1's searches, judged at the positions that may run a program.
     fn held_rules(
-        &self,
         words: &[Word],
         texts: &[&str],
         positions: &[usize],
         runnable: &[usize],
-        here: &Path,
         acc: &mut Acc,
     ) {
         for &i in runnable {
@@ -2416,7 +3663,6 @@ impl Guard<'_> {
                     acc.raise(CallClass::Protected(kind));
                 }
             }
-            self.recursive_read_at(texts, i, here, acc);
         }
         // The shell opens a connection for a word naming one of these, a redirection's target too.
         if texts
@@ -2461,8 +3707,20 @@ impl Guard<'_> {
                     }
                 }
                 "eval" | "ssh" => self.shell_text(&rest.join(" "), here, depth + 1, acc),
-                "su" | "runuser" | "flock" | "script" => {
-                    if let Some(s) = option_value(rest, &["--command", "-c"]) {
+                // Their command is the text of `-c` or `--command`, in any spelling they read.
+                "su" | "runuser" => {
+                    for text in su_commands(rest) {
+                        self.shell_text(text, here, depth + 1, acc);
+                    }
+                }
+                // The text of `-c` or `--command`, in any spelling their options are read in.
+                "flock" | "script" => {
+                    let (valued, longs): (&str, &[(&str, bool)]) = if name == "script" {
+                        ("cEIOBoT", SCRIPT_LONG)
+                    } else {
+                        ("wEc", FLOCK_LONG)
+                    };
+                    for s in command_option_values(rest, valued, longs, 'c', &["command"]) {
                         self.shell_text(s, here, depth + 1, acc);
                     }
                 }
@@ -2516,7 +3774,13 @@ impl Guard<'_> {
                     // F1.2: one larger than the guard searches is DENIED. A data file is not a
                     // script; a name that is not a file is left to the interpreter, which
                     // resolves names its own way (`node app` loads `app.js`).
-                    if let Some(s) = interpreter_script(n, rest) {
+                    if let Some(s) = interpreter_script(n, rest)
+                        // §7 A1.3: Lunchroom's own program is judged by `lunchroom_at`.
+                        && !self.layout.facts(&self.physical(s, here)).program
+                    {
+                        // P1.4: a script this call writes and then runs is judged on the text
+                        // written.
+                        self.run_written(s, here, RunAs::Code, depth, acc);
                         match self.fs.script(&self.physical(s, here)) {
                             Script::Text(t) => self.code_text(&t, &format!("the script {s}"), acc),
                             Script::TooLarge => {
@@ -2602,15 +3866,30 @@ impl Guard<'_> {
     /// the shell may run, as channels are judged (`mywrap bash x.sh`). A bare name not in the
     /// working folder is looked up through `PATH`, as the shell does.
     fn script_file(&self, f: &str, here: &Path, depth: usize, acc: &mut Acc) {
+        // P1.4: a file this call writes and then runs is judged on the text written; the file as
+        // it is now too, where there is one (the run may come before the write).
+        let wrote = self.run_written(f, here, RunAs::Shell, depth, acc);
+        // §7 A1.3: a mention of a Lunchroom command in Lunchroom's own program is no mention (the
+        // command that runs it is judged by `lunchroom_at`).
+        if self.layout.facts(&self.physical(f, here)).program {
+            return;
+        }
         let mut script = self.fs.script(&self.physical(f, here));
-        if script == Script::Unreadable
-            && !f.contains('/')
-            && let Some(p) = self.fs.which(f)
-        {
-            script = self.fs.script(&p);
+        if script == Script::Unreadable && !f.contains('/') {
+            match self.fs.which(f) {
+                Some(p) => script = self.fs.script(&p),
+                // L1.1: a program the search for it was cut short for is one Lunchroom could not
+                // check, not one that is not there.
+                None if self.fs.cut(Path::new(f)) => {
+                    self.unresolved(false, true, f, acc);
+                    return;
+                }
+                None => {}
+            }
         }
         match script {
             Script::Text(t) => self.shell_script(&t, &format!("the script {f}"), here, depth, acc),
+            Script::TooLarge | Script::Unreadable if wrote => {}
             Script::TooLarge | Script::Unreadable => {
                 acc.deny(
                     DenyReason::Unparsed,
@@ -2620,10 +3899,85 @@ impl Guard<'_> {
         }
     }
 
-    /// A shell script's text, `source` naming it (`the script ./x.sh`): one the reader can read is
-    /// classified as an agent that is not HELD would be, keeping only a DENIED result; one it
-    /// cannot is judged as code ([`code_rules`]).
+    /// Records a file this call writes, for the commands after it that run it (P1.4): its text
+    /// replaces the text of an earlier write of the same file, or is added to it where the write
+    /// appends (an append to text the call does not show leaves none shown).
+    fn note_written(&self, w: writes::Written, cwd: &Path, acc: &mut Acc) {
+        let path = normalize(&w.target, cwd, &self.layout.home);
+        acc.note(Dir::Write, &[self.physical(&w.target, cwd), path.clone()]);
+        let prior = acc.written.iter().position(|o| o.path == path);
+        let body = match (w.append, prior.map(|k| acc.written[k].body.clone())) {
+            (true, Some(Some(old))) => w.body.map(|new| old + &new),
+            (true, Some(None)) => None,
+            _ => w.body,
+        };
+        let entry = WrittenFile {
+            literal: w.target,
+            path,
+            body,
+            active: false,
+        };
+        match prior {
+            Some(k) => acc.written[k] = entry,
+            None => acc.written.push(entry),
+        }
+    }
+
+    /// The file `f`, which a command of this call runs, was written by this call (P1.4):
+    /// judges the text written as the script it is, `how` it is run, and says whether there was
+    /// one. Where the call does not show the text it wrote, the call is PROTECTED while the
+    /// session is HELD.
+    fn run_written(&self, f: &str, here: &Path, how: RunAs, depth: usize, acc: &mut Acc) -> bool {
+        let path = normalize(f, here, &self.layout.home);
+        // Every write of the file counts: the last one decides what runs, and the call does not
+        // tell which that is when a command writes it more than once.
+        let matches: Vec<usize> = (0..acc.written.len())
+            .filter(|&k| acc.written[k].path == path || acc.written[k].literal == f)
+            .collect();
+        if matches.is_empty() {
+            return false;
+        }
+        for at in matches {
+            // Judging the text of a file that runs itself must end.
+            if acc.written[at].active {
+                continue;
+            }
+            let (body, literal) = (
+                acc.written[at].body.clone(),
+                acc.written[at].literal.clone(),
+            );
+            let Some(text) = body else {
+                self.when_held(acc, CallClass::Protected(ProtectedKind::Unparsed));
+                continue;
+            };
+            let source = format!("the file {literal}, which this call writes");
+            let code = match how {
+                RunAs::Shell => false,
+                RunAs::Code => true,
+                RunAs::Auto => script_is_code(&text, &literal),
+            };
+            acc.written[at].active = true;
+            if code {
+                self.code_text(&text, &source, acc);
+            } else {
+                self.shell_script(&text, &source, here, depth, acc);
+            }
+            if let Some(w) = acc.written.get_mut(at) {
+                w.active = false;
+            }
+        }
+        true
+    }
+
+    /// A shell script's text, `source` naming it (`the script ./x.sh`), judged with the session's
+    /// own state (P1.4, F1.2): while the session is HELD, each part of it that
+    /// would be PROTECTED as a command of its own makes the call PROTECTED, and each part that
+    /// would be DENIED makes it DENIED. Text the reader can read whole is read as one text; any
+    /// other is read piece by piece ([`Guard::script_pieces`]) and as code ([`code_rules`]).
     fn shell_script(&self, text: &str, source: &str, here: &Path, depth: usize, acc: &mut Acc) {
+        // F1.2: a variable the script gave a literal is that literal, not an unknown word.
+        let literal = literals::substitute(text);
+        let text = literal.as_deref().unwrap_or(text);
         // I1.2: any mention of an identity variable in a script counts, parsed or not.
         if mentions_identity(text) {
             let word = tokens(text).into_iter().find(|t| is_identity(t));
@@ -2632,24 +3986,67 @@ impl Guard<'_> {
                 &format!("{} in {source}", word.unwrap_or("an identity variable")),
             );
         }
-        if shell::parse(text, &self.home()) == Parsed::Unparsed {
+        // A1.3, F1.4: a mention anywhere in the text counts, a string it only prints included.
+        Self::code_mentions(text, source, acc);
+        let whole = shell::parse(text, &self.home()) != Parsed::Unparsed;
+        if !whole {
             self.code_text(text, source, acc);
-            return;
         }
-        let g = Guard {
-            held: false,
-            ..*self
-        };
         let mut sub = Acc::new(CallClass::Ordinary);
-        g.shell_text(text, here, depth + 1, &mut sub);
+        sub.resolved = acc.resolved;
+        sub.written = std::mem::take(&mut acc.written);
+        if whole {
+            self.shell_text(text, here, depth + 1, &mut sub);
+        } else {
+            self.script_pieces(text, here, depth + 1, &mut sub);
+        }
         if sub.denied() {
             sub.fault = Some(match sub.fault.take() {
                 Some(f) => format!("{f}, in {source}"),
                 None => source.to_owned(),
             });
-            acc.deny_from(&sub);
         }
-        acc.new_session |= sub.new_session;
+        acc.absorb(sub);
+    }
+
+    /// A script the reader cannot read whole, judged piece by piece: each statement, as a command
+    /// of its own, with the control words of the shell (`if`, `then`, `do`, `done`, `fi`, …) and a
+    /// function's header taken off it, and `cd` carried from one statement to the next. A piece the
+    /// reader still cannot read is judged by its words ([`Guard::unparsed`]).
+    fn script_pieces(&self, text: &str, here: &Path, depth: usize, acc: &mut Acc) {
+        let body = without_heredoc_bodies(text);
+        let mut here = here.to_path_buf();
+        let was = std::mem::replace(&mut acc.lenient, true);
+        for raw in split_unquoted(&body) {
+            let Some(piece) = script_piece(raw) else {
+                continue;
+            };
+            self.shell_text(&piece, &here, depth, acc);
+            if let Parsed::Commands(cmds) = shell::parse(&piece, &self.home()) {
+                for c in &cmds {
+                    let t: Vec<&str> = c.words.iter().map(|w| w.text.as_str()).collect();
+                    if let ["cd" | "pushd", d, ..] = t.as_slice() {
+                        here = normalize(d, &here, &self.layout.home);
+                    }
+                }
+            }
+        }
+        acc.lenient = was;
+    }
+
+    /// A1.3, F1.4 for script or code text: a mention of a Lunchroom command only the user may run
+    /// (a string it only prints included), of `TIOCSTI` or of its number makes the call DENIED.
+    /// `what` names the text for the message (V1.4).
+    fn code_mentions(text: &str, what: &str, acc: &mut Acc) {
+        if let Some(m) = lunchroom_mention(text) {
+            acc.deny(DenyReason::Configuration, &format!("{m} (in {what})"));
+        }
+        if names_tiocsti(text) {
+            acc.deny(
+                DenyReason::Configuration,
+                &format!("TIOCSTI or its number (in {what})"),
+            );
+        }
     }
 
     /// Script or code text that is not a shell command (K1.8), `what` naming it for a denial
@@ -2660,27 +4057,49 @@ impl Guard<'_> {
         if let Some(r) = code_rules(&text) {
             acc.deny(r, what);
         }
-        // 1.1: code that names `ptrace` (python's ctypes, perl's `syscall`) attaches to a process.
-        if CONSOLE && text.to_ascii_lowercase().contains("ptrace") {
+        // §17.5: ptrace through python or perl is DENIED, also with the target process id written
+        // in the call and the process in the agent's own subtree (a program in these languages
+        // reaches ptrace by a name or a system call number the guard reads only as text).
+        if names_ptrace(&text) {
             acc.deny(DenyReason::Configuration, what);
         }
+        // F1.4, A1.3, §17.5: a string of the code that names another terminal, a path of
+        // Lunchroom's or another process's secrets is judged as the shell judges the path.
+        for (start, end) in quoted_spans(&text) {
+            for c in candidates(&text[start + 1..end]) {
+                if !c.starts_with(['/', '~']) {
+                    continue;
+                }
+                let f = self
+                    .layout
+                    .facts(&normalize(c, Path::new("/"), &self.layout.home));
+                if f.terminal || f.store {
+                    acc.deny(DenyReason::Configuration, c);
+                }
+                self.other_process(f.secret_pid, c, acc);
+            }
+        }
+        // P1.4 (§6::53): while the session is HELD, a part of the code that would be PROTECTED as a
+        // command of its own makes the call PROTECTED.
+        if self.held {
+            for kind in code_kinds(&text) {
+                acc.raise(CallClass::Protected(kind));
+            }
+        }
         acc.new_session |= code_starts_session(&text);
+        // P1.4: the string literals of one list or call that starts a program are one command.
+        Self::gated_code(&text, acc);
     }
 
     /// The memory, environment, descriptors and maps of a process outside the agent's own subtree
-    /// (`secret_pid`, from the path's facts). With the console's rules on (1.1) they are DENIED in
-    /// every session. In 1.1.0 they are a credential read (the lesson of the 2026 Hugging Face
-    /// incident, where agents dumped other processes' environments for tokens): PROTECTED while
-    /// HELD, nothing added otherwise.
+    /// (`secret_pid`, from the path's facts) are DENIED in every session (§17.5, L1.1; the lesson of
+    /// the 2026 Hugging Face incident, where agents dumped other processes' environments for
+    /// tokens).
     fn other_process(&self, secret_pid: Option<u32>, named: &str, acc: &mut Acc) {
         if secret_pid.is_none_or(|pid| self.own_process(pid)) {
             return;
         }
-        if CONSOLE {
-            acc.deny(DenyReason::DeniedPath, named);
-        } else {
-            self.when_held(acc, CallClass::Protected(ProtectedKind::Credential));
-        }
+        acc.deny(DenyReason::DeniedPath, named);
     }
 
     /// The process `pid` is in the agent's own subtree: the harness process its commands run
@@ -2697,13 +4116,34 @@ impl Guard<'_> {
 
     /// 1.1, the console's wall: the rules the kernel leaves open. `p` is the position of a program
     /// word, `full` the whole text of the command.
-    fn console_wall(&self, texts: &[&str], p: usize, full: &str, acc: &mut Acc) {
+    fn console_wall(&self, texts: &[&str], p: usize, full: &str, here: &Path, acc: &mut Acc) {
         let name = basename(texts[p]);
         let args = &texts[p + 1..];
         let what = texts[p..].join(" ");
-        // Rule 3: a debugger or tracer.
-        if DEBUGGERS.contains(&name) {
-            acc.deny(DenyReason::Configuration, &what);
+        // Rule 3 (§17.5): a debugger or tracer given a process id that is not written in the call
+        // or is not in the agent's own subtree. One that starts a program of its own runs.
+        if trace::DEBUGGERS.contains(&name) {
+            // gdb and lldb read commands from their input when a pipe or a redirection feeds them.
+            let fed = full.contains(['|', '<']);
+            let read = |f: &str| match self.fs.script(&self.physical(f, here)) {
+                Script::Text(t) => Some(t),
+                Script::TooLarge | Script::Unreadable => None,
+            };
+            let foreign =
+                trace::target_pids(name, args, fed, &read)
+                    .into_iter()
+                    .any(|pid| match pid {
+                        trace::Pid::Written(n) => !self.own_process(n),
+                        trace::Pid::Unwritten => true,
+                    });
+            if foreign {
+                acc.deny(DenyReason::Configuration, &what);
+            }
+            // §17.5 rule 3: a command given on the command line that makes the program ptrace
+            // (`call (int)ptrace(…)`) reaches any process, as code in python or perl does.
+            if debugger_payloads(args).iter().any(|c| names_ptrace(c)) {
+                acc.deny(DenyReason::Configuration, &what);
+            }
         }
         // Rule 2: signalling the console, or anything called lunchroom.
         if KILLERS.contains(&name) {
@@ -2712,95 +4152,23 @@ impl Guard<'_> {
                 args.iter()
                     .any(|a| *a == pid || a.strip_prefix('-').is_some_and(|r| r == pid))
             });
-            if names_pid || names_word(full, "lunchroom") {
+            if names_pid
+                || names_word(full, "lunchroom")
+                || terminal::kill_pattern_matches(name, args)
+                || terminal::kill_names_user(args, &self.layout.lunchroom_ids)
+            {
                 acc.deny(DenyReason::Configuration, &what);
             }
         }
         // Rule 5: becoming the user or the group `lunchroom`.
-        if becomes_lunchroom(name, args) {
+        if becomes_lunchroom(name, args, &self.layout.lunchroom_ids) {
             acc.deny(DenyReason::Configuration, &what);
         }
         // Rule 4: another terminal's keys and screen through tmux or screen.
         match name {
-            "tmux" => self.tmux_keys(args, &what, acc),
-            "screen" => self.screen_keys(args, &what, acc),
+            "tmux" => self.tmux_keys(args, here, &what, acc),
+            "screen" => self.screen_keys(args, here, &what, acc),
             _ => {}
-        }
-    }
-
-    /// Rule 4 for tmux: `send-keys`, `capture-pane` and `pipe-pane` type into or read a pane. The
-    /// agent's own pane (`TMUX_PANE`, named by `-t` or by none) is PROTECTED while HELD; any other
-    /// target, or another tmux server (`-L`, `-S`), is DENIED.
-    fn tmux_keys(&self, args: &[&str], what: &str, acc: &mut Acc) {
-        let mut other_server = false;
-        let mut k = 0;
-        // Global options before the subcommand; `-L`, `-S`, `-f`, `-c`, `-T` take a value.
-        while let Some(a) = args.get(k).filter(|a| a.starts_with('-')) {
-            if matches!(*a, "-L" | "-S") || a.starts_with("-L") || a.starts_with("-S") {
-                other_server = true;
-            }
-            k += if matches!(*a, "-L" | "-S" | "-f" | "-c" | "-T") {
-                2
-            } else {
-                1
-            };
-        }
-        let Some(sub) = args.get(k) else { return };
-        if !matches!(
-            *sub,
-            "send-keys" | "send" | "capture-pane" | "capturep" | "pipe-pane" | "pipep"
-        ) {
-            return;
-        }
-        let rest = &args[k + 1..];
-        let target = rest.iter().enumerate().find_map(|(i, a)| {
-            if *a == "-t" {
-                rest.get(i + 1).copied()
-            } else {
-                a.strip_prefix("-t").filter(|t| !t.is_empty())
-            }
-        });
-        let own = !other_server
-            && match target {
-                None => true,
-                Some(t) => self.layout.own_pane.as_deref() == Some(t),
-            };
-        if own {
-            self.when_held(acc, CallClass::Protected(ProtectedKind::OtherSession));
-        } else {
-            acc.deny(DenyReason::Configuration, what);
-        }
-    }
-
-    /// Rule 4 for screen: `-X stuff` types into a session and `-X hardcopy` reads one. The
-    /// agent's own session (`STY`, named by `-S` or by none) is PROTECTED while HELD; any other is
-    /// DENIED.
-    fn screen_keys(&self, args: &[&str], what: &str, acc: &mut Acc) {
-        let Some(x) = args.iter().position(|a| *a == "-X") else {
-            return;
-        };
-        // The command follows -X; options may come after it too (`screen -X -S name stuff x`).
-        let after = &args[x + 1..];
-        if !after.iter().any(|a| matches!(*a, "stuff" | "hardcopy")) {
-            return;
-        }
-        let target = args.iter().enumerate().find_map(|(i, a)| {
-            if matches!(*a, "-S" | "-r" | "-x") {
-                args.get(i + 1).copied()
-            } else {
-                a.strip_prefix("-S").filter(|t| !t.is_empty())
-            }
-        });
-        let own = target.is_none_or(|t| {
-            self.layout
-                .own_screen
-                .as_deref()
-                .is_some_and(|sty| sty == t || sty.split('.').nth(1) == Some(t))
-        });
-        if own {
-            self.when_held(acc, CallClass::Protected(ProtectedKind::OtherSession));
-        } else {
-            acc.deny(DenyReason::Configuration, what);
         }
     }
 
@@ -2815,12 +4183,19 @@ impl Guard<'_> {
 
     /// A program run by path or found through `PATH` that is a script (a `#!` line).
     fn shebang_at(&self, texts: &[&str], p: usize, here: &Path, depth: usize, acc: &mut Acc) {
-        let Some(path) = self
-            .resolve(texts[p], here)
-            .filter(|p| self.fs.runs_as_script(p))
-        else {
+        let found = self.resolve(texts[p], here);
+        // L1.1: a program the search for it was cut short for is one Lunchroom could not check.
+        if found.is_none() && !texts[p].contains('/') && self.fs.cut(Path::new(texts[p])) {
+            self.unresolved(false, true, texts[p], acc);
+            return;
+        }
+        let Some(path) = found.filter(|p| self.fs.runs_as_script(p)) else {
             return;
         };
+        // §7 A1.3: a mention of a Lunchroom command in Lunchroom's own program is no mention.
+        if self.layout.facts(&path).program {
+            return;
+        }
         let t = match self.fs.script(&path) {
             Script::Text(t) => t,
             // F1.2: a script it cannot read or search in full.
@@ -2864,16 +4239,18 @@ impl Guard<'_> {
                 .is_some_and(|r| self.layout.facts(&r).program || self.is_a_program_file(&r))
     }
 
-    /// 1.1.3 F113-AC1: `r` is the same file (device and inode) as Lunchroom's installed program, a
-    /// program in `layout.programs`, or the setgid program: a hard link under any name and folder.
+    /// C6-X09: `r` is one of Lunchroom's program files under any name and folder (a hard link):
+    /// the installed program, each other place it is installed, and the setgid program.
     fn is_a_program_file(&self, r: &Path) -> bool {
-        let Some(id) = self.fs.file_id(r) else {
-            return false;
-        };
-        std::iter::once(self.layout.program_dir.join(LUNCHROOM_NAMES[0]))
+        // Every place is looked at, whatever the first answer: the guard's first pass lists each
+        // look it will need, and answers none of them.
+        let id = self.fs.file_id(r);
+        let ids: Vec<_> = std::iter::once(self.layout.program_dir.join(LUNCHROOM_NAMES[0]))
             .chain(self.layout.programs.iter().cloned())
             .chain(std::iter::once(PathBuf::from(crate::setgid::PROGRAM)))
-            .any(|p| self.fs.file_id(&p) == Some(id))
+            .map(|p| self.fs.file_id(&p))
+            .collect();
+        id.is_some_and(|id| ids.contains(&Some(id)))
     }
 
     /// §6 item 1: the text is exactly one `lunchroom send`, with nothing before the program and
@@ -2881,22 +4258,50 @@ impl Guard<'_> {
     /// must be Lunchroom's program itself: a program merely named `lunchroom`, or another program
     /// in Lunchroom's program folder, is not.
     fn is_reply(&self, text: &str, cwd: &Path) -> bool {
+        shell::single(text, &self.home()).is_some_and(|c| {
+            matches!(c.words.as_slice(), [p, s, ..]
+                if s.text == "send" && !p.glob && !s.glob && self.is_real_program(&p.text, cwd))
+        })
+    }
+
+    /// §6 item 1, D1.1: the text is exactly one `lunchroom read <id>`: Lunchroom's own program
+    /// (as [`Guard::is_reply`] finds it), the word `read`, and one id, nothing else.
+    fn is_read(&self, text: &str, cwd: &Path) -> bool {
+        shell::single(text, &self.home()).is_some_and(|c| {
+            matches!(c.words.as_slice(), [p, r, id]
+                if r.text == "read"
+                    && !p.glob
+                    && !r.glob
+                    && !id.glob
+                    && !id.redirect
+                    && !id.text.is_empty()
+                    && !id.text.starts_with('-')
+                    && self.is_real_program(&p.text, cwd))
+        })
+    }
+
+    /// The word names Lunchroom's program itself, by its real path: the installed one or one the
+    /// layout lists. A program merely named `lunchroom` is not.
+    fn is_real_program(&self, w: &str, cwd: &Path) -> bool {
         let installed = self
             .fs
             .real(&self.layout.program_dir.join(LUNCHROOM_NAMES[0]));
-        let real_program = |w: &str| {
-            self.resolve(w, cwd)
-                .is_some_and(|r| r == installed || self.layout.programs.contains(&r))
-        };
-        shell::single(text, &self.home()).is_some_and(|c| {
-            matches!(c.words.as_slice(), [p, s, ..]
-                if s.text == "send" && !p.glob && !s.glob && real_program(&p.text))
-        })
+        self.resolve(w, cwd)
+            .is_some_and(|r| r == installed || self.layout.programs.contains(&r))
     }
 
     /// A1.3: an agent runs only Lunchroom's open commands.
     fn lunchroom_at(&self, texts: &[&str], p: usize, here: &Path, acc: &mut Acc) {
-        if self.is_lunchroom(texts[p], here) && !lunchroom_args_open(&texts[p + 1..]) {
+        // In a statement of a script the reader could not read whole, a program that only has
+        // Lunchroom's name (`tools/lunchroom --pattern x`) is judged by the words after it, as the
+        // script's text is ([`names_user_only_command`]); Lunchroom's own program by its arguments.
+        let is_it = if acc.lenient {
+            self.resolve(texts[p], here)
+                .is_some_and(|r| self.layout.facts(&r).program)
+        } else {
+            self.is_lunchroom(texts[p], here)
+        };
+        if is_it && !lunchroom_args_open(&texts[p + 1..]) {
             acc.deny(DenyReason::Configuration, &texts[p..].join(" "));
         }
     }
@@ -2995,18 +4400,57 @@ impl Guard<'_> {
         if !given && searcher {
             roots.push((here.to_path_buf(), here.to_string_lossy().into_owned()));
         }
+        // §17.5: a program that reads the content of everything below `/proc` or a process's
+        // folder in it reads `mem`, `environ`, `fd` and `maps` of the processes there, in every
+        // session. Listing names (`ls -R`, `du`, `tree`, `find` with no action) reads none.
+        let reads_content = match name {
+            "find" => args
+                .iter()
+                .any(|a| FIND_ACTIONS.contains(a) && *a != "-delete"),
+            "fd" | "fdfind" => args
+                .iter()
+                .any(|a| matches!(*a, "-x" | "-X" | "--exec" | "--exec-batch")),
+            "tree" | "du" | "ls" => false,
+            _ => true,
+        };
+        if reads_content {
+            for (r, named) in &roots {
+                match proc_secret_folder(r) {
+                    Some(None) => acc.deny(DenyReason::DeniedPath, named),
+                    Some(pid) => self.other_process(pid, named, acc),
+                    None => {}
+                }
+            }
+        }
         for (r, named) in roots {
-            self.search_from(&r, &named, acc);
+            if self.held {
+                self.search_from(&r, &named, acc);
+            } else {
+                acc.access.searches.insert(r);
+            }
         }
     }
 }
+
+mod braces;
+mod escapes;
+mod folder;
+mod gated;
+mod literals;
+mod marks;
+mod recipes;
+mod regex;
+mod terminal;
+mod trace;
+mod writes;
+
+pub use folder::reads_its_folder;
+pub use gated::{Gate, KNOWN_PROGRAMS, action_verb, known_programs};
+pub use marks::{Mark, MarkKind, MarkSource, Marked};
+pub use writes::Access;
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(all(test, feature = "console"))]
 mod console_tests;
-
-/// The console's guard rules (1.1) are on: built with the feature `console`. Without it (1.1.0) no
-/// console exists, and these rules would only block an agent's ordinary work in every session.
-const CONSOLE: bool = cfg!(feature = "console");

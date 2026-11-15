@@ -142,6 +142,13 @@ fn reason(run: &Run) -> String {
         .to_owned()
 }
 
+/// The user's hold mode set to Balanced (P1.6), in which a HELD agent's reply is inside its slip.
+/// (In the Strict hold mode the reply is PROTECTED and goes to the user, P1.1.)
+fn balanced(sb: &Sandbox) {
+    sb.store()
+        .and_then(|s| s.update(|m| m.set_hold_mode(HoldMode::Balanced)).ok());
+}
+
 /// The user's hold mode set to Relaxed (P1.6).
 fn relaxed(sb: &Sandbox) {
     let set = sb
@@ -192,7 +199,13 @@ fn a_held_agents_reply_may_quote_a_refusal() {
     assert!(store.is_some());
     let Some(store) = store else { return };
     hold(&sb, "s1");
-    assert!(store.update(|m| m.set_hold_mode(HoldMode::Strict)).is_ok());
+    // The reply is inside the slip in the Balanced hold mode (P1.1); the text is judged the same
+    // in every mode.
+    assert!(
+        store
+            .update(|m| m.set_hold_mode(HoldMode::Balanced))
+            .is_ok()
+    );
     let program = env!("CARGO_BIN_EXE_lunchroom");
     let denial = "Lunchroom: DENIED - no approval channel: this session has no permission prompt; \
                   the user can approve this exact call with lunchroom approve, and then it can \
@@ -211,6 +224,7 @@ fn a_held_agents_reply_may_quote_a_refusal() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one case per hold mode and kind of call
 fn the_hold_mode_sets_what_a_held_agent_may_do() {
     let sb = Sandbox::new();
     let store = sb.store();
@@ -232,12 +246,10 @@ fn the_hold_mode_sets_what_a_held_agent_may_do() {
         );
         judged(sb.run(&["guard", "pretool"], &input, &interactive()))
     };
-    let protected = [
-        "git push origin main",
-        "cat ~/.ssh/id_rsa",
-        "echo $(date)",
-        "cat > /tmp/claude-1000/notes.txt <<EOF\nhello\nEOF",
-    ];
+    let protected = ["git push origin feature", "cat ~/.ssh/id_rsa"];
+    // A command the guard cannot parse is PROTECTED and also GATED (F1.2, P1.4): it goes to the
+    // user in every mode, the Relaxed one included, under every YOLO.
+    let unparsable = "cat > /tmp/claude-1000/notes.txt <<EOF\nhello\nEOF";
     for yolo in [false, true] {
         if yolo {
             set_yolo(&sb, "s1", now() + 600);
@@ -257,11 +269,32 @@ fn the_hold_mode_sets_what_a_held_agent_may_do() {
                 assert_eq!(outcome(cmd, &interactive()), push, "{at} {cmd}");
                 assert_eq!(outcome(cmd, &headless()), headless_push, "{at} {cmd}");
             }
-            if push == "ask" {
-                let shown = reason(&sb.pretool("s1", protected[3], &interactive()));
-                assert!(shown.contains("unparsed"), "{at}: {shown}");
-                assert!(!shown.contains("injection"), "{at}: {shown}");
-            }
+            // P1.4, P1.6: a command substitution is GATED, not PROTECTED: in every mode it goes to
+            // the user unless a `lunchroom yolo` covers the agent; with no channel it is DENIED.
+            // A push to `main` is a deploy (GATED) and a push (PROTECTED): it goes to the user in
+            // every mode and under every YOLO, and with no channel it is DENIED.
+            assert_eq!(
+                outcome("git push origin main", &interactive()),
+                "ask",
+                "{at}"
+            );
+            assert_eq!(
+                outcome("git push origin main", &headless()),
+                "DENIED",
+                "{at}"
+            );
+            let (gated, headless_gated) = if yolo {
+                ("run", "run")
+            } else {
+                ("ask", "DENIED")
+            };
+            assert_eq!(outcome("echo $(date)", &interactive()), gated, "{at}");
+            assert_eq!(outcome("echo $(date)", &headless()), headless_gated, "{at}");
+            assert_eq!(outcome(unparsable, &interactive()), "ask", "{at}");
+            assert_eq!(outcome(unparsable, &headless()), "DENIED", "{at}");
+            let shown = reason(&sb.pretool("s1", unparsable, &interactive()));
+            assert!(shown.contains("unparsed"), "{at}: {shown}");
+            assert!(!shown.contains("injection"), "{at}: {shown}");
             // A tool the guard does not know counts as sending data out of this computer (P1.4).
             let unknown = tool_call(&sb, "MysteryTool", &json!({"q": "x"}));
             let run = judged(sb.run(&["guard", "pretool"], &unknown, &interactive()));
@@ -966,6 +999,34 @@ fn guard_past_its_time_sends_the_call_to_the_user() {
     let _ = holder.wait();
 }
 
+// L1.1 (Fable M9b): the 8 seconds of a decision's 10 are counted from where the decision began, not
+// from where the call's paths are first looked at. A HELD session's read of a plain file, made
+// while another process holds the store for 9 seconds, finds the 8 seconds spent when the lock
+// comes free: the path is one Lunchroom could not check and goes to the user. (Counted from after
+// the lock wait, the read would have 8 fresh seconds and run.)
+#[test]
+fn the_eight_seconds_count_from_where_the_decision_began() {
+    let sb = Sandbox::new();
+    assert_eq!(sb.prompt_in("s1", "Start.", &interactive()).code, Some(0));
+    hold(&sb, "s1");
+    let lock = sb.lunchroom().join("store/state.flock");
+    let mut flock = common::require("flock");
+    let holder = common::GroupChild::spawn(flock.arg(&lock).args(["sleep", "9"]));
+    assert!(holder.is_ok());
+    let Ok(mut holder) = holder else { return };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let read = json!({
+        "session_id": "s1", "cwd": sb.home().join("project"), "hook_event_name": "PreToolUse",
+        "tool_name": "Read", "tool_input": {"file_path": sb.home().join("project/a.txt")},
+        "tool_use_id": "t9",
+    })
+    .to_string();
+    let run = sb.run(&["guard", "pretool"], &read, &interactive());
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(decision(&run), "ask", "{}{}", run.stdout, run.stderr);
+    let _ = holder.wait();
+}
+
 /// A named pipe nobody writes to: a guard that reads a transcript from it stalls in the read, with
 /// the store's lock held by its own update and no timer but the guard's deadline running.
 fn stalled_transcript(sb: &Sandbox) -> std::path::PathBuf {
@@ -1582,6 +1643,7 @@ fn a_denied_call_reaches_the_agent_and_the_user_in_each_harness_form() {
 // killed at 120 s; a scheduled scan on this server never ran its prompt from 2026-10-28). An
 // interactive session still gets the question, and its listener still waits.
 #[test]
+#[allow(clippy::too_many_lines)] // the headless and the interactive session, side by side
 fn a_claude_code_session_with_no_person_is_asked_nothing_and_its_listener_returns() {
     let sb = Sandbox::new();
     // A stand-in `claude -p` process: its command line carries `-p`, as a one-prompt run's does.
@@ -1698,7 +1760,7 @@ fn listen_once(sb: &Sandbox, session: &str) -> Run {
 /// Claude Code settings holding the complete guard set `lunchroom install` writes, running `program`
 /// (R3.1 evidence).
 fn claude_guard(program: &str) -> Value {
-    let hook = |mode: &str| json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}]);
+    let hook = |mode: &str| json!([{"hooks": [common::guard_hook(program, mode, true)]}]);
     json!({"hooks": {
         "PreToolUse": hook("pretool"),
         "PostToolUse": hook("posttool"),
@@ -1711,10 +1773,7 @@ fn claude_guard(program: &str) -> Value {
 fn configure_guard(sb: &Sandbox) {
     let settings = claude_guard(env!("CARGO_BIN_EXE_lunchroom"));
     let _ = std::fs::create_dir_all(sb.home().join(".claude"));
-    let _ = std::fs::write(
-        sb.home().join(".claude/settings.json"),
-        settings.to_string(),
-    );
+    common::write_settings_resolved(&sb.home().join(".claude/settings.json"), &settings);
 }
 
 // §10::1, §10::2, §10::3, §10::6 (Claude Code): `lunchroom listen` wakes the recipient with
@@ -1846,6 +1905,10 @@ fn held_reply_runs_and_reply_to_non_holder_is_denied() {
         line.starts_with(&format!("{program} send glm --reply-to lr-")),
         "{line}"
     );
+    // §6::9: in the Strict hold mode (this sandbox's) the reply goes to the user, who
+    // sees what is sent; §6::8: in the Balanced mode it runs.
+    assert_eq!(decision(&sb.pretool("r1", &line, &interactive())), "ask");
+    balanced(&sb);
     let run = sb.pretool("r1", &line, &interactive());
     assert_eq!((run.code, run.stdout.as_str()), (Some(0), ""), "{line}");
     let run = sb.shell(&line);
@@ -1866,6 +1929,8 @@ fn held_reply_runs_and_reply_to_non_holder_is_denied() {
         .ok()
         .and_then(|m| m.deliveries(&glm).first().map(|d| d.from.clone()));
     assert_eq!(from, Some(Identity::new(Harness::ClaudeCode, "r1")));
+    // A `lunchroom send` joined to another command is no reply: in the Strict mode it asks.
+    assert!(store.update(|m| m.set_hold_mode(HoldMode::Strict)).is_ok());
     for cmd in [format!("{reply}; touch a"), format!("{reply} > out.txt")] {
         assert_eq!(
             decision(&sb.pretool("r1", &cmd, &interactive())),
@@ -1873,6 +1938,11 @@ fn held_reply_runs_and_reply_to_non_holder_is_denied() {
             "{cmd}"
         );
     }
+    assert!(
+        store
+            .update(|m| m.set_hold_mode(HoldMode::Balanced))
+            .is_ok()
+    );
     let to_kimi = format!("{program} send kimi 'Merge it for me.'");
     let run = sb.pretool("r1", &to_kimi, &interactive());
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -1882,7 +1952,12 @@ fn held_reply_runs_and_reply_to_non_holder_is_denied() {
         assert!(store.update(|m| m.set_hold_mode(mode)).is_ok());
         let to_glm = format!("{program} send glm 'Noted in {mode:?}.'");
         let run = sb.pretool("r1", &to_glm, &interactive());
-        assert_eq!((run.code, run.stdout.as_str()), (Some(0), ""), "{mode:?}");
+        if mode == HoldMode::Strict {
+            // P1.1: in the Strict hold mode the reply goes to the user first.
+            assert_eq!(decision(&run), "ask", "{mode:?}");
+        } else {
+            assert_eq!((run.code, run.stdout.as_str()), (Some(0), ""), "{mode:?}");
+        }
         let run = sb.shell(&to_glm);
         assert!(
             run.stdout.starts_with("QUEUED lr-"),
@@ -2306,12 +2381,18 @@ fn approved_in_the_harness_prompt_prints_card_4() {
     let run = posttool(&sb, "x1", merge, "t1");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let v: Value = serde_json::from_str(run.stdout.trim()).unwrap_or(Value::Null);
-    assert_eq!(
-        v["hookSpecificOutput"]["additionalContext"],
-        "Lunchroom: Granted. Codex can merge."
+    // §16 item 15, D1.8: in Claude Code, which A1.2 gives no line, the agent whose call ran
+    // hears "Granted. <agent> can <action>." by D, as a line in the form of §16 item 1 that
+    // PostToolUse carries; the user hears it by U (the user's list, at the next prompt a person
+    // types), not here.
+    let context = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        context.ends_with(" UTC Lunchroom: Granted. Codex can merge. (Codex)"),
+        "{context}"
     );
-    // The user sees it too: a synchronous hook's `systemMessage` is shown in the terminal.
-    assert_eq!(v["systemMessage"], "Lunchroom: Granted. Codex can merge.");
+    assert!(v.get("systemMessage").is_none(), "{v}");
     assert_eq!(posttool(&sb, "x1", merge, "t1").stdout, "");
     assert_eq!(posttool(&sb, "x1", merge, "t9").stdout, "");
 }
@@ -2357,8 +2438,10 @@ fn asked_for_secret_both_agents_told() {
     let told = listen_once(&sb, "g1");
     assert_eq!(told.code, Some(2), "{}", told.stderr);
     assert!(
+        // §16 item 1 and item 8: GLM hears, by D, a line of Lunchroom's in the form of item 1
+        // that names DeepSeek and carries no text of the message.
         told.stderr
-            .contains("Lunchroom: Denied. Asked for a secret. DeepSeek asked you for a secret"),
+            .contains(" UTC Lunchroom: Denied. Asked for a secret. (DeepSeek to GLM)"),
         "{}",
         told.stderr
     );
@@ -3346,13 +3429,18 @@ fn every_channel_every_way_through_the_hook() {
         }
     }
     set_yolo(&sb, "s1", now() + 600);
-    for cmd in ["echo $(date)", heredoc] {
-        assert_eq!(
-            decision(&sb.pretool("s1", cmd, &interactive())),
-            "ask",
-            "{cmd}"
-        );
-    }
+    // A command the guard cannot parse is GATED and PROTECTED: no YOLO frees it (P1.4).
+    assert_eq!(
+        decision(&sb.pretool("s1", heredoc, &interactive())),
+        "ask",
+        "{heredoc}"
+    );
+    // A command substitution parses and is built at run time: GATED only, which a `lunchroom
+    // yolo` frees (P1.4).
+    assert_eq!(
+        decision(&sb.pretool("s1", "echo $(date)", &interactive())),
+        "allow"
+    );
 }
 
 // §12::2 (Claude Code): Lunchroom's own delivery into another agent's session is not
@@ -3362,6 +3450,7 @@ fn every_channel_every_way_through_the_hook() {
 #[test]
 fn lunchrooms_own_delivery_passes_the_guard() {
     let sb = Sandbox::new();
+    balanced(&sb);
     configure_guard(&sb);
     name_agents(&sb, &[("GLM", "g1"), ("DeepSeek", "d1")]);
     let program = env!("CARGO_BIN_EXE_lunchroom");
@@ -3698,7 +3787,7 @@ fn project_guard(dir: &Path, on: bool) {
     if on {
         let settings = claude_guard(env!("CARGO_BIN_EXE_lunchroom"));
         let _ = std::fs::create_dir_all(dir.join(".claude"));
-        let _ = std::fs::write(&file, settings.to_string());
+        common::write_settings(&file, &settings);
     } else {
         let _ = std::fs::write(&file, "{}");
     }
@@ -3754,10 +3843,7 @@ fn user_is_told_when_an_agent_becomes_unguarded() {
         ""
     );
     let missing = claude_guard("/nonexistent/bin/lunchroom");
-    let _ = std::fs::write(
-        mistral_dir.join(".claude/settings.json"),
-        missing.to_string(),
-    );
+    common::write_settings(&mistral_dir.join(".claude/settings.json"), &missing);
     let run = sb.prompt_in("c1", "And now?", &interactive());
     assert!(told_why(&system_message(&run)), "{}", system_message(&run));
     let status = sb.run(&["status"], "", &[]).stdout;
@@ -3785,7 +3871,7 @@ fn user_is_told_when_an_agent_becomes_unguarded() {
     assert_eq!(message_state(&sb, &id), Some("QUEUED"));
     // A relative program path counts from the session's folder: `./bin/lunchroom` there.
     let rel = claude_guard("./bin/lunchroom");
-    let _ = std::fs::write(mistral_dir.join(".claude/settings.json"), rel.to_string());
+    common::write_settings(&mistral_dir.join(".claude/settings.json"), &rel);
     let status = sb.run(&["status"], "", &[]).stdout;
     assert!(
         status.contains("Mistral\tclaude-code:m1\tUNGUARDED"),
@@ -3933,6 +4019,18 @@ fn codex_session_with(
     script: &str,
     env: &[(&str, &str)],
 ) -> Option<common::GroupChild> {
+    codex_session_args(sb, input, script, env, &[])
+}
+
+/// As [`codex_session_with`], with `args` after the script on the stand-in's own command line: the
+/// first is the shell's `$0`, the rest the options a `codex` window was started with (H1.4).
+fn codex_session_args(
+    sb: &Sandbox,
+    input: &str,
+    script: &str,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> Option<common::GroupChild> {
     // Where Codex's own install keeps a release (H1.2 reads it from the path).
     let harness = sb
         .root
@@ -3950,6 +4048,7 @@ fn codex_session_with(
         let started = common::GroupChild::spawn(
             Command::new(&fake)
                 .args(["-c", &format!("{script}; true")])
+                .args(args)
                 .env_clear()
                 .env("HOME", sb.home())
                 .env("LUNCHROOM_HOME", sb.lunchroom())
@@ -4008,13 +4107,15 @@ fn configure_codex_hooks(sb: &Sandbox, trusted: bool, hooks: &[(&str, &str, &str
     for (event, mode, _) in hooks {
         events.insert(
             (*event).to_owned(),
-            json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}]),
+            json!([{"hooks": [common::guard_hook(program, mode, false)]}]),
         );
     }
     let file = codex.join("hooks.json");
-    let _ = std::fs::write(&file, json!({ "hooks": events }).to_string());
+    common::write_settings(&file, &json!({ "hooks": events }));
     let config = if trusted {
-        let mut config = "model = \"x\"\n\n[features]\nunified_exec_tty = false\n".to_owned();
+        let mut config =
+            "model = \"x\"\nweb_search = \"disabled\"\n\n[features]\nunified_exec_tty = false\n"
+                .to_owned();
         for (_, _, state) in hooks {
             let _ = write!(
                 config,
@@ -4262,14 +4363,23 @@ fn codex_delivery_through_codex_queue() {
     assert_eq!(message_state(&sb, &id), Some("DELIVERED"));
     let queued =
         std::fs::read_to_string(sb.home().join(".codex/queued-x1.txt")).unwrap_or_default();
+    // D1.1: the hand-over carries the id and the command that shows it, never the envelope or
+    // any text of the message.
+    assert!(queued.contains(&format!("id {id}.")), "{queued}");
+    assert!(queued.contains(&format!(" read {id}`")), "{queued}");
     assert!(
-        queued.contains("[LUNCHROOM MESSAGE - from agent Claude"),
+        queued.ends_with(&format!("\n[END LUNCHROOM MESSAGE {id}]")),
         "{queued}"
     );
     assert!(
-        queued.contains(&format!("[lr:{id}]> Codex, please review before I merge.")),
+        !queued.contains("[LUNCHROOM MESSAGE - from agent"),
         "{queued}"
     );
+    assert!(
+        !queued.contains("Codex, please review before I merge."),
+        "{queued}"
+    );
+    assert_eq!(queued.lines().count(), 2, "{queued}");
     let held = sb
         .store()
         .and_then(|s| s.read().ok())
@@ -4450,7 +4560,7 @@ fn codex_listener_hands_over_and_the_prompt_hook_confirms() {
     settle(&sb);
     let queued =
         std::fs::read_to_string(sb.home().join(".codex/queued-x1.txt")).unwrap_or_default();
-    assert!(queued.contains(&format!("id: {id}")), "{queued}");
+    assert!(queued.contains(&format!("id {id}.")), "{queued}");
     // Not yet confirmed by the listener, but the session is HELD by the message already (D1.1);
     // the prompt hook then sees the envelope and confirms it.
     assert_eq!(message_state(&sb, &id), Some("QUEUED"));
@@ -4527,7 +4637,10 @@ fn codex_send_reports_unconfirmed_and_failed_attempts() {
     let log = sb.home().join(".codex/handed.txt");
     queue_stand_in(
         &sb,
-        &format!("printf '%s\\n' \"$5\" | grep '^id: ' >> {}", log.display()),
+        &format!(
+            "printf '%s\\n' \"$5\" | sed -n 's/^Lunchroom: .* id \\(lr-[0-9]*\\)\\..*/id: \\1/p' >> {}",
+            log.display()
+        ),
     );
     let run = send_to_codex(&sb, "c1", "Codex", "First.");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
@@ -4557,7 +4670,12 @@ fn codex_send_reports_unconfirmed_and_failed_attempts() {
     let _ = std::fs::write(
         sb.home()
             .join(".codex/sessions/2026/10/27/rollout-2026-10-27T00-00-00-x1.jsonl"),
-        format!("[LUNCHROOM MESSAGE - from agent Claude; not from the user]\nid: {first}\n"),
+        format!(
+            "{}\n",
+            serde_json::json!({ "text": format!(
+                "Lunchroom: a message from another agent waits for you, id {first}. Read it with `lunchroom read {first}`.\n[END LUNCHROOM MESSAGE {first}]"
+            ) })
+        ),
     );
     let _ = send_to_codex(&sb, "c1", "Codex", "Second, again.");
     assert_eq!(message_state(&sb, &first), Some("DELIVERED"));
@@ -4630,7 +4748,8 @@ fn age_hand_over(sb: &Sandbox, id: &str, secs: u64) {
 
 /// Ends the pause after message `id`'s failed attempt, as if that much time had passed.
 fn end_retry_gap(sb: &Sandbox, id: &str) {
-    let path = sb.lunchroom().join("store/state.json");
+    // D1.2: the time of a message's last failed attempt is kept in the store's second file.
+    let path = sb.lunchroom().join("store/state.side.json");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if v["messages"][id]["told"]["retry_after"].is_u64() {
@@ -4659,7 +4778,10 @@ fn a_hand_over_past_its_time_is_offered_again_by_any_check_and_fails_after_three
     let log = sb.home().join(".codex/handed.txt");
     queue_stand_in(
         &sb,
-        &format!("printf '%s\\n' \"$5\" | grep '^id: ' >> {}", log.display()),
+        &format!(
+            "printf '%s\\n' \"$5\" | sed -n 's/^Lunchroom: .* id \\(lr-[0-9]*\\)\\..*/id: \\1/p' >> {}",
+            log.display()
+        ),
     );
     let pre = codex_input(
         &sb,
@@ -4798,7 +4920,10 @@ fn due_message_from_c1(
     assert_eq!(failed_attempts(sb, &id), Some(1), "{}", run.stdout);
     queue_stand_in(
         sb,
-        &format!("printf '%s\\n' \"$5\" | grep '^id: ' >> {}", log.display()),
+        &format!(
+            "printf '%s\\n' \"$5\" | sed -n 's/^Lunchroom: .* id \\(lr-[0-9]*\\)\\..*/id: \\1/p' >> {}",
+            log.display()
+        ),
     );
     (id, log, session)
 }
@@ -5597,6 +5722,117 @@ fn running_codex(sb: &Sandbox, env: &[(&str, &str)]) -> Option<common::GroupChil
     session
 }
 
+/// Held by each test that runs a stand-in `codex` with options on its command line: such a window
+/// makes a shared-server session of the same user UNGUARDED (H1.4), so two of them must not run
+/// together.
+static CODEX_WINDOWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A running stand-in Codex session `x1` started with `options` on its command line.
+fn running_codex_started_with(sb: &Sandbox, options: &[&str]) -> Option<common::GroupChild> {
+    let pre = codex_input(
+        sb,
+        "x1",
+        "PreToolUse",
+        &json!({
+            "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "c1",
+        }),
+    );
+    let mut args = vec!["codex"];
+    args.extend_from_slice(options);
+    let session = codex_session_args(
+        sb,
+        &pre,
+        "\"$LR\" guard pretool < \"$IN\"; sleep 8",
+        &[],
+        &args,
+    );
+    assert!(session.is_some());
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    session
+}
+
+// §13::68-§13::72, §13::75, §4::38-§4::41 (H1.4): a Codex session started with each
+// spelling that turns the tty setting or web search on shows UNGUARDED, naming the option, and
+// receives nothing; one started with `-c web_search="disabled"`, `--enable web_search_request`, or
+// the tty set to `false` is guarded and receives the message.
+#[test]
+fn a_codex_session_started_with_an_option_that_turns_a_setting_on_is_unguarded() {
+    let _alone = CODEX_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (options, on) in [
+        (&["-c", "features.unified_exec_tty=true"][..], true),
+        (&["--config=features.unified_exec_tty=1"], true),
+        (&["--enable=unified_exec_tty"], true),
+        (&["--enable", "unified_exec_tty"], true),
+        (&["-c", "web_search=\"live\""], true),
+        (&["-cweb_search=cached"], true),
+        (&["--search"], true),
+        (&["-c", "web_search=\"disabled\""], false),
+        (&["--enable", "web_search_request"], false),
+        (&["-c", "features.unified_exec_tty=false"], false),
+    ] {
+        let sb = Sandbox::new();
+        codex_and_two_senders(&sb);
+        let session = running_codex_started_with(&sb, options);
+        let run = send_to_codex(&sb, "c1", "Codex", "After the window started.");
+        assert_eq!(run.code, Some(0), "{options:?}: {}", run.stderr);
+        let queued = sb.home().join(".codex/queued-x1.txt");
+        if on {
+            assert!(
+                run.stdout.contains("Codex is UNGUARDED."),
+                "{options:?}: {}",
+                run.stdout
+            );
+            assert!(!queued.exists(), "{options:?}");
+            let status = sb.user_status();
+            let why = codex_why(&status);
+            assert!(
+                why.contains("was started with") && why.contains("UNGUARDED"),
+                "{options:?}: {status}"
+            );
+        } else {
+            assert!(
+                run.stdout.contains("DELIVERED lr-"),
+                "{options:?}: {}",
+                run.stdout
+            );
+            assert!(queued.exists(), "{options:?}");
+        }
+        stop(session);
+    }
+}
+
+// §13::76 (H1.4): while a `codex` window of the user is running with such an option,
+// every session in the shared server (a `codex` process running `app-server`) is UNGUARDED; when
+// that window ends, it is not.
+#[test]
+fn a_window_with_such_an_option_makes_every_session_in_the_shared_server_unguarded() {
+    let _alone = CODEX_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sb = Sandbox::new();
+    codex_and_two_senders(&sb);
+    let session = running_codex_started_with(&sb, &["app-server"]);
+    let window = codex_session_args(&sb, "", "sleep 5", &[], &["codex", "--search"]);
+    assert!(window.is_some());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let run = send_to_codex(&sb, "c1", "Codex", "While the window runs.");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stdout.contains("Codex is UNGUARDED."), "{}", run.stdout);
+    assert!(!sb.home().join(".codex/queued-x1.txt").exists());
+    let why = codex_why(&sb.user_status());
+    assert!(
+        why.contains("--search") && why.contains("shared server"),
+        "{why}"
+    );
+    stop(window);
+    let run = send_to_codex(&sb, "c1", "Codex", "After the window ended.");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stdout.contains("DELIVERED lr-"), "{}", run.stdout);
+    stop(session);
+}
+
 // §13 H1: a Codex session without `unified_exec_tty = false` is UNGUARDED, and `status`
 // says how to end that, as after updating Lunchroom through another harness's install.
 #[test]
@@ -5664,7 +5900,14 @@ fn a_second_senders_send_hands_over_nothing_of_the_first_senders() {
     let run = send_to_codex(&sb, "c2", "Codex", "Second sender's text.");
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let handed = std::fs::read_to_string(&log).unwrap_or_default();
-    assert!(handed.contains("Second sender's text."), "{handed}");
+    let second_id = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(handed.contains(&format!("id {second_id}.")), "{handed}");
+    assert!(!handed.contains("Second sender's text."), "{handed}");
     assert!(!handed.contains("First sender's text."), "{handed}");
     assert!(!handed.contains(&first_id), "{handed}");
     assert_eq!(message_state(&sb, &first_id), Some("QUEUED"));
@@ -5698,7 +5941,11 @@ fn a_codex_first_on_the_senders_path_is_not_the_program_that_hands_over() {
     assert!(!marker.exists(), "the planted codex ran");
     let queued =
         std::fs::read_to_string(sb.home().join(".codex/queued-x1.txt")).unwrap_or_default();
-    assert!(queued.contains("Past the planted one."), "{queued}");
+    assert!(
+        queued.contains("a message from another agent waits for you"),
+        "{queued}"
+    );
+    assert!(!queued.contains("Past the planted one."), "{queued}");
     let _ = finish(session);
 }
 
@@ -5766,19 +6013,23 @@ fn a_program_that_cannot_be_established_starts_nothing_and_is_not_an_attempt() {
     let _ = finish(session);
 }
 
-// §10::15 through `lunchroom send`: 64 KiB made of one-byte lines is refused as having
-// too many lines and nothing is stored; 64 KiB in lines of 100 bytes is accepted.
+// §10::37 through `lunchroom send`: 64 KiB made of one-byte lines is accepted (no
+// harness takes the envelope as a command argument, so lines are not limited); one byte more is
+// refused as too long and nothing is stored; 64 KiB in lines of 100 bytes is accepted.
 #[test]
-fn one_byte_lines_are_refused_through_send_and_100_byte_lines_are_accepted() {
+fn one_byte_lines_are_accepted_through_send_and_100_byte_lines_are_accepted() {
     let sb = Sandbox::new();
     let _ = a_sent_message(&sb);
     let state = sb.lunchroom().join("store/state.json");
-    let before = std::fs::read_to_string(&state).unwrap_or_default();
     let short_lines = "a\n".repeat(32_768);
     assert_eq!(short_lines.len(), 65_536);
     let run = sb.run(&["send", "reviewer", "-"], &short_lines, &[]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let before = std::fs::read_to_string(&state).unwrap_or_default();
+    let too_long = format!("{short_lines}a");
+    let run = sb.run(&["send", "reviewer", "-"], &too_long, &[]);
     assert_eq!(run.code, Some(2), "{}", run.stderr);
-    assert!(run.stderr.contains("too many lines"), "{}", run.stderr);
+    assert!(run.stderr.contains("longer than"), "{}", run.stderr);
     assert_eq!(std::fs::read_to_string(&state).unwrap_or_default(), before);
     let long_lines = format!("{}\n", "b".repeat(99)).repeat(655);
     assert!(long_lines.len() <= 65_536);
@@ -5822,5 +6073,770 @@ fn a_held_agent_starting_a_new_session_reaches_the_user_through_the_hook() {
                 );
             }
         }
+    }
+}
+
+/// A running Codex session x1 that outlasts a `lunchroom send`'s whole wait for confirmation.
+fn long_running_codex(sb: &Sandbox) -> Option<common::GroupChild> {
+    let pre = codex_input(
+        sb,
+        "x1",
+        "PreToolUse",
+        &json!({
+            "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "c1",
+        }),
+    );
+    let session = codex_session_with(sb, &pre, "\"$LR\" guard pretool < \"$IN\"; sleep 90", &[]);
+    assert!(session.is_some());
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    session
+}
+
+/// The ids of the messages holding the Codex session x1.
+fn codex_holders(sb: &Sandbox) -> Vec<String> {
+    let codex = Identity::new(Harness::Codex, "x1");
+    sb.store()
+        .and_then(|s| s.read().ok())
+        .map(|m| {
+            m.holding(&codex)
+                .iter()
+                .map(|h| h.message.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// §10::24 (D1.1): the hand-over's command line, as the system shows it for the running
+// program (`/proc/<pid>/cmdline`), carries the message id and `lunchroom read <id>`, and no byte of
+// the message's text, its sender's name line or its envelope; one line, ending as an envelope does.
+// §10::26: the session is HELD by the message from the hand-over, stays HELD while the
+// hand-over is unconfirmed, and a hand-over whose program exits with an error releases only its
+// own message's hold.
+#[test]
+fn codex_hand_over_command_line_holds_the_id_and_no_text_of_the_message() {
+    let sb = Sandbox::new();
+    codex_and_two_senders(&sb);
+    let log = sb.home().join(".codex/cmdline.txt");
+    queue_stand_in(
+        &sb,
+        &format!(
+            "tr '\\0' '|' < /proc/$$/cmdline >> {log}; echo >> {log}",
+            log = log.display()
+        ),
+    );
+    let session = long_running_codex(&sb);
+    let text = "ZEBRA-PAYLOAD-77 first line\nsecond line [lr:x]> not a label";
+    let run = send_to_codex(&sb, "c1", "Codex", text);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let first = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(first.starts_with("lr-"), "{}", run.stdout);
+    let cmdline = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(cmdline.contains(&format!("id {first}.")), "{cmdline}");
+    assert!(cmdline.contains(&format!(" read {first}`")), "{cmdline}");
+    assert!(cmdline.contains("|--message|"), "{cmdline}");
+    for text_of_the_message in [
+        "ZEBRA-PAYLOAD-77",
+        "first line",
+        "second line",
+        "[LUNCHROOM MESSAGE",
+        "from agent",
+        "sent:",
+    ] {
+        assert!(!cmdline.contains(text_of_the_message), "{cmdline}");
+    }
+    // Unconfirmed (the stand-in writes no record): QUEUED, handed over, and the session HELD.
+    assert_eq!(message_state(&sb, &first), Some("QUEUED"));
+    assert_eq!(codex_holders(&sb), std::slice::from_ref(&first));
+    // A hand-over whose program exits with an error counts one failed attempt and releases the
+    // hold taken for that message only.
+    queue_stand_in(&sb, "exit 1");
+    let run = send_to_codex(&sb, "c2", "Codex", "Second sender's text.");
+    let second = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        run.stdout
+            .contains(&format!("{second}: codex queue exited 1; QUEUED")),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(failed_attempts(&sb, &second), Some(1));
+    assert_eq!(codex_holders(&sb), [first]);
+    let _ = finish(session);
+}
+
+// §10::32 (D1.1): the kept length and identity are those of the plain record at the
+// hand-over, 0 when there is none: a hand-over with no record keeps zeros, one made with a record
+// keeps its length, device and inode.
+#[test]
+fn codex_hand_over_keeps_the_record_length_and_identity_or_zero() {
+    let sb = Sandbox::new();
+    codex_and_two_senders(&sb);
+    queue_stand_in(&sb, "exit 0");
+    let session = long_running_codex(&sb);
+    let run = send_to_codex(&sb, "c1", "Codex", "No record yet.");
+    let first = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let kept = |id: &str| {
+        sb.store()
+            .and_then(|s| s.read().ok())
+            .and_then(|m| m.handed_at(id))
+    };
+    assert_eq!(
+        kept(&first),
+        Some(lunchroom_core::mail::RecordMark::default())
+    );
+    // Now the thread has a record of 4096 bytes.
+    let record = sb
+        .home()
+        .join(".codex/sessions/2026/10/27/rollout-2026-10-27T00-00-00-x1.jsonl");
+    assert!(std::fs::write(&record, "x".repeat(4096)).is_ok());
+    let run = send_to_codex(&sb, "c2", "Codex", "With a record.");
+    let second = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let mark = kept(&second);
+    assert!(
+        mark.is_some_and(|m| m.len == 4096 && m.ino != 0),
+        "{mark:?}"
+    );
+    let _ = finish(session);
+}
+
+// §10::3 (D1.3, Codex), §10::26: a hand-over program that gives no answer in time is not
+// known to have failed: the message stays handed over (never handed over again), is not counted as
+// a failed attempt, and its hold stays. The listener's hand-over has the 50 seconds of its hook, so
+// this test takes that long.
+#[test]
+fn a_hand_over_program_that_gives_no_answer_leaves_the_message_handed_over_and_uncounted() {
+    let sb = Sandbox::new();
+    configure_guard(&sb);
+    configure_codex(&sb, true);
+    queue_stand_in(&sb, "sleep 300");
+    name_agents(&sb, &[("Claude", "c1")]);
+    let codex = Identity::new(Harness::Codex, "x1");
+    let named = sb.store().and_then(|s| {
+        s.update(|m| m.register("Codex", &codex, Origin::User, None).ok())
+            .ok()
+    });
+    assert!(named.is_some());
+    let run = send_to_codex(&sb, "c1", "Codex", "Will not be answered.");
+    let id = run
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    let pre = codex_input(
+        &sb,
+        "x1",
+        "PreToolUse",
+        &json!({
+            "tool_name": "Bash", "tool_input": {"command": "true"}, "tool_use_id": "c1",
+        }),
+    );
+    let stop = codex_input(&sb, "x1", "Stop", &json!({}));
+    let stop_file = sb.root.join("stop.json");
+    let _ = std::fs::write(&stop_file, &stop);
+    let session = codex_session(
+        &sb,
+        &pre,
+        &format!(
+            "\"$LR\" guard pretool < \"$IN\"; \"$LR\" listen --once < {}; echo listen=$?",
+            stop_file.display()
+        ),
+    );
+    let out = finish(session);
+    assert!(out.contains("listen=0"), "{out}");
+    let record = sb.store().and_then(|s| s.read().ok()).and_then(|m| {
+        m.message(&id)
+            .map(|d| (d.status.state().word(), d.failed_attempts, d.handed_over))
+    });
+    assert_eq!(record, Some(("QUEUED", 0, true)));
+    assert_eq!(codex_holders(&sb), [id]);
+}
+
+/// The call `command` of Claude Code session `s1` that waits for the user (it was DENIED because
+/// nobody could be asked), refused by the user as the console's refuse key will do it: the store
+/// side of §17.10. Returns the refusal's id.
+fn refuse_waiting_call(sb: &Sandbox) -> String {
+    let store = sb.store();
+    assert!(store.is_some());
+    let Some(store) = store else {
+        return String::new();
+    };
+    let waiting = store
+        .read()
+        .map(|m| m.requests().to_vec())
+        .unwrap_or_default();
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
+    let request = waiting.first().cloned().unwrap_or_else(unreachable_request);
+    store
+        .update(|m| m.refuse_request(0, &request, now()).ok())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// A request that no test reads: `refuse_waiting_call` asserted that one waits.
+fn unreachable_request() -> lunchroom_core::approvals::Request {
+    lunchroom_core::approvals::Request {
+        session: Identity::new(Harness::ClaudeCode, "none"),
+        agent: String::new(),
+        tool: String::new(),
+        input: json!({}),
+        cwd: String::new(),
+        rule: String::new(),
+        at: 0,
+    }
+}
+
+// §17::187, §17::188, §17::189 (Claude Code, which A1.2 gives no channel): a call kept
+// for `lunchroom approve` that the user refuses is no longer waiting; the exact call tried again is
+// DENIED, and its reason tells the agent that the user declined it; it is not kept for approval
+// again; another call is judged as before; a different session's same call is not affected.
+#[test]
+fn a_refused_call_is_denied_on_retry_with_the_reason_that_the_user_declined_it() {
+    let sb = Sandbox::new();
+    hold(&sb, "s1");
+    let call = "git push origin main";
+    let first = sb.pretool("s1", call, &headless());
+    assert_eq!(first.code, Some(2), "{}", first.stdout);
+    assert!(
+        first.stderr.contains("no approval channel"),
+        "{}",
+        first.stderr
+    );
+    let listed = sb.run(&["approve"], "", &[]);
+    assert!(listed.stdout.contains(call), "{}", listed.stdout);
+    let id = refuse_waiting_call(&sb);
+    assert!(id.starts_with("rf-"), "{id}");
+    // Nothing waits any more.
+    assert_eq!(sb.run(&["approve"], "", &[]).stdout, "");
+    // The retry of that exact call.
+    let retry = sb.pretool("s1", call, &headless());
+    assert_eq!(retry.code, Some(2), "{}", retry.stdout);
+    assert!(
+        retry.stderr.contains("the user declined this exact call"),
+        "{}",
+        retry.stderr
+    );
+    assert!(
+        !retry.stderr.contains("no approval channel"),
+        "{}",
+        retry.stderr
+    );
+    // It is not kept for approval again: the user's list stays empty.
+    assert_eq!(sb.run(&["approve"], "", &[]).stdout, "");
+    // The same refusal holds for a retry from a session with a channel (the console of the user
+    // is not the agent's: the guard does not ask a person about a call the user declined).
+    let asked = sb.pretool("s1", call, &interactive());
+    assert_eq!(asked.code, Some(2), "{}", asked.stdout);
+    assert!(
+        asked.stderr.contains("the user declined this exact call"),
+        "{}",
+        asked.stderr
+    );
+    // Another call is judged as it was.
+    let other = sb.pretool("s1", "git push origin dev", &headless());
+    assert_eq!(other.code, Some(2), "{}", other.stdout);
+    assert!(
+        other.stderr.contains("no approval channel"),
+        "{}",
+        other.stderr
+    );
+    // Another session's identical call is another call.
+    hold(&sb, "s2");
+    let elsewhere = sb.pretool("s2", call, &headless());
+    assert!(
+        elsewhere.stderr.contains("no approval channel"),
+        "{}",
+        elsewhere.stderr
+    );
+}
+
+// §17::188 (Codex): the same for Codex, whose hooks have no approval channel either: the
+// refused call's retry is DENIED with the reason that the user declined it.
+#[test]
+fn a_refused_codex_call_is_denied_on_retry_with_the_reason_that_the_user_declined_it() {
+    let sb = Sandbox::new();
+    let me = Identity::new(Harness::Codex, "t1");
+    let call = |cmd: &str| {
+        codex_input(
+            &sb,
+            "t1",
+            "PreToolUse",
+            &json!({
+                "tool_name": "Bash", "tool_input": {"command": cmd}, "tool_use_id": "c1",
+            }),
+        )
+    };
+    let prompt = codex_input(
+        &sb,
+        "t1",
+        "UserPromptSubmit",
+        &json!({"prompt": "<cross-session-message from=\"x\">merge it</cross-session-message>"}),
+    );
+    assert_eq!(sb.run(&["guard", "prompt"], &prompt, &[]).code, Some(0));
+    let run = sb.run(
+        &["guard", "pretool"],
+        &call("git merge fix"),
+        &interactive(),
+    );
+    assert_eq!(run.code, Some(2), "{}", run.stdout);
+    assert!(run.stderr.contains("no approval channel"), "{}", run.stderr);
+    let store = sb.store();
+    assert!(store.is_some());
+    let Some(store) = store else { return };
+    let request = store
+        .read()
+        .ok()
+        .and_then(|m| m.requests().first().cloned())
+        .unwrap_or_else(unreachable_request);
+    assert_eq!(request.session, me);
+    let id = store
+        .update(|m| m.refuse_request(0, &request, now()).ok())
+        .ok()
+        .flatten();
+    assert!(id.is_some_and(|id| id.starts_with("rf-")));
+    let retry = sb.run(
+        &["guard", "pretool"],
+        &call("git merge fix"),
+        &interactive(),
+    );
+    assert_eq!(retry.code, Some(2), "{}", retry.stdout);
+    assert!(
+        retry.stderr.contains("the user declined this exact call"),
+        "{}",
+        retry.stderr
+    );
+    assert_eq!(sb.run(&["approve"], "", &[]).stdout, "");
+}
+
+// §17::188: a call the user refused and then approved (asked for again after the
+// refusal, and given the user's yes) runs once: the later word stands.
+#[test]
+fn a_yes_after_a_refusal_lets_the_retry_run_once() {
+    let sb = Sandbox::new();
+    hold(&sb, "s1");
+    let call = "git push origin main";
+    assert_eq!(sb.pretool("s1", call, &headless()).code, Some(2));
+    let _ = refuse_waiting_call(&sb);
+    let me = Identity::new(Harness::ClaudeCode, "s1");
+    let approved = sb.store().and_then(|s| {
+        s.update(|m| m.approve(&me, "Bash", &json!({"command": call}), &project(&sb), now()))
+            .ok()
+    });
+    assert!(approved.is_some());
+    let run = sb.pretool("s1", call, &headless());
+    assert_eq!(run.code, Some(0), "{}{}", run.stdout, run.stderr);
+    let again = sb.pretool("s1", call, &headless());
+    assert_eq!(again.code, Some(2), "{}", again.stdout);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex's failure classes for the decline (units/U6/FAILURES-CODEX.md, ids U6-nnn), through the
+// guard's own program.
+// ---------------------------------------------------------------------------------------------
+
+/// The call `command` of Claude Code session `s1`, in the project folder, waiting for the user and
+/// declined by them, while `s1` is HELD by another agent's text; the guard is not asked first (the
+/// request is put in the store, as the guard puts one there), so the mode in force when the call
+/// was asked does not matter.
+fn decline_call(sb: &Sandbox, command: &str) -> String {
+    let me = Identity::new(Harness::ClaudeCode, "s1");
+    let request = lunchroom_core::approvals::Request {
+        session: me,
+        agent: "s1".to_owned(),
+        tool: "Bash".to_owned(),
+        input: json!({ "command": command }),
+        cwd: project(sb),
+        rule: String::new(),
+        at: now(),
+    };
+    let store = sb.store();
+    assert!(store.is_some());
+    let Some(store) = store else {
+        return String::new();
+    };
+    let id = store
+        .update(|m| {
+            m.request(request.clone());
+            let at = m.requests().iter().position(|r| *r == request)?;
+            m.refuse_request(at, &request, now()).ok()
+        })
+        .ok()
+        .flatten();
+    assert!(id.is_some());
+    id.unwrap_or_default()
+}
+
+fn declined_reason(run: &Run) -> bool {
+    run.code == Some(2) && run.stderr.contains("the user declined this exact call")
+}
+
+fn set_mode(sb: &Sandbox, mode: HoldMode) {
+    let set = sb
+        .store()
+        .and_then(|s| s.update(|m| m.set_hold_mode(mode)).ok());
+    assert!(set.is_some());
+}
+
+// U6-001, U6-002, U6-003: in each hold mode the retry of the declined call is DENIED, with a channel
+// to the user and without one. (In Relaxed a call like this runs when it was never declined.)
+#[test]
+fn declined_exact_call_is_denied_in_strict_mode() {
+    declined_in_mode(HoldMode::Strict);
+}
+
+#[test]
+fn declined_exact_call_is_denied_in_balanced_mode() {
+    declined_in_mode(HoldMode::Balanced);
+}
+
+#[test]
+fn declined_exact_call_is_denied_in_relaxed_mode() {
+    let sb = Sandbox::new();
+    set_mode(&sb, HoldMode::Relaxed);
+    let call = "touch made-in-relaxed.txt";
+    hold(&sb, "s1");
+    let ran = sb.pretool("s1", call, &headless());
+    assert_eq!(
+        ran.code,
+        Some(0),
+        "never declined, it runs: {}{}",
+        ran.stdout,
+        ran.stderr
+    );
+    decline_call(&sb, call);
+    for env in [headless(), interactive()] {
+        let run = sb.pretool("s1", call, &env);
+        assert!(declined_reason(&run), "{}{}", run.stdout, run.stderr);
+    }
+}
+
+fn declined_in_mode(mode: HoldMode) {
+    let sb = Sandbox::new();
+    set_mode(&sb, mode);
+    let call = "git push origin main";
+    hold(&sb, "s1");
+    decline_call(&sb, call);
+    for env in [headless(), interactive()] {
+        let run = sb.pretool("s1", call, &env);
+        assert!(
+            declined_reason(&run),
+            "{mode:?}: {}{}",
+            run.stdout,
+            run.stderr
+        );
+    }
+    // Another call is judged as the mode judges it, not as declined.
+    let other = sb.pretool("s1", "git push origin dev", &headless());
+    assert!(
+        !other.stderr.contains("the user declined"),
+        "{}",
+        other.stderr
+    );
+}
+
+// U6-004, U6-070: the user's YOLO, set before the decline or after it, does not let the call run.
+#[test]
+fn declined_exact_call_is_denied_with_yolo() {
+    let sb = Sandbox::new();
+    let call = "git push origin main";
+    hold(&sb, "s1");
+    set_yolo(&sb, "s1", now() + 600);
+    decline_call(&sb, call);
+    for env in [headless(), interactive()] {
+        let run = sb.pretool("s1", call, &env);
+        assert!(declined_reason(&run), "{}{}", run.stdout, run.stderr);
+    }
+}
+
+#[test]
+fn yolo_does_not_override_declined_exact_call() {
+    let sb = Sandbox::new();
+    let call = "touch made-under-yolo.txt";
+    hold(&sb, "s1");
+    decline_call(&sb, call);
+    set_yolo(&sb, "s1", now() + 600);
+    for env in [headless(), interactive()] {
+        let run = sb.pretool("s1", call, &env);
+        assert!(declined_reason(&run), "{}{}", run.stdout, run.stderr);
+    }
+}
+
+// U6-071: a YOLO that starts and ends leaves the decline as it was.
+#[test]
+fn yolo_start_stop_does_not_mutate_refusal() {
+    let sb = Sandbox::new();
+    let call = "touch made-after-yolo.txt";
+    hold(&sb, "s1");
+    decline_call(&sb, call);
+    set_yolo(&sb, "s1", now() + 600);
+    assert!(declined_reason(&sb.pretool("s1", call, &headless())));
+    set_yolo(&sb, "s1", 1);
+    assert!(declined_reason(&sb.pretool("s1", call, &headless())));
+    let kept = sb
+        .store()
+        .and_then(|s| s.read().ok())
+        .map(|m| m.requests().len());
+    assert_eq!(
+        kept,
+        Some(0),
+        "a declined retry is not kept for approval again"
+    );
+}
+
+// U6-072: every change of the hold mode, in every order, leaves the decline.
+#[test]
+fn hold_mode_changes_do_not_clear_refusal() {
+    let sb = Sandbox::new();
+    let call = "touch made-after-mode.txt";
+    hold(&sb, "s1");
+    set_mode(&sb, HoldMode::Strict);
+    decline_call(&sb, call);
+    for mode in [
+        HoldMode::Balanced,
+        HoldMode::Relaxed,
+        HoldMode::Strict,
+        HoldMode::Relaxed,
+        HoldMode::Balanced,
+    ] {
+        set_mode(&sb, mode);
+        let run = sb.pretool("s1", call, &headless());
+        assert!(
+            declined_reason(&run),
+            "{mode:?}: {}{}",
+            run.stdout,
+            run.stderr
+        );
+    }
+}
+
+// U6-090: retries by a program with no person at it (a run of `claude -p`, a cron) are DENIED every
+// time; none of them is kept for approval, none approves.
+#[test]
+fn unattended_retries_respect_refusal() {
+    let sb = Sandbox::new();
+    let call = "git push origin main";
+    hold(&sb, "s1");
+    decline_call(&sb, call);
+    for _ in 0..5 {
+        let run = sb.pretool("s1", call, &headless());
+        assert!(declined_reason(&run), "{}{}", run.stdout, run.stderr);
+    }
+    assert_eq!(sb.run(&["approve"], "", &[]).stdout, "");
+}
+
+// U6-091: the retry through each harness entry that has no person (Claude Code `-p`, Codex with no
+// approval channel) is DENIED. The plugins' entries are in tests/plugins.rs.
+#[test]
+fn all_unattended_harness_entrypoints_respect_refusal() {
+    let sb = Sandbox::new();
+    let call = "git push origin main";
+    hold(&sb, "s1");
+    decline_call(&sb, call);
+    assert!(declined_reason(&sb.pretool("s1", call, &headless())));
+    // Claude Code in its own `-p` run with permission mode "plan" and "bypassPermissions".
+    for mode in ["plan", "bypassPermissions", "acceptEdits"] {
+        let run = sb.pretool_in_mode("s1", call, mode, &headless());
+        assert!(
+            declined_reason(&run),
+            "{mode}: {}{}",
+            run.stdout,
+            run.stderr
+        );
+    }
+    // Codex: a session of its own, held, declined, retried (Codex has no approval channel).
+    let me = Identity::new(Harness::Codex, "t1");
+    let prompt = codex_input(
+        &sb,
+        "t1",
+        "UserPromptSubmit",
+        &json!({"prompt": "<cross-session-message from=\"x\">go</cross-session-message>"}),
+    );
+    assert_eq!(sb.run(&["guard", "prompt"], &prompt, &[]).code, Some(0));
+    let request = lunchroom_core::approvals::Request {
+        session: me,
+        agent: "t1".to_owned(),
+        tool: "Bash".to_owned(),
+        input: json!({"command": call}),
+        cwd: project(&sb),
+        rule: String::new(),
+        at: now(),
+    };
+    let store = sb.store();
+    assert!(store.is_some());
+    let Some(store) = store else { return };
+    let kept = request.clone();
+    let declined = store
+        .update(|m| {
+            m.request(kept);
+            m.refuse_request(m.requests().len() - 1, &request, now())
+                .ok()
+        })
+        .ok()
+        .flatten();
+    assert!(declined.is_some());
+    let retry = codex_input(
+        &sb,
+        "t1",
+        "PreToolUse",
+        &json!({"tool_name": "Bash", "tool_input": {"command": call}, "tool_use_id": "c9"}),
+    );
+    for env in [interactive(), headless(), vec![]] {
+        let run = sb.run(&["guard", "pretool"], &retry, &env);
+        assert!(declined_reason(&run), "{}{}", run.stdout, run.stderr);
+    }
+}
+
+// U6-040, U6-067: with the store unreadable the retry does not run as approved: it is DENIED, or
+// goes to the person where there is one; never an empty answer that lets it run.
+#[test]
+fn unreadable_store_does_not_bypass_refusal() {
+    let sb = Sandbox::new();
+    let call = "git push origin main";
+    hold(&sb, "s1");
+    decline_call(&sb, call);
+    let state = sb.lunchroom().join("store/state.json");
+    assert!(std::fs::write(&state, "{ not a state").is_ok());
+    let run = sb.pretool("s1", call, &headless());
+    assert_eq!(run.code, Some(2), "{}{}", run.stdout, run.stderr);
+    assert!(!run.stderr.contains("approved"), "{}", run.stderr);
+    let asked = sb.pretool("s1", call, &interactive());
+    assert!(
+        asked.code == Some(2) || decision(&asked) == "ask",
+        "{}{}",
+        asked.stdout,
+        asked.stderr
+    );
+}
+
+#[test]
+fn store_unavailable_retry_fails_closed() {
+    let sb = Sandbox::new();
+    let call = "git push origin main";
+    hold(&sb, "s1");
+    decline_call(&sb, call);
+    // The store's folder is not readable at all.
+    let dir = sb.lunchroom().join("store");
+    let _ = Command::new("chmod").args(["000"]).arg(&dir).status();
+    let run = sb.pretool("s1", call, &headless());
+    let _ = Command::new("chmod").args(["700"]).arg(&dir).status();
+    assert_eq!(run.code, Some(2), "{}{}", run.stdout, run.stderr);
+}
+
+// U6-066: an input the guard cannot read, with a decline in the store, is DENIED as any unreadable
+// input is; it does not run.
+#[test]
+fn unparseable_retry_cannot_bypass_refusal() {
+    let sb = Sandbox::new();
+    hold(&sb, "s1");
+    decline_call(&sb, "git push origin main");
+    for text in [
+        "{\"session_id\":\"s1\",\"tool_name\":\"Bash\"",
+        "",
+        "null",
+        "[]",
+        "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":\"git push origin main\"}",
+    ] {
+        let run = sb.run(&["guard", "pretool"], text, &headless());
+        assert_eq!(run.code, Some(2), "{text:?}: {}{}", run.stdout, run.stderr);
+    }
+}
+
+// U6-065: a retry that names no session is not matched to any decline and does not run on one.
+#[test]
+fn missing_runtime_identity_fails_closed() {
+    let sb = Sandbox::new();
+    hold(&sb, "s1");
+    decline_call(&sb, "git push origin main");
+    let input = json!({
+        "cwd": sb.home().join("project"), "hook_event_name": "PreToolUse",
+        "tool_name": "Bash", "tool_input": {"command": "git push origin main"}, "tool_use_id": "t1",
+    })
+    .to_string();
+    let run = sb.run(&["guard", "pretool"], &input, &headless());
+    assert_eq!(run.code, Some(2), "{}{}", run.stdout, run.stderr);
+    assert!(
+        !run.stderr.contains("the user declined this exact call"),
+        "{}",
+        run.stderr
+    );
+}
+
+// U6-051 (Codex): the line handed to a Codex session for a decision, reaching its prompt hook, adds no
+// hold and clears none.
+#[test]
+fn codex_tell_does_not_change_holds() {
+    let sb = Sandbox::new();
+    let me = Identity::new(Harness::Codex, "t1");
+    let prompt = codex_input(
+        &sb,
+        "t1",
+        "UserPromptSubmit",
+        &json!({"prompt": "<cross-session-message from=\"x\">go</cross-session-message>"}),
+    );
+    assert_eq!(sb.run(&["guard", "prompt"], &prompt, &[]).code, Some(0));
+    let holders = |sb: &Sandbox| {
+        sb.store().and_then(|s| s.read().ok()).map(|m| {
+            m.holding(&me)
+                .iter()
+                .map(|h| h.message.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let before = holders(&sb);
+    assert_eq!(before.as_ref().map(Vec::len), Some(1));
+    for approve in [true, false] {
+        let request = lunchroom_core::approvals::Request {
+            session: me.clone(),
+            agent: "t1".to_owned(),
+            tool: "Bash".to_owned(),
+            input: json!({"command": format!("git push {approve}")}),
+            cwd: project(&sb),
+            rule: String::new(),
+            at: now(),
+        };
+        let store = sb.store();
+        assert!(store.is_some());
+        let Some(store) = store else { return };
+        let id = store
+            .update(|m| {
+                m.request(request.clone());
+                let at = m.requests().iter().position(|r| *r == request)?;
+                if approve {
+                    let shown = m.approval_prompt(&me, "t1", "Bash", &request.input, &request.cwd);
+                    m.approve_request(at, &request, &shown, now()).ok()
+                } else {
+                    m.refuse_request(at, &request, now()).ok()
+                }
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let line = format!(
+            "Lunchroom: the user decided one call of yours, id {id}; it is not another agent's message. Read it with `lunchroom read {id}`.\n[END LUNCHROOM MESSAGE {id}]"
+        );
+        let told = codex_input(&sb, "t1", "UserPromptSubmit", &json!({ "prompt": line }));
+        let run = sb.run(&["guard", "prompt"], &told, &[]);
+        assert_eq!(run.code, Some(0), "{}{}", run.stdout, run.stderr);
+        assert_eq!(holders(&sb), before, "{id}");
     }
 }

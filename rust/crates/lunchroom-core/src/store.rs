@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 const STATE: &str = "state.json";
 const TEMP: &str = "state.json.tmp";
@@ -25,6 +26,13 @@ const TEMP: &str = "state.json.tmp";
 /// return to it when the state file cannot be read.
 const PREVIOUS: &str = "state.json.prev";
 const PREVIOUS_TEMP: &str = "state.json.prev.tmp";
+/// The file of the fields 1.1 adds (spec §10 D1.2): beside the state file, read and written under
+/// the same lock. A 1.0.1 program takes the lock and rewrites the state file without the fields it
+/// does not know; it never rewrites this one, so none of them is lost while it still runs.
+const SIDE: &str = "state.side.json";
+const SIDE_TEMP: &str = "state.side.json.tmp";
+const SIDE_PREVIOUS: &str = "state.side.json.prev";
+const SIDE_PREVIOUS_TEMP: &str = "state.side.json.prev.tmp";
 const GUARD_FILE: &str = "state.flock";
 /// How long a reader or writer waits for another to finish: past it, the store is reported busy,
 /// so no command, the user's own included, waits on a process that never lets go.
@@ -100,6 +108,33 @@ fn wait_for(try_lock: impl Fn() -> Result<(), fs::TryLockError>) -> io::Result<(
 /// and inode. Every write replaces the file, so a new state is a new stamp.
 pub type Stamp = (i64, i64, u64, u64);
 
+/// A state that keeps some of its fields in a file of their own (spec §10 D1.2).
+///
+/// [`Sided::split`] takes the fields an older program does not know out of the state's JSON and
+/// returns them, [`Sided::join`] puts them back. The defaults keep nothing apart, so a state with
+/// no such fields is one file.
+pub trait Sided {
+    /// Removes from `main` the fields that belong in the second file and returns them as one JSON
+    /// object, or `Null` when there are none.
+    fn split(main: &mut Value) -> Value {
+        let _ = main;
+        Value::Null
+    }
+
+    /// Puts the fields of the second file back into `main`.
+    fn join(main: &mut Value, side: &Value) {
+        let _ = (main, side);
+    }
+}
+
+/// The two files of one state as read: the state file and the second file, each as text (`None`
+/// when the file was never written; a file that is there and empty is text, and does not parse).
+struct Loaded<T> {
+    state: T,
+    main: Option<String>,
+    side: Option<String>,
+}
+
 /// A state of type `T` kept in one folder.
 #[derive(Debug)]
 pub struct Store<T> {
@@ -118,6 +153,8 @@ pub(crate) enum Crash {
     BeforeRename,
     /// After the state being replaced is kept as the previous one, before the new state replaces it.
     AfterPrevious,
+    /// After the second file replaces its file, before the state file does.
+    AfterSide,
     /// After the new state replaces the state file, before the folder is flushed.
     AfterRename,
     /// A repair, after the previous state is written to the temporary file, before the unreadable
@@ -129,7 +166,7 @@ pub(crate) enum Crash {
     RepairAfterRename,
 }
 
-impl<T: Serialize + DeserializeOwned + Default> Store<T> {
+impl<T: Serialize + DeserializeOwned + Default + Sided> Store<T> {
     /// The store in `dir`, which is created, readable by its owner only, if it is missing.
     ///
     /// # Errors
@@ -138,7 +175,8 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)?;
+            .create(dir)
+            .map_err(|e| with_path(dir, &e))?;
         crate::setgid::settle(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -160,7 +198,7 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
             kind: PhantomData,
         }
         .load()
-        .map(|(state, _)| state)
+        .map(|loaded| loaded.state)
     }
 
     /// The state as last written; the default state before the first write.
@@ -175,19 +213,29 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
             let _wait = crate::steps::begin(WAITING_STEP);
             wait_for(|| guard.try_lock_shared())?;
         }
-        let state = self.load().map(|(state, _)| state);
+        let state = self.load().map(|loaded| loaded.state);
         guard.unlock()?;
         state
     }
 
-    /// The stamp of the state file as it is now, taken without a lock; all zeros when there is
-    /// none. Equal stamps mean the same state, so a caller that found nothing to do may skip
-    /// reading until the stamp changes.
+    /// The stamp of the state as it is now, taken without a lock; all zeros when there is none.
+    /// Equal stamps mean the same state, so a caller that found nothing to do may skip reading
+    /// until the stamp changes. It covers the state file and the second file (D1.2): a change
+    /// to either is a new stamp.
     #[must_use]
     pub fn stamp(&self) -> Stamp {
-        fs::metadata(self.dir.join(STATE)).map_or((0, 0, 0, 0), |m| {
-            (m.mtime(), m.mtime_nsec(), m.size(), m.ino())
-        })
+        let of = |name: &str| {
+            fs::metadata(self.dir.join(name)).map_or((0, 0, 0, 0), |m| {
+                (m.mtime(), m.mtime_nsec(), m.size(), m.ino())
+            })
+        };
+        let (main, side) = (of(STATE), of(SIDE));
+        (
+            main.0.wrapping_add(side.0.wrapping_mul(31)),
+            main.1.wrapping_add(side.1.wrapping_mul(31)),
+            main.2.wrapping_add(side.2.wrapping_mul(31)),
+            main.3 ^ side.3.rotate_left(17),
+        )
     }
 
     /// Changes the state in one atomic step and returns what `change` returns.
@@ -238,47 +286,82 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
         change: impl FnOnce(&mut T) -> R,
         crash: Option<Crash>,
     ) -> io::Result<R> {
-        let (mut state, text) = self.load()?;
+        let loaded = self.load()?;
+        let mut state = loaded.state;
         let result = change(&mut state);
-        let bytes = serde_json::to_vec(&state).map_err(io::Error::other)?;
+        // The state as JSON, with the fields of the second file taken out of it (D1.2).
+        let mut main_value = serde_json::to_value(&state).map_err(io::Error::other)?;
+        let side_value = T::split(&mut main_value);
+        let bytes = serde_json::to_vec(&main_value).map_err(io::Error::other)?;
+        let (old_main, old_side) = (
+            loaded.main.as_deref().unwrap_or_default(),
+            loaded.side.as_deref().unwrap_or_default(),
+        );
+        let side_bytes = if side_value.is_null() {
+            loaded.side.is_some().then(|| b"{}".to_vec())
+        } else {
+            Some(serde_json::to_vec(&side_value).map_err(io::Error::other)?)
+        };
+        let main_changed = bytes != old_main.as_bytes();
+        let side_changed = side_bytes
+            .as_ref()
+            .is_some_and(|b| b.as_slice() != old_side.as_bytes());
         // Nothing changed: the state on disk already is the new state.
-        if bytes == text.as_bytes() {
+        if !main_changed && !side_changed {
             return Ok(result);
         }
-        let temp = self.dir.join(TEMP);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temp)?;
-        crate::setgid::settle(&temp);
-        let half = bytes.len() / 2;
-        file.write_all(&bytes[..half])?;
-        if crash == Some(Crash::MidWrite) {
-            return Err(io::Error::other(
-                "stopped part way through the write, as a crash",
-            ));
+        // A second file's temporary left by a crash is no longer wanted when the second file is
+        // not what this update writes.
+        if !side_changed {
+            let _ = fs::remove_file(self.dir.join(SIDE_TEMP));
         }
-        file.write_all(&bytes[half..])?;
-        file.sync_all()?;
-        drop(file);
+        // Both new files are written whole and flushed before either replaces its file.
+        if let (true, Some(side_bytes)) = (side_changed, &side_bytes) {
+            let mut file = self.create_temp(SIDE_TEMP)?;
+            file.write_all(side_bytes)?;
+            file.sync_all()?;
+        }
+        let temp = self.dir.join(TEMP);
+        if main_changed {
+            let mut file = self.create_temp(TEMP)?;
+            let half = bytes.len() / 2;
+            file.write_all(&bytes[..half])?;
+            if crash == Some(Crash::MidWrite) {
+                return Err(io::Error::other(
+                    "stopped part way through the write, as a crash",
+                ));
+            }
+            file.write_all(&bytes[half..])?;
+            file.sync_all()?;
+        }
         if crash == Some(Crash::BeforeRename) {
             return Err(io::Error::other("stopped before the rename, as a crash"));
         }
         // The state replaced is kept as the previous one (it was read whole above).
-        if !text.is_empty() {
-            let link = self.dir.join(PREVIOUS_TEMP);
-            let _ = fs::remove_file(&link);
-            fs::hard_link(self.dir.join(STATE), &link)?;
-            fs::rename(&link, self.dir.join(PREVIOUS))?;
+        if main_changed && loaded.main.is_some() {
+            self.keep_previous(STATE, PREVIOUS_TEMP, PREVIOUS)?;
+        }
+        if side_changed && loaded.side.is_some() {
+            self.keep_previous(SIDE, SIDE_PREVIOUS_TEMP, SIDE_PREVIOUS)?;
         }
         if crash == Some(Crash::AfterPrevious) {
             return Err(io::Error::other(
                 "stopped after keeping the previous state, as a crash",
             ));
         }
-        fs::rename(&temp, self.dir.join(STATE))?;
+        // The second file first: the state file's rename is the last step, so a crash between the
+        // two leaves a state file the second file's newer fields only add to.
+        if side_changed {
+            fs::rename(self.dir.join(SIDE_TEMP), self.dir.join(SIDE))?;
+        }
+        if crash == Some(Crash::AfterSide) {
+            return Err(io::Error::other(
+                "stopped after the second file's rename, as a crash",
+            ));
+        }
+        if main_changed {
+            fs::rename(&temp, self.dir.join(STATE))?;
+        }
         if crash == Some(Crash::AfterRename) {
             return Err(io::Error::other("stopped after the rename, as a crash"));
         }
@@ -286,13 +369,40 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
         Ok(result)
     }
 
+    /// A new, empty temporary file `name` in the store's folder, readable by its owner only.
+    fn create_temp(&self, name: &str) -> io::Result<File> {
+        let path = self.dir.join(name);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        crate::setgid::settle(&path);
+        Ok(file)
+    }
+
+    /// Keeps `file` as `previous` by a link and a rename, so the previous state is whole at every
+    /// moment.
+    fn keep_previous(&self, file: &str, link_name: &str, previous: &str) -> io::Result<()> {
+        let link = self.dir.join(link_name);
+        let _ = fs::remove_file(&link);
+        fs::hard_link(self.dir.join(file), &link)?;
+        fs::rename(&link, self.dir.join(previous))
+    }
+
     /// The state from before the last change.
     ///
     /// # Errors
     /// When there is none, or it does not parse.
     pub fn read_previous(&self) -> io::Result<T> {
-        let text = fs::read_to_string(self.dir.join(PREVIOUS))?;
-        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let main = fs::read_to_string(self.dir.join(PREVIOUS))?;
+        let side = match fs::read_to_string(self.dir.join(SIDE_PREVIOUS)) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        Self::parse(Some(&main), side.as_deref())
     }
 
     /// When the state file cannot be read, puts the previous state back and keeps the unreadable
@@ -327,20 +437,63 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
         if self.load().is_ok() {
             return Ok(false);
         }
-        let previous = fs::read_to_string(self.dir.join(PREVIOUS))?;
-        serde_json::from_str::<T>(&previous)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let temp = self.dir.join(TEMP);
-        let mut file = OpenOptions::new()
+        let mut repaired = false;
+        // The state file first, from the state before the last change.
+        let main_reads = self
+            .read_text(STATE, PREVIOUS)
+            .and_then(|main| Self::parse(main.as_deref(), None))
+            .is_ok();
+        if !main_reads {
+            self.repair_file(
+                (STATE, TEMP, PREVIOUS),
+                |text| serde_json::from_str::<T>(text).is_ok(),
+                crash,
+            )?;
+            repaired = true;
+        }
+        // The second file, when the state still does not read with it (D1.2): from its own
+        // previous state, kept the same way.
+        if self.load().is_err() {
+            let main = self.read_text(STATE, PREVIOUS)?;
+            self.repair_file(
+                (SIDE, SIDE_TEMP, SIDE_PREVIOUS),
+                |text| Self::parse(main.as_deref(), Some(text)).is_ok(),
+                None,
+            )?;
+            repaired = true;
+        }
+        self.load()?;
+        Ok(repaired)
+    }
+
+    /// Puts the previous state of the file `names.0` (`names.1` the temporary file, `names.2` the
+    /// previous state) back when `valid` accepts it, keeping the unreadable file beside it as
+    /// `<name>.unreadable-<n>`.
+    fn repair_file(
+        &self,
+        names: (&str, &str, &str),
+        valid: impl Fn(&str) -> bool,
+        crash: Option<Crash>,
+    ) -> io::Result<()> {
+        let (file, temp_name, previous_name) = names;
+        let previous = fs::read_to_string(self.dir.join(previous_name))?;
+        if !valid(&previous) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the previous state of {file} does not read either"),
+            ));
+        }
+        let temp = self.dir.join(temp_name);
+        let mut handle = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(&temp)?;
         crate::setgid::settle(&temp);
-        file.write_all(previous.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
+        handle.write_all(previous.as_bytes())?;
+        handle.sync_all()?;
+        drop(handle);
         if crash == Some(Crash::RepairAfterTemp) {
             return Err(io::Error::other(
                 "stopped after the temporary file, as a crash",
@@ -349,12 +502,12 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
         // The unreadable file is kept by a link, not a move, so the state file is absent for no
         // moment. A state file that is missing (lost, or an earlier repair that stopped) has
         // nothing to keep.
-        match fs::symlink_metadata(self.dir.join(STATE)) {
+        match fs::symlink_metadata(self.dir.join(file)) {
             Ok(_) => {
                 let mut n = 1;
                 loop {
-                    let kept = self.dir.join(format!("{STATE}.unreadable-{n}"));
-                    match fs::hard_link(self.dir.join(STATE), &kept) {
+                    let kept = self.dir.join(format!("{file}.unreadable-{n}"));
+                    match fs::hard_link(self.dir.join(file), &kept) {
                         Ok(()) => break,
                         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
                         Err(e) => return Err(e),
@@ -369,39 +522,69 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
                 "stopped after keeping the file, as a crash",
             ));
         }
-        fs::rename(&temp, self.dir.join(STATE))?;
+        fs::rename(&temp, self.dir.join(file))?;
         if crash == Some(Crash::RepairAfterRename) {
             return Err(io::Error::other("stopped after the rename, as a crash"));
         }
         File::open(&self.dir)?.sync_all()?;
-        Ok(true)
+        Ok(())
     }
 
-    /// The state and the text it was read from (empty before the first write).
-    fn load(&self) -> io::Result<(T, String)> {
+    /// The text of `file`, or `None` when it was never written. A missing file is a store never
+    /// written to only when no previous state (`previous`) exists: every write keeps one, and no
+    /// step of a write or a repair removes the file, so a previous state beside a missing file is
+    /// a store whose state was lost, an error to repair, never an empty store.
+    fn read_text(&self, file: &str, previous: &str) -> io::Result<Option<String>> {
         let mut text = String::new();
-        match File::open(self.dir.join(STATE)) {
-            Ok(mut file) => {
-                file.read_to_string(&mut text)?;
+        match File::open(self.dir.join(file)) {
+            Ok(mut handle) => {
+                handle.read_to_string(&mut text)?;
+                Ok(Some(text))
             }
-            // A missing state file is a store never written to only when no previous state
-            // exists: every write keeps one, and no step of a write or a repair removes the state
-            // file, so a previous state beside a missing state file is a store whose state was
-            // lost, an error to repair, never an empty store.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if self.dir.join(PREVIOUS).exists() {
+                if self.dir.join(previous).exists() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "the state file is missing but a previous state exists",
+                        format!("{file} is missing but a previous state exists"),
                     ));
                 }
-                return Ok((T::default(), text));
+                Ok(None)
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         }
-        let state = serde_json::from_str(&text)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok((state, text))
+    }
+
+    /// The state from the text of the state file and of the second file (`None`: never written).
+    /// The default state when there is no state file. An empty or damaged file is an error.
+    fn parse(main: Option<&str>, side: Option<&str>) -> io::Result<T> {
+        let bad = |e: serde_json::Error| io::Error::new(io::ErrorKind::InvalidData, e);
+        let Some(side) = side else {
+            return main.map_or_else(
+                || Ok(T::default()),
+                |m| serde_json::from_str(m).map_err(bad),
+            );
+        };
+        let mut value = match main {
+            Some(m) => serde_json::from_str::<Value>(m).map_err(bad)?,
+            None => serde_json::to_value(T::default()).map_err(bad)?,
+        };
+        let side_value: Value = serde_json::from_str(side).map_err(bad)?;
+        if !side_value.is_object() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the second file of the store is not a JSON object",
+            ));
+        }
+        T::join(&mut value, &side_value);
+        serde_json::from_value(value).map_err(bad)
+    }
+
+    /// The state and the text of the files it was read from.
+    fn load(&self) -> io::Result<Loaded<T>> {
+        let main = self.read_text(STATE, PREVIOUS)?;
+        let side = self.read_text(SIDE, SIDE_PREVIOUS)?;
+        let state = Self::parse(main.as_deref(), side.as_deref())?;
+        Ok(Loaded { state, main, side })
     }
 
     /// The file whose exclusive lock admits one writer at a time. It is never replaced, so every
@@ -414,10 +597,17 @@ impl<T: Serialize + DeserializeOwned + Default> Store<T> {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(&path)?;
+            .open(&path)
+            .map_err(|e| with_path(&path, &e))?;
         crate::setgid::settle(&path);
         Ok(file)
     }
+}
+
+/// `e` with the path it is about at its front, keeping its kind: a user told only "Permission
+/// denied" has nothing to act on (cold first-time install, 2026-11-14).
+fn with_path(path: &Path, e: &io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -425,6 +615,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    impl Sided for BTreeMap<String, u32> {}
 
     // An update that changes nothing leaves the state file as it is: no rewrite and no flush,
     // which every guard hook and every listener tick would otherwise pay.
@@ -649,6 +841,147 @@ mod tests {
         }
     }
 
+    /// A state with one field a 1.0.1 program does not know (`b`), kept in the second file.
+    #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct Two {
+        a: u32,
+        #[serde(default)]
+        b: u32,
+    }
+
+    impl Sided for Two {
+        fn split(main: &mut Value) -> Value {
+            let moved = main.as_object_mut().and_then(|o| o.remove("b"));
+            moved.map_or(Value::Null, |b| serde_json::json!({ "b": b }))
+        }
+
+        fn join(main: &mut Value, side: &Value) {
+            if let (Some(o), Some(b)) = (main.as_object_mut(), side.get("b")) {
+                o.insert("b".to_owned(), b.clone());
+            }
+        }
+    }
+
+    fn two(case: &str) -> Option<(PathBuf, Store<Two>)> {
+        let dir = crate::test_target()
+            .join("store-unit-two")
+            .join(std::process::id().to_string())
+            .join(case);
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::<Two>::open(&dir).ok()?;
+        Some((dir, store))
+    }
+
+    // §10::42, §10::43 (D1.2): the fields of the second file are written to a file of
+    // their own, beside the state file, and an update that changes only them writes only it.
+    #[test]
+    fn the_second_file_holds_its_fields_and_only_it_changes_with_them() {
+        let made = two("fields");
+        assert!(made.is_some());
+        let Some((dir, store)) = made else { return };
+        assert!(store.update(|s| *s = Two { a: 1, b: 10 }).is_ok());
+        let main = fs::read_to_string(dir.join(STATE)).unwrap_or_default();
+        let side = fs::read_to_string(dir.join(SIDE)).unwrap_or_default();
+        assert_eq!(main, "{\"a\":1}");
+        assert_eq!(side, "{\"b\":10}");
+        assert_eq!(store.read().ok(), Some(Two { a: 1, b: 10 }));
+        // Only the second file's field changes: the state file is not rewritten, and the stamp
+        // (which a listener reads to skip the store) moves.
+        let (inode, stamp) = (
+            fs::metadata(dir.join(STATE)).ok().map(|m| m.ino()),
+            store.stamp(),
+        );
+        assert!(store.update(|s| s.b = 11).is_ok());
+        assert_eq!(fs::metadata(dir.join(STATE)).ok().map(|m| m.ino()), inode);
+        assert_ne!(store.stamp(), stamp);
+        assert_eq!(
+            fs::read_to_string(dir.join(SIDE)).unwrap_or_default(),
+            "{\"b\":11}"
+        );
+        // Nothing changed: neither file is written, and the stamp stays.
+        let stamp = store.stamp();
+        let side_inode = fs::metadata(dir.join(SIDE)).ok().map(|m| m.ino());
+        assert!(store.update(|s| s.b).is_ok());
+        assert_eq!(store.stamp(), stamp);
+        assert_eq!(
+            fs::metadata(dir.join(SIDE)).ok().map(|m| m.ino()),
+            side_inode
+        );
+        // The field goes back to nothing: the second file says so rather than keeping the old value.
+        assert!(store.update(|s| s.b = 0).is_ok());
+        assert_eq!(store.read().ok(), Some(Two { a: 1, b: 0 }));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // §10::43 (D1.2): reads and writes of the second file hold `state.flock`: while
+    // another program holds it, an update that changes only the second file does not go through,
+    // and it does as soon as the lock is let go.
+    #[test]
+    fn the_second_file_is_written_under_the_same_lock() {
+        let made = two("lock");
+        assert!(made.is_some());
+        let Some((dir, store)) = made else { return };
+        assert!(store.update(|s| s.b = 1).is_ok());
+        let holder = store.guard();
+        assert!(holder.as_ref().is_ok_and(|h| h.try_lock().is_ok()));
+        let worker = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let other = Store::<Two>::open(&dir);
+                other.and_then(|s| s.update(|s| s.b = 2))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!worker.is_finished(), "the update went through a held lock");
+        assert_eq!(
+            fs::read_to_string(dir.join(SIDE)).unwrap_or_default(),
+            "{\"b\":1}",
+            "the second file is not written while the lock is held"
+        );
+        drop(holder);
+        assert!(worker.join().is_ok_and(|r| r.is_ok()));
+        assert_eq!(store.read().ok().map(|s| s.b), Some(2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // §10::2, §10::42: a crash between the replacement of the second file and the state
+    // file leaves a store that reads, with both files whole; the next update is whole.
+    #[test]
+    fn a_crash_between_the_two_files_leaves_a_store_that_reads() {
+        for (case, crash) in [
+            ("mid-write", Crash::MidWrite),
+            ("before-rename", Crash::BeforeRename),
+            ("after-previous", Crash::AfterPrevious),
+            ("after-side", Crash::AfterSide),
+            ("after-rename", Crash::AfterRename),
+        ] {
+            let made = two(case);
+            assert!(made.is_some(), "{case}");
+            let Some((dir, store)) = made else { return };
+            assert!(store.update(|s| *s = Two { a: 1, b: 1 }).is_ok());
+            assert!(store.update(|s| *s = Two { a: 2, b: 2 }).is_ok());
+            assert!(
+                store
+                    .update_crashing(|s| *s = Two { a: 3, b: 3 }, crash)
+                    .is_err(),
+                "{case}"
+            );
+            let back = store.read().ok();
+            assert!(back.is_some(), "{case}: reads");
+            let back = back.unwrap_or_default();
+            // Old, new, or (after the second file only) the new second file beside the old state.
+            let allowed = [Two { a: 2, b: 2 }, Two { a: 3, b: 3 }, Two { a: 2, b: 3 }];
+            assert!(allowed.contains(&back), "{case}: {back:?}");
+            assert!(store.update(|s| s.a += 10).is_ok(), "{case}");
+            assert!(store.read().is_ok_and(|s| s.a >= 12), "{case}");
+            assert!(
+                !dir.join(TEMP).exists() && !dir.join(SIDE_TEMP).exists(),
+                "{case}"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
     // A store another process holds is reported busy after LOCK_WAIT, never waited on forever.
     #[test]
     fn a_held_store_is_reported_busy() {
@@ -667,5 +1000,44 @@ mod tests {
         drop(holder);
         assert!(store.update(|m| m.insert("a".to_owned(), 1)).is_ok());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Cold first-time install, 2026-11-14: a store that cannot be opened or locked is named in
+    // the error, not only "Permission denied".
+    #[test]
+    fn a_store_that_cannot_be_reached_is_named() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::test_target()
+            .join("store-unit-named")
+            .join(std::process::id().to_string());
+        let _ = fs::remove_dir_all(&root);
+        assert!(fs::create_dir_all(&root).is_ok());
+        assert!(fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).is_ok());
+        let dir = root.join("store");
+        let err = Store::<BTreeMap<String, u32>>::open(&dir)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.starts_with(&format!("{}: ", dir.display()))),
+            "{err:?}"
+        );
+        // A folder that exists and cannot be written: the lock file is named.
+        assert!(fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).is_ok());
+        assert!(fs::create_dir_all(&dir).is_ok());
+        assert!(fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).is_ok());
+        let store = Store::<BTreeMap<String, u32>>::open(&dir);
+        assert!(store.is_ok());
+        if let Ok(store) = store {
+            let err = store.read().err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(
+                    |e| e.starts_with(&format!("{}: ", dir.join(GUARD_FILE).display()))
+                ),
+                "{err:?}"
+            );
+        }
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&root);
     }
 }

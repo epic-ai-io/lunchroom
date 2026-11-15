@@ -1,7 +1,7 @@
 #!/bin/bash
 # Proof 1, inside one container: Claude Code installed from Anthropic's own apt, dnf or apk
 # repository (the Containerfile of the distro), a real session of it running, and what Lunchroom
-# 1.1.0 says about that session. $DISTRO is apt, dnf or apk (set by the Containerfile).
+# 1.1 says about that session. $DISTRO is apt, dnf or apk (set by the Containerfile).
 #
 # The session is the real /usr/bin/claude the package installed, started on a pseudo-terminal as
 # a person's terminal window starts it, with the user typing `join NAME` in it. It points at a
@@ -58,15 +58,26 @@ grep -rqs "downloads.claude.ai/claude-code/$DNFURL/stable" /etc/apk/repositories
     && pass "the repository file names downloads.claude.ai/claude-code/$DNFURL/stable" \
     || fail "the repository file does not name downloads.claude.ai/claude-code/$DNFURL/stable"
 
-heading "2. Lunchroom 1.1.0 installed for a user, and a real session"
+heading "2. Lunchroom 1.1 installed for a user, and a real session"
 make_user
 seed_claude
 install_lunchroom
-if [ -x "$DEVHOME/.lunchroom/bin/lunchroom" ] && grep -q '.lunchroom/bin/lunchroom guard prompt' "$DEVHOME/.claude/settings.json"; then
-    pass "lunchroom install claude-code put the program and the hooks on dev's account"
+# 1.1, spec section 17 item 2: the hooks run /usr/local/lib/lunchroom/lunchroom, the setgid program; the store is /var/lib/lunchroom/<uid>.
+if lr_installed && grep -q "$LR guard prompt" "$DEVHOME/.claude/settings.json"; then
+    pass "lunchroom install claude-code put the setgid program and the hooks on dev's account"
 else
     fail "lunchroom install claude-code did not finish (see $RUN/install.log)"
+    python3 "$PROOF/plaintext.py" "$RUN/install.log" | tail -40 | sed 's/^/    install | /'
     finish
+fi
+# 1.1, spec section 17 item 8: where `sudo -n -l` shows a password-free rule (the dnf image's dev has one),
+# the install still sets the wall up and says plainly that the wall does not hold on this account.
+if [ "${SUDO_NOPASSWD:-0}" = 1 ]; then
+    python3 "$PROOF/plaintext.py" "$RUN/install.log" | grep -q "store wall does not hold on this account" \
+        && pass "the install says the store wall does not hold on this account (dev's sudo is password-free; item 8)" \
+        || { fail "the install does not say the store wall does not hold, though dev's sudo is password-free"
+             as_dev sudo -n -l 2>&1 | sed 's/^/    sudo -n -l | /'
+             python3 "$PROOF/plaintext.py" "$RUN/install.log" | tail -30 | sed 's/^/    install | /'; }
 fi
 if [ -e "/etc/lunchroom/$(id -u dev).verifier" ]; then
     pass "the passphrase check is set"

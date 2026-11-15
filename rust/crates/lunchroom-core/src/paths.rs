@@ -36,6 +36,10 @@ pub struct Layout {
     /// The agent's own tmux pane (`TMUX_PANE`, `%3`) and screen session (`STY`), when it has them.
     pub own_pane: Option<String>,
     pub own_screen: Option<String>,
+    /// The numeric user and group ids of the system user and group `lunchroom`, when the system
+    /// has them (§17.5: `sudo -u '#998'` runs as the user as `sudo -u lunchroom` does). The caller
+    /// that builds the layout reads them from the system; empty where there is no such user.
+    pub lunchroom_ids: Vec<u32>,
 }
 
 impl Layout {
@@ -55,6 +59,7 @@ impl Layout {
             console_pid: None,
             own_pane: None,
             own_screen: None,
+            lunchroom_ids: Vec::new(),
         }
     }
 
@@ -104,6 +109,17 @@ impl Layout {
     #[must_use]
     pub fn facts(&self, p: &Path) -> Facts {
         let segs = segments(p);
+        // `/proc/<pid>/root/<path>` is `<path>` as that process sees the file system, which is
+        // this one for every process that shares it: the facts are the path's own.
+        if p.starts_with("/proc")
+            && segs.get(1).is_some_and(|s| s.parse::<u32>().is_ok())
+            && segs.get(2).map(String::as_str) == Some("root")
+        {
+            let inner: PathBuf = std::iter::once("/".to_owned())
+                .chain(segs[3..].iter().cloned())
+                .collect();
+            return self.facts(&inner);
+        }
         let in_lunchroom = p.starts_with(&self.lunchroom_home);
         let in_program = p.starts_with(&self.program_dir) || self.programs.iter().any(|q| p == q);
         let (seg_store, seg_program) = lunchroom_segments(&segs);
@@ -276,10 +292,24 @@ fn in_process_folder(p: &Path, segs: &[String]) -> bool {
 /// everything in the program folder except the program itself.
 fn system_store(p: &Path) -> bool {
     p.starts_with("/etc/lunchroom")
-        || (cfg!(feature = "console")
-            && (p.starts_with(crate::setgid::STORE_ROOT)
-                || (p.starts_with(crate::setgid::PROGRAM_DIR)
-                    && p != Path::new(crate::setgid::PROGRAM))))
+        || p.starts_with(crate::setgid::STORE_ROOT)
+        || p.starts_with(crate::setgid::APPROVALS_ROOT)
+        || (p.starts_with(crate::setgid::PROGRAM_DIR) && p != Path::new(crate::setgid::PROGRAM))
+        || is_sudoers_rule_file(p)
+}
+
+/// The rule files of Lunchroom's in `/etc/sudoers.d`: the rule file of §17.8,
+/// `zz-lunchroom-<uid>` (and a temporary copy of it, which shares the start of its name), and the
+/// rule `lunchroom install console` writes so the user can start the console, `lunchroom` (and its
+/// unchecked copy, `lunchroom.unchecked`).
+fn is_sudoers_rule_file(p: &Path) -> bool {
+    p.parent() == Some(Path::new(crate::setgid::SUDOERS_DIR))
+        && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.starts_with(crate::setgid::SUDOERS_PREFIX)
+                || n == crate::setgid::SYSTEM_USER
+                || n.strip_prefix(crate::setgid::SYSTEM_USER)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
 }
 
 /// A terminal device other than `/dev/tty` itself: `/dev/pts/N`, `/dev/ttyN`, `/dev/ttySN`,
@@ -294,15 +324,43 @@ fn terminal_device(p: &Path) -> bool {
             .is_some_and(|n| (n.starts_with("tty") && n != "tty") || n.starts_with("vcs"))
 }
 
+/// A folder of `/proc` that holds the secret files of processes: `/proc` itself (`Some(None)`, every
+/// process) or `/proc/<pid>`, `/proc/<pid>/task` or `/proc/<pid>/task/<tid>` (`Some(Some(pid))`). A
+/// program that reads everything below such a folder reads `mem`, `environ`, `fd` and `maps`.
+#[must_use]
+pub fn proc_secret_folder(p: &Path) -> Option<Option<u32>> {
+    if !p.starts_with("/proc") {
+        return None;
+    }
+    let segs = segments(p);
+    if segs.len() == 1 {
+        return Some(None);
+    }
+    let pid = segs.get(1)?.parse::<u32>().ok()?;
+    match segs.len() {
+        2 => Some(Some(pid)),
+        3 if segs[2] == "task" => Some(Some(pid)),
+        4 if segs[2] == "task" && segs[3].parse::<u32>().is_ok() => Some(Some(pid)),
+        _ => None,
+    }
+}
+
 /// The process id in `/proc/<pid>/{mem,environ,fd,maps}` or below one of them.
 fn process_secret_pid(p: &Path, segs: &[String]) -> Option<u32> {
     if !p.starts_with("/proc") {
         return None;
     }
     let pid = segs.get(1)?.parse::<u32>().ok()?;
-    segs.get(2)
-        .is_some_and(|s| matches!(s.as_str(), "mem" | "environ" | "fd" | "maps"))
-        .then_some(pid)
+    let secret = |s: Option<&String>| {
+        s.is_some_and(|s| matches!(s.as_str(), "mem" | "environ" | "fd" | "maps"))
+    };
+    // A thread's folder holds the same files: `/proc/<pid>/task/<tid>/environ`.
+    let named = if segs.get(2).map(String::as_str) == Some("task") {
+        segs.get(4)
+    } else {
+        segs.get(2)
+    };
+    secret(named).then_some(pid)
 }
 
 /// The paths a controlling terminal with the number `tty_nr` (field 7 of `/proc/<pid>/stat`) has:
@@ -384,6 +442,8 @@ fn is_credential(segs: &[String]) -> bool {
 /// this form and resolves it with the file system (`Fs::resolve`), never from [`normalize`].
 #[must_use]
 pub fn absolute(p: &str, cwd: &Path, home: &Path) -> PathBuf {
+    // The system reads a path up to its first NUL: what follows names nothing.
+    let p = p.split('\0').next().unwrap_or_default();
     if p == "~" {
         home.to_path_buf()
     } else if let Some(rest) = p.strip_prefix("~/") {
@@ -537,27 +597,54 @@ mod tests {
         ] {
             assert_eq!(l.facts(Path::new(p)).secret_pid, None, "{p}");
         }
-        // DV-09: the passphrase checks in `/etc/lunchroom` are a store in every build (a HELD
-        // agent's read of one is DENIED, L1.1, K1.11); the console's other two system folders are
-        // stores only with the console (1.1).
+        // §7 A1.3 / §17.5 / §7::66: the passphrase checks in `/etc/lunchroom`, the store
+        // folders, the delivery folders, the program folder (but the program itself) and the rule
+        // file of §17.8 are Lunchroom's paths in every build, the console installed or not.
         for p in [
             "/etc/lunchroom",
             "/etc/lunchroom/1000.verifier",
             "/etc/lunchroom/1000.verifier.tmp",
+            "/var/lib/lunchroom",
+            "/var/lib/lunchroom/1000/store/state.json",
+            "/var/lib/lunchroom-approvals",
+            "/var/lib/lunchroom-approvals/1000/requests/r1.plan.json",
+            "/usr/local/lib/lunchroom/other",
+            "/etc/sudoers.d/zz-lunchroom-1000",
+            "/etc/sudoers.d/zz-lunchroom-1000.tmp",
+            "/etc/sudoers.d/zz-lunchroom-1000.new",
+            "/etc/sudoers.d/lunchroom",
+            "/etc/sudoers.d/lunchroom.unchecked",
         ] {
             assert!(l.facts(Path::new(p)).store, "{p}");
         }
+        // Near misses are not.
         for p in [
-            "/var/lib/lunchroom",
-            "/var/lib/lunchroom/1000/store/state.json",
-            "/usr/local/lib/lunchroom/other",
+            "/etc/lunchrooms/x",
+            "/etc/sudoers.d/90-wheel",
+            "/etc/sudoers.d/lunchroom-1000",
+            "/etc/sudoers",
+            "/var/lib/lunchrooms",
+            "/var/lib/lunchroom-other/x",
+            "/usr/local/lib/lunchroom-other",
         ] {
-            assert_eq!(
-                l.facts(Path::new(p)).store,
-                cfg!(feature = "console"),
-                "{p}"
-            );
+            assert!(!l.facts(Path::new(p)).store, "{p}");
         }
+        // The program itself is the program, not a store.
+        let program = l.facts(Path::new("/usr/local/lib/lunchroom/lunchroom"));
+        assert!(program.program && !program.store);
+        // Its `task/<tid>` folders hold the same secrets as the process's own.
+        assert_eq!(
+            l.facts(Path::new("/proc/42/task/43/environ")).secret_pid,
+            Some(42)
+        );
+        assert_eq!(
+            l.facts(Path::new("/proc/42/task/43/mem")).secret_pid,
+            Some(42)
+        );
+        assert_eq!(
+            l.facts(Path::new("/proc/42/task/43/status")).secret_pid,
+            None
+        );
         assert!(!l.facts(Path::new("/etc/lunchrooms/x")).store);
         let program = l.facts(Path::new("/usr/local/lib/lunchroom/lunchroom"));
         assert!(program.program && !program.store);

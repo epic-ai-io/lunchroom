@@ -24,7 +24,7 @@ use serde_json::Value;
 use toml_edit::DocumentMut;
 
 use lunchroom_core::identity::{Harness, Identity};
-use lunchroom_core::mail::{Evidence, Mail};
+use lunchroom_core::mail::{Evidence, Found, Judged, Mail};
 
 use crate::process;
 
@@ -121,7 +121,7 @@ pub const fn harness_name(harness: Harness) -> &'static str {
 }
 
 /// The word `lunchroom install` takes for `harness`.
-const fn install_word(harness: Harness) -> &'static str {
+pub(crate) const fn install_word(harness: Harness) -> &'static str {
     match harness {
         Harness::ClaudeCode => "claude-code",
         Harness::Codex => "codex",
@@ -284,51 +284,106 @@ impl Why {
     }
 }
 
+/// The session's record and its harness process, while that very process runs: STOPPED
+/// otherwise (R3.3). It reads only `/proc/<pid>/stat`, which every user may read, so the console,
+/// which runs as the user `lunchroom`, can tell this much itself.
+fn running_record<'m>(
+    mail: &'m Mail,
+    who: &Identity,
+) -> Option<(&'m lunchroom_core::mail::SessionRecord, u32)> {
+    let record = mail.session(who)?;
+    let pid = record
+        .process
+        .split(':')
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())?;
+    (process::key(pid).as_deref() == Some(record.process.as_str())).then_some((record, pid))
+}
+
+/// Whether `who` is not running: no session record, or its harness process has ended (R3.3).
+#[must_use]
+pub fn not_running(mail: &Mail, who: &Identity) -> bool {
+    running_record(mail, who).is_none()
+}
+
+/// What `judged` found of `who` at `now`, as the store keeps it for the console.
+#[must_use]
+pub fn kept(mail: &Mail, who: &Identity, judged: &Assessment, now: u64) -> Judged {
+    let (found, why) = match judged {
+        Assessment::NotRunning => (Found::NotRunning, String::new()),
+        Assessment::Unguarded(why) => (Found::Unguarded, why.text()),
+        Assessment::Guarded => (Found::Guarded, String::new()),
+    };
+    Judged {
+        found,
+        why,
+        process: mail.session(who).map(|r| r.process.clone()),
+        at: now,
+    }
+}
+
 /// `assess` against the list `passed` of passing adapters and their releases. Each harness's
 /// checks run in R3.4's order, configuration first, so the first one that fails is the reason;
 /// a session passing every check is guarded.
 fn assess_with(passed: &[(Harness, &str)], mail: &Mail, who: &Identity, home: &Path) -> Assessment {
     // H1.7: the step named if the guard's time runs out here.
     let _step = lunchroom_core::steps::begin(format!("working out whether {who} is guarded"));
-    let Some(record) = mail.session(who) else {
+    let Some((record, pid)) = running_record(mail, who) else {
         return Assessment::NotRunning;
     };
-    let Some(pid) = record
-        .process
-        .split(':')
-        .next()
-        .and_then(|p| p.parse::<u32>().ok())
-    else {
-        return Assessment::NotRunning;
-    };
-    if process::key(pid).as_deref() != Some(record.process.as_str()) {
-        return Assessment::NotRunning;
-    }
     let why = match who.harness {
         // Item 2 for Claude Code: the session's record names this very process only because a
         // Lunchroom hook ran in it, and a record of another process is STOPPED above; so a
         // running Claude Code session never lacks item 2 here.
         Harness::ClaudeCode => {
-            if configured(pid, &record.cwd, home) {
-                release_fault(passed, who.harness, pid)
-            } else {
-                Some(Why::Configuration(CLAUDE_NOT_CONFIGURED.to_owned()))
+            match configured(pid, &record.cwd, home) {
+                ClaudeGuard::Guarded => release_fault(passed, who.harness, pid),
+                // H1.5: the settings hold an earlier install's tool-call hook, which does not
+                // block a call when the guard fails.
+                ClaudeGuard::OlderHook => Some(Why::Configuration(CLAUDE_OLD_HOOK.to_owned())),
+                ClaudeGuard::NotConfigured => {
+                    Some(Why::Configuration(CLAUDE_NOT_CONFIGURED.to_owned()))
+                }
             }
         }
         Harness::Codex => {
             let current = codex_guard_in(&codex_home_of(pid, home), pid, &record.cwd);
             let opened_before =
                 mail.opened_before_codex_setting(who, process::boot_id().as_deref());
+            // H1.4: the settings the session's first guard hook recorded for this process; either
+            // on keeps the session UNGUARDED until it is started anew.
+            let recorded = mail
+                .guard_fingerprint(who)
+                .and_then(CodexSettings::parse)
+                .filter(|s| s.on() && s.process == record.process);
             match current {
                 // The setting first, as `lunchroom status` always named it.
-                Err(fault @ (CodexFault::TtyNotOff | CodexFault::TtyTurnedOn)) => {
-                    Some(Why::Configuration(fault.text()))
-                }
+                Err(
+                    fault @ (CodexFault::TtyNotOff
+                    | CodexFault::TtyTurnedOn
+                    | CodexFault::WebNotOff
+                    | CodexFault::WebTurnedOn
+                    | CodexFault::CommandTty(_)
+                    | CodexFault::CommandWeb(_)
+                    | CodexFault::SharedServer(_)),
+                ) => Some(Why::Configuration(fault.text())),
+                _ if recorded.is_some() => recorded.map(|s| {
+                    Why::Configuration(
+                        CodexFault::Recorded {
+                            tty: s.tty,
+                            web: s.web,
+                        }
+                        .text(),
+                    )
+                }),
                 _ if opened_before => Some(Why::Configuration(CODEX_OPENED_BEFORE.to_owned())),
                 Err(fault) => Some(Why::Configuration(fault.text())),
                 // R3.1 (Codex): the trusted guard now in place is the one a guard hook recorded
                 // when it ran in this session; else none has run with it.
-                Ok(current) if mail.guard_fingerprint(who) != Some(current.as_str()) => {
+                Ok(current)
+                    if mail.guard_fingerprint(who).map(recorded_hooks)
+                        != Some(current.as_str()) =>
+                {
                     Some(Why::NoGuardRan(who.harness))
                 }
                 Ok(_) => release_fault(passed, who.harness, pid),
@@ -352,14 +407,29 @@ fn assess_with(passed: &[(Harness, &str)], mail: &Mail, who: &Identity, home: &P
             } else if recorded.is_none() {
                 Some(Why::NoGuardRan(who.harness))
             } else {
-                let program = std::fs::read_link(format!("/proc/{pid}/exe"))
-                    .map_or_else(|_| format!("/proc/{pid}/exe"), |p| p.display().to_string());
+                let program = lunchroom_core::setgid::as_own_group(|| {
+                    std::fs::read_link(format!("/proc/{pid}/exe"))
+                })
+                .map_or_else(|_| format!("/proc/{pid}/exe"), |p| p.display().to_string());
                 version_fault(passed, who.harness, plugin_release(recorded), program)
             }
         }
     };
     why.map_or(Assessment::Guarded, Assessment::Unguarded)
 }
+
+/// What the user is told when Claude Code's tool-call hook is an earlier install's: it does not
+/// block a call when the guard fails (H1.5).
+pub(crate) const CLAUDE_OLD_HOOK: &str = "Claude Code's tool-call hook for Lunchroom's guard is from \
+     an earlier install: it does not block a call when the guard fails (no failure branch, or no \
+     \"onFailure\": \"block\"). Reinstall: run lunchroom install claude-code in a terminal of your \
+     own, then start the session anew.";
+
+/// What the user is told when Codex's tool-call hook is an earlier install's (H1.5).
+pub(crate) const CODEX_OLD_HOOK: &str = "Codex's tool-call hook for Lunchroom's guard is from an \
+     earlier install: it does not block a call when the guard fails. Reinstall: run lunchroom \
+     install codex in a terminal of your own, trust Lunchroom's hooks in Codex's /hooks, then \
+     start the session anew.";
 
 /// What the user is told when Claude Code's configuration does not run the whole guard (R3.4
 /// item 1).
@@ -460,6 +530,73 @@ pub fn codex_home_of(pid: u32, home: &Path) -> PathBuf {
     process_env(pid, "CODEX_HOME").map_or_else(|| home.join(".codex"), PathBuf::from)
 }
 
+/// A Codex thread that has a session record and no guard hook record (H1.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // `lunchroom status` and `doctor` print it (spec C1.4)
+pub struct UnrecordedThread {
+    /// The thread's id, as Codex names the session.
+    pub thread: String,
+    /// The session record, `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`.
+    pub file: PathBuf,
+}
+
+/// The id a rollout file's name ends with: `rollout-<time>-<thread id>.jsonl`, or the same
+/// compressed by Codex's maintenance (`.jsonl.zst`). The thread id is a UUID.
+#[cfg_attr(not(test), allow(dead_code))] // used by `unrecorded_codex_threads`
+fn rollout_thread(name: &str) -> Option<&str> {
+    let stem = name
+        .strip_prefix("rollout-")?
+        .strip_suffix(".jsonl")
+        .or_else(|| name.strip_suffix(".jsonl.zst")?.strip_prefix("rollout-"))?;
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
+    let shape = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = id.split('-').collect();
+    (parts.len() == shape.len()
+        && parts
+            .iter()
+            .zip(shape)
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit())))
+    .then_some(id)
+}
+
+/// The Codex threads with a session record in `<codex_home>/sessions` that no guard hook has
+/// recorded in `mail`, oldest first (H1.4): `lunchroom status` and `lunchroom doctor` show each as
+/// UNGUARDED with the reason [`CODEX_NO_HOOK_RAN`]. A thread a hook recorded has a session in
+/// `mail`, whatever its state.
+#[must_use]
+#[cfg_attr(not(test), allow(dead_code))] // `lunchroom status` and `doctor` print it (spec C1.4)
+pub fn unrecorded_codex_threads(mail: &Mail, codex_home: &Path) -> Vec<UnrecordedThread> {
+    let mut found: Vec<UnrecordedThread> = Vec::new();
+    let mut dirs = vec![(codex_home.join("sessions"), 0)];
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 4 {
+                    dirs.push((path, depth + 1));
+                }
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(thread) = rollout_thread(&name) else {
+                continue;
+            };
+            let who = Identity::new(Harness::Codex, thread);
+            if mail.session(&who).is_none() && !found.iter().any(|f| f.thread == thread) {
+                found.push(UnrecordedThread {
+                    thread: thread.to_owned(),
+                    file: path,
+                });
+            }
+        }
+    }
+    found.sort_by(|a, b| a.file.file_name().cmp(&b.file.file_name()));
+    found
+}
+
 /// Codex's folder for `who`'s session, from the process a guard hook recorded it in.
 #[must_use]
 pub fn recorded_codex_home(mail: &Mail, who: &Identity, home: &Path) -> PathBuf {
@@ -505,11 +642,43 @@ const CODEX_GUARD_HOOKS: [(&str, &str); 4] = [
 /// current definition the user has not trusted, so a guard hook that ran proves the trust then;
 /// Lunchroom records this fingerprint when its guard runs, and the session is guarded only while
 /// the fingerprint is unchanged.
+///
+/// H1.4: the string recorded also holds, on its first line, the tty and web search settings in force
+/// for the session's `codex` process, read from the configuration files and from that process's
+/// command line at the session's first hook ([`CodexSettings`]). `previous` is the string recorded
+/// at the session's earlier hook: while it was recorded for the same process, its settings are kept
+/// as they were, so a session recorded with either on stays UNGUARDED across later hooks (until it
+/// is started anew, which is a new process).
 #[must_use]
-pub fn codex_guard_fingerprint(pid: u32, cwd: &Path, home: &Path) -> Option<String> {
-    codex_fingerprint_in(&codex_home_of(pid, home), pid, cwd)
+pub fn codex_guard_fingerprint(
+    pid: u32,
+    cwd: &Path,
+    home: &Path,
+    previous: Option<&str>,
+) -> Option<String> {
+    let codex_home = codex_home_of(pid, home);
+    let key = process::key(pid)?;
+    let settings = previous
+        .and_then(CodexSettings::parse)
+        .filter(|s| s.process == key)
+        .unwrap_or_else(|| CodexSettings::read(&key, &codex_home, pid, cwd));
+    let hooks = codex_hooks_in(&codex_home, pid, cwd).ok();
+    if hooks.is_none() && !settings.on() {
+        return None;
+    }
+    Some(format!(
+        "{}\n{}",
+        settings.line(),
+        hooks.unwrap_or_default()
+    ))
 }
 
+/// The hooks part of a recorded fingerprint: what follows the settings line.
+fn recorded_hooks(recorded: &str) -> &str {
+    recorded.split_once('\n').map_or("", |(_, hooks)| hooks)
+}
+
+#[cfg(test)]
 fn codex_fingerprint_in(codex_home: &Path, pid: u32, cwd: &Path) -> Option<String> {
     codex_guard_in(codex_home, pid, cwd).ok()
 }
@@ -522,6 +691,24 @@ pub(crate) enum CodexFault {
     TtyNotOff,
     /// A profile, or a project's `.codex/config.toml`, turns [`CODEX_TTY`] on, or is not TOML.
     TtyTurnedOn,
+    /// `config.toml` does not set [`CODEX_WEB`] to `"disabled"` at its top level (or is not TOML).
+    WebNotOff,
+    /// A profile, or a project's `.codex/config.toml`, sets [`CODEX_WEB`] to another value, or is
+    /// not TOML.
+    WebTurnedOn,
+    /// The session's `codex` process was started with an option that turns the tty setting on (H1.4).
+    CommandTty(String),
+    /// The session's `codex` process was started with an option that turns web search on (H1.4).
+    CommandWeb(String),
+    /// The record made at the session's first hook shows the tty setting on, the web search
+    /// setting on, or both (H1.4): the session stays UNGUARDED until it is started anew.
+    Recorded { tty: String, web: String },
+    /// The session runs in a shared server, and a running `codex` process of the user was started
+    /// with an option that turns the tty setting or web search on (H1.4).
+    SharedServer(String),
+    /// The hooks file `file` holds the whole guard set, but its tool-call hook is an earlier
+    /// install's, which does not block a call when the guard fails (H1.5).
+    OldToolHook(PathBuf),
     /// No hooks file Codex reads holds every one of [`CODEX_GUARD_HOOKS`]; the user's hooks file.
     NoGuardSet(PathBuf),
     /// The guard set is there, but Lunchroom's hook of `event` in `file` is not trusted, or is
@@ -536,10 +723,22 @@ const CODEX_TTY_NOT_OFF: &str = "Codex sessions are UNGUARDED until unified_exec
 const CODEX_TTY_TURNED_ON: &str = "A Codex config.toml turns unified_exec_tty on, in a project or \
      a profile, or is not TOML: the Codex sessions it reaches are UNGUARDED until you change that \
      file.";
-/// What the user is told of a Codex session open when the install set [`CODEX_TTY`].
-pub(crate) const CODEX_OPENED_BEFORE: &str = "A Codex session started before unified_exec_tty was set is \
-     UNGUARDED: start a new session; resuming this one under the same Codex server keeps it \
-     UNGUARDED.";
+/// What the user is told when [`CODEX_WEB`] is not `"disabled"`.
+const CODEX_WEB_NOT_OFF: &str = "Codex sessions are UNGUARDED until web_search is \"disabled\" at \
+     the top of Codex's config.toml: run lunchroom install codex in a terminal of your own, then \
+     start them anew.";
+/// What the user is told when a profile or a project sets [`CODEX_WEB`] to another value.
+const CODEX_WEB_TURNED_ON: &str = "A Codex config.toml sets web_search to a value other than \
+     \"disabled\", in a project or a profile, or is not TOML: the Codex sessions it reaches are \
+     UNGUARDED until you change that file.";
+/// What the user is told of a Codex session open when the install set [`CODEX_TTY`] and
+/// [`CODEX_WEB`].
+pub(crate) const CODEX_OPENED_BEFORE: &str = "A Codex session started before unified_exec_tty and \
+     web_search were set is UNGUARDED: start a new session; resuming this one under the same Codex \
+     server keeps it UNGUARDED.";
+/// Why a Codex thread with a session record and no hook record is UNGUARDED (H1.4, R3.4).
+#[cfg_attr(not(test), allow(dead_code))] // `lunchroom status` and `doctor` print it (spec C1.4)
+pub(crate) const CODEX_NO_HOOK_RAN: &str = "no guard hook has run in it";
 
 impl CodexFault {
     /// The fault as the user reads it, naming the setting or the hook, and what to do.
@@ -547,6 +746,34 @@ impl CodexFault {
         match self {
             Self::TtyNotOff => CODEX_TTY_NOT_OFF.to_owned(),
             Self::TtyTurnedOn => CODEX_TTY_TURNED_ON.to_owned(),
+            Self::WebNotOff => CODEX_WEB_NOT_OFF.to_owned(),
+            Self::WebTurnedOn => CODEX_WEB_TURNED_ON.to_owned(),
+            Self::CommandTty(by) => format!(
+                "This Codex session was started with {by}, which turns unified_exec_tty on: it is \
+                 UNGUARDED until you start it anew without that option."
+            ),
+            Self::CommandWeb(by) => format!(
+                "This Codex session was started with {by}, which turns web search on: it is \
+                 UNGUARDED until you start it anew without that option."
+            ),
+            Self::Recorded { tty, web } => {
+                let named: Vec<String> = [("unified_exec_tty", tty), ("web search", web)]
+                    .into_iter()
+                    .filter(|(_, by)| !by.is_empty())
+                    .map(|(what, by)| format!("{what} on by {by}"))
+                    .collect();
+                format!(
+                    "This Codex session was started with {}, as its first guard hook read it: it \
+                     is UNGUARDED until you start it anew.",
+                    named.join(" and ")
+                )
+            }
+            Self::SharedServer(by) => format!(
+                "A Codex window of yours was started with {by}, which turns unified_exec_tty or \
+                 web search on, and Codex's shared server runs this session: every session in that \
+                 server is UNGUARDED until that window ends."
+            ),
+            Self::OldToolHook(file) => format!("{CODEX_OLD_HOOK} (in {})", file.display()),
             Self::NoGuardSet(file) => format!(
                 "Codex's hooks file {} does not hold Lunchroom's whole guard (PreToolUse, \
                  PostToolUse, UserPromptSubmit and SessionStart, each on every tool, its program \
@@ -572,24 +799,81 @@ pub(crate) fn codex_guard_in(
     pid: u32,
     cwd: &Path,
 ) -> Result<String, CodexFault> {
+    if let Some(fault) = codex_settings_fault(codex_home, pid, cwd) {
+        return Err(fault);
+    }
+    codex_hooks_in(codex_home, pid, cwd)
+}
+
+/// The first of what in the configuration files and on the command line of the `codex` process
+/// `pid` turns the tty setting or web search on (H1.1, H1.4), or `None`. The files first, then the
+/// command line, then, for a session in a shared server, the command lines of the user's other
+/// `codex` processes.
+fn codex_settings_fault(codex_home: &Path, pid: u32, cwd: &Path) -> Option<CodexFault> {
     let config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
     // Codex runs no hook for `write_stdin`: with terminals on, a HELD agent could type into a shell
     // it opened before the hold, so a session is guarded only with them off (H1.1).
     if codex_tty_setting(&config) != Some(false) {
-        return Err(CodexFault::TtyNotOff);
+        return Some(CodexFault::TtyNotOff);
     }
     if turns_tty_on(&config) || codex_project_tty(cwd) {
-        return Err(CodexFault::TtyTurnedOn);
+        return Some(CodexFault::TtyTurnedOn);
     }
+    // Codex's hosted web search reaches no hook either (H1.4): guarded only where it is `disabled`,
+    // by the same files and profiles.
+    if !codex_web_is_off(&config) {
+        return Some(CodexFault::WebNotOff);
+    }
+    if turns_web_on(&config) || codex_project_web(cwd) {
+        return Some(CodexFault::WebTurnedOn);
+    }
+    let mut files = vec![config];
+    files.extend(project_configs(cwd));
+    let line = CommandLine::read(&cmdline_args(pid), &files);
+    if let Some(by) = line.tty.first() {
+        return Some(CodexFault::CommandTty(by.clone()));
+    }
+    if let Some(by) = line.web.first() {
+        return Some(CodexFault::CommandWeb(by.clone()));
+    }
+    shared_server_fault(pid)
+}
+
+/// The hooks Codex runs for the session in process `pid`, as a fingerprint of the trusted guard set,
+/// or the first fault in it (the settings are [`codex_settings_fault`]'s).
+fn codex_hooks_in(codex_home: &Path, pid: u32, cwd: &Path) -> Result<String, CodexFault> {
+    codex_hooks_with(
+        &read_file,
+        &|hook| program_present(hook, pid, cwd),
+        codex_home,
+        cwd,
+    )
+}
+
+/// [`codex_hooks_in`] reading each file through `read`, once: both forms of the tool-call hook are
+/// judged from the one reading of each hooks file, and the trust from one reading of `config.toml`.
+fn codex_hooks_with(
+    read: Reader<'_>,
+    present: Present<'_>,
+    codex_home: &Path,
+    cwd: &Path,
+) -> Result<String, CodexFault> {
+    let config = read(&codex_home.join("config.toml")).unwrap_or_default();
     let mut fault = CodexFault::NoGuardSet(codex_home.join("hooks.json"));
     for file in [codex_home.join("hooks.json"), cwd.join(".codex/hooks.json")] {
-        let Some(hooks) = read_json(&file) else {
+        let Some(hooks) = json_from(read, &file) else {
             continue;
         };
-        if !CODEX_GUARD_HOOKS
-            .iter()
-            .all(|(event, mode)| has_guard_hook(&hooks, event, mode, pid, cwd))
-        {
+        let holds = |form: PreTool| {
+            CODEX_GUARD_HOOKS.iter().all(|(event, mode)| {
+                has_guard_hook(&hooks, event, mode, &present, form, Some(&file))
+            })
+        };
+        if !holds(PreTool::Codex) {
+            // H1.5: a set whose tool-call hook is an earlier install's is named for what it is.
+            if holds(PreTool::Older) && matches!(fault, CodexFault::NoGuardSet(_)) {
+                fault = CodexFault::OldToolHook(file.clone());
+            }
             continue;
         }
         let mut trusted = Vec::new();
@@ -636,28 +920,353 @@ fn tty_in(config: &DocumentMut) -> Option<bool> {
     config.get("features")?.get(CODEX_TTY)?.as_bool()
 }
 
-/// `text` turns [`CODEX_TTY`] on, in its `[features]` or in any profile, or is not TOML.
+/// Codex's hosted web search mode: `disabled`, `cached`, `indexed` or `live` (Codex 0.163.0,
+/// `codex-rs/config/src/config_toml.rs` lines 475-476), a top-level key of `config.toml`.
+pub(crate) const CODEX_WEB: &str = "web_search";
+/// The value of [`CODEX_WEB`] that turns web search off.
+pub(crate) const CODEX_WEB_DISABLED: &str = "disabled";
+
+/// `config` sets [`CODEX_WEB`] to `"disabled"` at its top level.
+pub(crate) fn codex_web_is_off(config: &str) -> bool {
+    config
+        .parse::<DocumentMut>()
+        .is_ok_and(|c| c.get(CODEX_WEB).is_some_and(web_value_is_off))
+}
+
+/// A `web_search` value that turns web search off: the string `disabled` (H1.4: any other value,
+/// of any type, counts as on).
+fn web_value_is_off(item: &toml_edit::Item) -> bool {
+    item.as_str() == Some(CODEX_WEB_DISABLED)
+}
+
+/// A `unified_exec_tty` value that turns the terminals off: the boolean `false` (H1.4: any other
+/// value, of any type, counts as on).
+fn tty_value_is_off(item: &toml_edit::Item) -> bool {
+    item.as_bool() == Some(false)
+}
+
+/// The tty setting a table of settings (a profile, or the top level) holds, and whether it is on.
+fn table_tty_on(table: &toml_edit::Item) -> bool {
+    table
+        .get("features")
+        .and_then(|f| f.get(CODEX_TTY))
+        .is_some_and(|v| !tty_value_is_off(v))
+}
+
+/// The web search setting a table of settings holds, and whether it is on.
+fn table_web_on(table: &toml_edit::Item) -> bool {
+    table.get(CODEX_WEB).is_some_and(|v| !web_value_is_off(v))
+}
+
+/// `text` turns [`CODEX_TTY`] on, in its `[features]` or in any profile, with any value but
+/// `false`, or is not TOML.
 fn turns_tty_on(text: &str) -> bool {
+    turns_on(text, table_tty_on)
+}
+
+/// `text` sets [`CODEX_WEB`] to any value but `"disabled"` at its top level or in any profile, or
+/// is not TOML. A top level with no `web_search` is not this: it is the file that sets none
+/// ([`codex_web_is_off`]).
+fn turns_web_on(text: &str) -> bool {
+    turns_on(text, table_web_on)
+}
+
+fn turns_on(text: &str, on: fn(&toml_edit::Item) -> bool) -> bool {
     text.parse::<DocumentMut>().map_or(true, |config| {
-        let profile = |item: &toml_edit::Item| {
-            let features = item.get("features")?;
-            features.get(CODEX_TTY)?.as_bool()
-        };
-        tty_in(&config) == Some(true)
+        on(config.as_item())
             || config
                 .get("profiles")
                 .and_then(toml_edit::Item::as_table_like)
-                .is_some_and(|all| all.iter().any(|(_, p)| profile(p) == Some(true)))
+                .is_some_and(|all| all.iter().any(|(_, p)| on(p)))
     })
 }
 
-/// A `.codex/config.toml` in `cwd` or a folder above it turns [`CODEX_TTY`] on. Codex reads each of
-/// these in a trusted project; trust is not asked here.
+/// The `.codex/config.toml` files Codex reads for a session in `cwd`: those in `cwd` and every
+/// folder above it. Codex reads each of these in a trusted project; trust is not asked here.
+fn project_configs(cwd: &Path) -> Vec<String> {
+    cwd.ancestors()
+        .filter_map(|folder| std::fs::read_to_string(folder.join(".codex/config.toml")).ok())
+        .collect()
+}
+
+/// A `.codex/config.toml` in `cwd` or a folder above it turns [`CODEX_TTY`] on.
 fn codex_project_tty(cwd: &Path) -> bool {
-    cwd.ancestors().any(|folder| {
-        std::fs::read_to_string(folder.join(".codex/config.toml"))
-            .is_ok_and(|text| turns_tty_on(&text))
-    })
+    project_configs(cwd).iter().any(|text| turns_tty_on(text))
+}
+
+/// A `.codex/config.toml` in `cwd` or a folder above it sets [`CODEX_WEB`] to another value.
+fn codex_project_web(cwd: &Path) -> bool {
+    project_configs(cwd).iter().any(|text| turns_web_on(text))
+}
+
+/// What the command line of a `codex` process turns on (H1.4), as the options it carries, each in
+/// the spelling it was written in. Read from Codex 0.163.0: `-c` or `--config` (also `-c<value>`,
+/// `-c=<value>` and `--config=<value>`, which `clap` reads alike) with the key
+/// `features.unified_exec_tty` or the whole table `features`, and with the key `web_search`;
+/// `--enable unified_exec_tty` (also `--enable=unified_exec_tty`), which is
+/// `-c features.unified_exec_tty=true`; `--search`, which is `-c web_search="live"`; and `-p` or
+/// `--profile` (also `-p<value>` and `--profile=<value>`) naming a profile a configuration file
+/// holds that sets either on. `--enable web_search_request` turns nothing on: a `web_search` value
+/// wins over Codex's older web search features (`codex-rs/core/src/config/mod.rs` lines 2736-2746).
+/// Options are read wherever they stand up to a `--`: `-c`, `--enable` and `--disable` are global
+/// to the subcommands (`global = true`), so `codex exec -c web_search=live` carries one too.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommandLine {
+    /// The options that turn the tty setting on.
+    pub(crate) tty: Vec<String>,
+    /// The options that turn web search on.
+    pub(crate) web: Vec<String>,
+}
+
+/// The value of a `-c` override as Codex reads it (`codex-rs/utils/cli/src/config_override.rs`
+/// lines 49-81): TOML when it parses, else the text with its quotes taken off as a string.
+fn override_value(raw: &str) -> toml_edit::Item {
+    format!("_x_ = {raw}")
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|d| d.get("_x_").cloned())
+        .unwrap_or_else(|| toml_edit::value(raw.trim().trim_matches(|c| c == '"' || c == '\'')))
+}
+
+impl CommandLine {
+    /// What `args`, the arguments of a `codex` process, turn on; `configs` are the configuration
+    /// files' texts, in which a profile named by `-p` is looked up.
+    pub(crate) fn read(args: &[String], configs: &[String]) -> Self {
+        let mut line = Self::default();
+        let mut at = 0;
+        while at < args.len() {
+            let arg = args[at].as_str();
+            if arg == "--" {
+                break;
+            }
+            at += 1;
+            if arg == "--search" {
+                line.web.push(arg.to_owned());
+                continue;
+            }
+            let Some((option, value, took)) = option_of(arg, args.get(at)) else {
+                continue;
+            };
+            at += took;
+            let spelled = format!("{option} {value}");
+            match option {
+                "config" => line.override_on(&value, &spelled),
+                "enable" => {
+                    if value == CODEX_TTY {
+                        line.tty.push(spelled);
+                    }
+                }
+                "profile" => {
+                    let sets = |on: fn(&toml_edit::Item) -> bool| {
+                        configs.iter().any(|text| {
+                            text.parse::<DocumentMut>().is_ok_and(|c| {
+                                c.get("profiles")
+                                    .and_then(|p| p.get(value.as_str()))
+                                    .is_some_and(on)
+                            })
+                        })
+                    };
+                    if sets(table_tty_on) {
+                        line.tty.push(spelled.clone());
+                    }
+                    if sets(table_web_on) {
+                        line.web.push(spelled);
+                    }
+                }
+                _ => {}
+            }
+        }
+        line
+    }
+
+    /// The effect of one `-c key=value` override.
+    fn override_on(&mut self, raw: &str, spelled: &str) {
+        let Some((key, value)) = lunchroom_core::codex_cli::config_override(raw) else {
+            return;
+        };
+        let value = override_value(&value);
+        let tty_key = format!("features.{CODEX_TTY}");
+        let profile_key = |tail: &str| {
+            key.strip_prefix("profiles.")
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(_, rest)| rest == tail)
+        };
+        if key == tty_key || profile_key(&tty_key) {
+            if !tty_value_is_off(&value) {
+                self.tty.push(spelled.to_owned());
+            }
+        } else if key == "features" {
+            // The whole table: its `unified_exec_tty`, when it holds one (a table merges over the
+            // file's, `codex-rs/config/src/merge.rs`); a value that is no table counts as on unless
+            // it is `false`.
+            let on = match value.as_table_like() {
+                Some(table) => table.get(CODEX_TTY).is_some_and(|v| !tty_value_is_off(v)),
+                None => !tty_value_is_off(&value),
+            };
+            if on {
+                self.tty.push(spelled.to_owned());
+            }
+        } else if (key == CODEX_WEB || profile_key(CODEX_WEB)) && !web_value_is_off(&value) {
+            self.web.push(spelled.to_owned());
+        }
+    }
+}
+
+/// The option `arg` is, as `clap` reads it for `codex` (the six this reads are
+/// [`lunchroom_core::codex_cli`]'s `config`, `enable`, `disable`, `profile`, `search`): its name,
+/// its value and how many of the following arguments it took (`next` is the argument after it).
+/// A short option takes the rest of its argument as its value, a leading `=` dropped
+/// (`parser.rs:979`); a long one takes what follows `=`, else the next argument.
+fn option_of(arg: &str, next: Option<&String>) -> Option<(&'static str, String, usize)> {
+    let long = |name: &'static str| -> Option<(&'static str, String, usize)> {
+        let rest = arg.strip_prefix("--")?.strip_prefix(name)?;
+        if let Some(value) = rest.strip_prefix('=') {
+            return Some((name, value.to_owned(), 0));
+        }
+        rest.is_empty()
+            .then(|| next.map(|v| (name, v.clone(), 1)))
+            .flatten()
+    };
+    let short = |letter: char, name: &'static str| -> Option<(&'static str, String, usize)> {
+        let rest = arg.strip_prefix('-')?.strip_prefix(letter)?;
+        if rest.is_empty() {
+            return next.map(|v| (name, v.clone(), 1));
+        }
+        Some((name, rest.strip_prefix('=').unwrap_or(rest).to_owned(), 0))
+    };
+    if arg.starts_with("--") {
+        long("config")
+            .or_else(|| long("enable"))
+            .or_else(|| long("disable"))
+            .or_else(|| long("profile"))
+    } else {
+        short('c', "config").or_else(|| short('p', "profile"))
+    }
+}
+
+/// What a `codex app-server` process (the server Codex's windows share) is called on its command
+/// line.
+const CODEX_SERVER_WORD: &str = "app-server";
+
+/// H1.4: a session that runs in a shared server (its process is the server) is UNGUARDED while any
+/// running `codex` process of the user carries an option that turns the tty setting or web search
+/// on, since the options a window was started with are on that window's own process, not on the
+/// server's (codex-cli 0.166.0, measured 2026-10-31). Read from the `codex` processes now running,
+/// so it ends with the window.
+fn shared_server_fault(pid: u32) -> Option<CodexFault> {
+    use std::os::unix::fs::MetadataExt as _;
+    if !cmdline_args(pid).iter().any(|a| a == CODEX_SERVER_WORD) {
+        return None;
+    }
+    let user = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    let own_files = |other: u32| {
+        let home = process_env(other, "CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| process_env(other, "HOME").map(|h| Path::new(&h).join(".codex")));
+        home.and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok())
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|other| *other != pid)
+        .filter(|other| {
+            std::fs::metadata(format!("/proc/{other}")).is_ok_and(|m| m.uid() == user)
+                && is_codex_process(*other)
+        })
+        .find_map(|other| {
+            let line = CommandLine::read(&cmdline_args(other), &own_files(other));
+            line.tty
+                .into_iter()
+                .chain(line.web)
+                .next()
+                .map(|by| CodexFault::SharedServer(format!("{by} (process {other})")))
+        })
+}
+
+/// Process `pid` is a `codex` process: its program, as its command line gives it, is named `codex`.
+fn is_codex_process(pid: u32) -> bool {
+    cmdline_args(pid)
+        .first()
+        .and_then(|program| program.rsplit('/').next().map(str::to_owned))
+        .is_some_and(|name| name == "codex")
+}
+
+/// The tty and web search settings in force for a Codex session's `codex` process, as its first
+/// guard hook read them from the configuration files and the process's command line (H1.4),
+/// recorded as the first line of the session's guard fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexSettings {
+    /// The process the settings were read for: `<pid>:<start time>`.
+    pub(crate) process: String,
+    /// What turned the tty setting on (an option, or the file's setting); empty when it is off.
+    pub(crate) tty: String,
+    /// What turned web search on; empty when it is off.
+    pub(crate) web: String,
+}
+
+/// Starts the settings line of a recorded fingerprint.
+const SETTINGS_LINE: &str = "codex-settings";
+
+impl CodexSettings {
+    pub(crate) fn read(key: &str, codex_home: &Path, pid: u32, cwd: &Path) -> Self {
+        let config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
+        let mut files = vec![config.clone()];
+        files.extend(project_configs(cwd));
+        let line = CommandLine::read(&cmdline_args(pid), &files);
+        // Each setting on its own, the files first: the one the user fixes in a file, then the
+        // option the process was started with.
+        let tty = if codex_tty_setting(&config) != Some(false) {
+            "config.toml".to_owned()
+        } else if turns_tty_on(&config) || codex_project_tty(cwd) {
+            "a profile or project file".to_owned()
+        } else {
+            line.tty.first().cloned().unwrap_or_default()
+        };
+        let web = if !codex_web_is_off(&config) {
+            "config.toml".to_owned()
+        } else if turns_web_on(&config) || codex_project_web(cwd) {
+            "a profile or project file".to_owned()
+        } else {
+            line.web.first().cloned().unwrap_or_default()
+        };
+        Self {
+            process: key.to_owned(),
+            tty: clean(&tty),
+            web: clean(&web),
+        }
+    }
+
+    /// Either setting is on.
+    pub(crate) fn on(&self) -> bool {
+        !self.tty.is_empty() || !self.web.is_empty()
+    }
+
+    /// The settings as the first line of a recorded fingerprint.
+    pub(crate) fn line(&self) -> String {
+        format!("{SETTINGS_LINE}|{}|{}|{}", self.process, self.tty, self.web)
+    }
+
+    /// The settings of a recorded fingerprint, or `None` for a record that has none.
+    pub(crate) fn parse(recorded: &str) -> Option<Self> {
+        let first = recorded.lines().next()?;
+        let mut parts = first.splitn(4, '|');
+        (parts.next()? == SETTINGS_LINE).then_some(())?;
+        Some(Self {
+            process: parts.next()?.to_owned(),
+            tty: parts.next()?.to_owned(),
+            web: parts.next()?.to_owned(),
+        })
+    }
+}
+
+/// `text` as one field of the settings line: no separator and no line break.
+fn clean(text: &str) -> String {
+    text.chars()
+        .map(|c| if c == '|' || c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Every Lunchroom hook in a Codex `hooks.json`, as its event's `config.toml` name, its group and
@@ -702,9 +1311,58 @@ fn lunchroom_command(hook: &Value) -> Option<(&str, &str)> {
 }
 
 /// The program of a hook whose command is exactly Lunchroom's `guard <mode>`.
-fn guard_program<'a>(hook: &'a Value, mode: &str) -> Option<&'a str> {
+pub(crate) fn guard_program<'a>(
+    hook: &'a Value,
+    mode: &str,
+    form: PreTool,
+    source: Option<&Path>,
+) -> Option<&'a str> {
+    let command = hook["command"].as_str().unwrap_or_default();
+    // A command past the bound is not Lunchroom's line in any form, and is read no further.
+    if command.len() > crate::install::MAX_HOOK_COMMAND {
+        return None;
+    }
     let (program, args) = lunchroom_command(hook)?;
-    (args == format!("guard {mode}")).then_some(program)
+    if mode != "pretool" {
+        return (args == format!("guard {mode}")).then_some(program);
+    }
+    // H1.5: the tool-call hook is `guard pretool` followed by the failure branch the install
+    // writes, byte for byte, and its line names the configuration file the hook was read from; in
+    // Claude Code it also carries `"onFailure": "block"`. An install of 1.0.x wrote `guard
+    // pretool` alone, which fails open when the guard fails; only a diagnosis ([`PreTool::Older`])
+    // takes it. A hook read from no file (settings given as text) cannot be the install's.
+    // One ASCII space, nothing else, between the program and `guard` (the shell splits a command
+    // at spaces and tabs only, and a hook is run as written).
+    let before = &command[..command.len().saturating_sub(args.len())];
+    let one_space = before
+        .strip_suffix(' ')
+        .is_some_and(|p| !p.ends_with(char::is_whitespace));
+    let written =
+        source.is_some_and(|file| one_space && crate::install::is_fail_closed_for(args, file));
+    let accepted = match form {
+        PreTool::Codex => written,
+        PreTool::Claude => written && hook["onFailure"] == "block",
+        // The diagnosis "reinstall" is for the hook as the install writes it (here without
+        // `onFailure`) and for the one form a released installer wrote: `guard pretool` alone
+        // (1.0.1, commit 276b58f, install.rs line 346). Any other text is no Lunchroom form: the
+        // line of another file's, an alias, an altered or whitespace-altered line, a bare
+        // `|| exit 2` (no release wrote it), or settings given as text.
+        PreTool::Older => {
+            source.is_some() && (written || one_space && crate::install::is_pre_1_1_pretool(args))
+        }
+    };
+    accepted.then_some(program)
+}
+
+/// How much of H1.5 a tool-call hook must have to count as the guard's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreTool {
+    /// Codex: `guard pretool` and the failure branch.
+    Codex,
+    /// Claude Code: the failure branch and `"onFailure": "block"`.
+    Claude,
+    /// An older install's hook is accepted too (to tell "reinstall" from "no guard at all").
+    Older,
 }
 
 /// The program a Lunchroom plugin file runs: its `PROGRAM = "<path>"` line (`const PROGRAM` in
@@ -1352,6 +2010,12 @@ fn programs_of(
 /// the script a runtime runs (its first argument, absolute or taken from the process's folder, its
 /// links followed).
 fn process_programs(pid: u32) -> Programs {
+    // As the user's own group: a setgid program cannot read another process's exe or cwd link
+    // (`lunchroom_core::setgid::as_own_group`).
+    lunchroom_core::setgid::as_own_group(|| process_programs_read(pid))
+}
+
+fn process_programs_read(pid: u32) -> Programs {
     programs_of(
         std::fs::read_link(format!("/proc/{pid}/exe")).ok(),
         &std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default(),
@@ -1729,7 +2393,9 @@ pub fn json5(text: &str) -> Option<Value> {
 
 /// A variable in process `pid`'s starting environment.
 fn process_env(pid: u32, name: &str) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let raw =
+        lunchroom_core::setgid::as_own_group(|| std::fs::read(format!("/proc/{pid}/environ")))
+            .ok()?;
     raw.split(|b| *b == 0).find_map(|kv| {
         let kv = String::from_utf8_lossy(kv);
         kv.strip_prefix(&format!("{name}="))
@@ -1796,16 +2462,70 @@ const CLAUDE_GUARD_HOOKS: [(&str, &str); 4] = [
 
 /// The session in process `pid` is guarded: the hooks Claude Code actually runs for it include
 /// every one of [`CLAUDE_GUARD_HOOKS`].
-fn configured(pid: u32, cwd: &Path, home: &Path) -> bool {
+fn configured(pid: u32, cwd: &Path, home: &Path) -> ClaudeGuard {
     let config_dir =
         process_env(pid, "CLAUDE_CONFIG_DIR").map_or_else(|| home.join(".claude"), PathBuf::from);
-    configured_with(
+    claude_guard_with(
+        &read_file,
+        &|hook| program_present(hook, pid, cwd),
         &cmdline_args(pid),
         &config_dir,
         Path::new(MANAGED_SETTINGS),
-        pid,
         cwd,
     )
+}
+
+/// What Claude Code's settings hold of Lunchroom's guard (H1.5), judged from one reading of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeGuard {
+    /// The whole guard set, the tool-call hook as the install writes it.
+    Guarded,
+    /// The whole guard set, but the tool-call hook is an earlier install's: reinstall.
+    OlderHook,
+    /// Not the whole guard set, or no hooks run.
+    NotConfigured,
+}
+
+/// How a file's text is read: the real one, or a test's.
+type Reader<'a> = &'a dyn Fn(&Path) -> Option<String>;
+
+/// Whether a hook's program is there to run (R3.1): the real one asks the file system; a test's
+/// records what it is asked.
+type Present<'a> = &'a dyn Fn(&Value) -> bool;
+
+fn read_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// The JSON in the file `path`, read with `read`.
+fn json_from(read: Reader<'_>, path: &Path) -> Option<Value> {
+    serde_json::from_str(&read(path)?).ok()
+}
+
+/// [`claude_guard_with`] as the boolean for one form of the tool-call hook: whether the settings
+/// hold the whole guard set with the tool-call hook in the form `form` (or, for
+/// [`PreTool::Older`], in either).
+#[cfg(test)]
+fn configured_with(
+    args: &[String],
+    config_dir: &Path,
+    managed: &Path,
+    pid: u32,
+    cwd: &Path,
+    form: PreTool,
+) -> bool {
+    match claude_guard_with(
+        &read_file,
+        &|hook| program_present(hook, pid, cwd),
+        args,
+        config_dir,
+        managed,
+        cwd,
+    ) {
+        ClaudeGuard::Guarded => true,
+        ClaudeGuard::OlderHook => form == PreTool::Older,
+        ClaudeGuard::NotConfigured => false,
+    }
 }
 
 /// `configured` for a Claude Code process started with `args`, whose user settings are in
@@ -1819,23 +2539,30 @@ fn configured(pid: u32, cwd: &Path, home: &Path) -> bool {
 /// `--settings` over those); when true it leaves only the managed hooks, which only a
 /// `disableAllHooks` in managed settings stops. The managed `allowManagedHooksOnly` leaves only
 /// the managed hooks too.
-fn configured_with(
+///
+/// Each settings file is read once, through `read`, and both forms of the tool-call hook are judged
+/// from that one reading: a file replaced between two readings cannot be judged guarded by one
+/// and older by the other.
+fn claude_guard_with(
+    read: Reader<'_>,
+    present: Present<'_>,
     args: &[String],
     config_dir: &Path,
     managed: &Path,
-    pid: u32,
     cwd: &Path,
-) -> bool {
+) -> ClaudeGuard {
     if args.iter().any(|a| a == "--bare") {
-        return false;
+        return ClaudeGuard::NotConfigured;
     }
-    let managed = read_json(managed);
-    let managed_flag = |key: &str| managed.as_ref().and_then(|m| m[key].as_bool());
+    let managed_json = json_from(read, managed);
+    let managed_flag = |key: &str| managed_json.as_ref().and_then(|m| m[key].as_bool());
+    let managed_only = managed_flag("allowManagedHooksOnly");
     if managed_flag("disableAllHooks") == Some(true) {
-        return false;
+        return ClaudeGuard::NotConfigured;
     }
     let loaded = setting_sources(args);
-    let mut levels: Vec<Value> = [
+    // Each settings value with the file it was read from (none for settings given as text).
+    let mut levels: Vec<(Option<PathBuf>, Value)> = [
         ("user", config_dir.join("settings.json")),
         ("project", cwd.join(".claude/settings.json")),
         ("local", cwd.join(".claude/settings.local.json")),
@@ -1846,23 +2573,35 @@ fn configured_with(
             .as_ref()
             .is_none_or(|l| l.iter().any(|s| s.as_str() == *name))
     })
-    .filter_map(|(_, path)| read_json(&path))
+    .filter_map(|(_, path)| json_from(read, &path).map(|v| (Some(path), v)))
     .collect();
-    levels.extend(settings_flag(args, cwd));
+    levels.extend(settings_flag(read, args, cwd));
     let others_off = levels
         .iter()
         .rev()
-        .find_map(|v| v["disableAllHooks"].as_bool())
+        .find_map(|(_, v)| v["disableAllHooks"].as_bool())
         == Some(true);
-    let mut running: Vec<Value> = managed.clone().into_iter().collect();
-    if !others_off && managed_flag("allowManagedHooksOnly") != Some(true) {
+    let mut running: Vec<(Option<PathBuf>, Value)> = managed_json
+        .into_iter()
+        .map(|v| (Some(managed.to_path_buf()), v))
+        .collect();
+    if !others_off && managed_only != Some(true) {
         running.extend(levels);
     }
-    CLAUDE_GUARD_HOOKS.iter().all(|(event, mode)| {
-        running
-            .iter()
-            .any(|v| has_guard_hook(v, event, mode, pid, cwd))
-    })
+    let holds = |form: PreTool| {
+        CLAUDE_GUARD_HOOKS.iter().all(|(event, mode)| {
+            running
+                .iter()
+                .any(|(file, v)| has_guard_hook(v, event, mode, &present, form, file.as_deref()))
+        })
+    };
+    if holds(PreTool::Claude) {
+        ClaudeGuard::Guarded
+    } else if holds(PreTool::Older) {
+        ClaudeGuard::OlderHook
+    } else {
+        ClaudeGuard::NotConfigured
+    }
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -1908,18 +2647,19 @@ fn setting_sources(args: &[String]) -> Option<Vec<String>> {
 }
 
 /// The settings given to a process started with `args` as `--settings <file or JSON text>`.
-fn settings_flag(args: &[String], cwd: &Path) -> Vec<Value> {
+fn settings_flag(read: Reader<'_>, args: &[String], cwd: &Path) -> Vec<(Option<PathBuf>, Value)> {
     option_values(args, "--settings")
         .filter_map(|given| {
             if given.trim_start().starts_with('{') {
-                serde_json::from_str(given).ok()
+                serde_json::from_str(given).ok().map(|v| (None, v))
             } else {
                 let path = PathBuf::from(given);
-                read_json(&if path.is_absolute() {
+                let path = if path.is_absolute() {
                     path
                 } else {
                     cwd.join(path)
-                })
+                };
+                json_from(read, &path).map(|v| (Some(path), v))
             }
         })
         .collect()
@@ -1930,7 +2670,14 @@ fn settings_flag(args: &[String], cwd: &Path) -> Vec<Value> {
 /// pattern, which leaves the calls it does not match unchecked; `UserPromptSubmit` has no
 /// matcher), and the hook is a synchronous command with no `if` filter whose program is there to
 /// run.
-fn has_guard_hook(settings: &Value, event: &str, mode: &str, pid: u32, cwd: &Path) -> bool {
+fn has_guard_hook(
+    settings: &Value,
+    event: &str,
+    mode: &str,
+    present: &dyn Fn(&Value) -> bool,
+    form: PreTool,
+    source: Option<&Path>,
+) -> bool {
     settings["hooks"][event]
         .as_array()
         .into_iter()
@@ -1945,12 +2692,12 @@ fn has_guard_hook(settings: &Value, event: &str, mode: &str, pid: u32, cwd: &Pat
         })
         .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
         .any(|h| {
-            guard_program(h, mode).is_some()
+            guard_program(h, mode, form, source).is_some()
                 && h["type"] == "command"
                 && h["if"].is_null()
                 && h["async"].as_bool() != Some(true)
                 && h["asyncRewake"].as_bool() != Some(true)
-                && program_present(h, pid, cwd)
+                && present(h)
         })
 }
 
@@ -1965,16 +2712,40 @@ pub(crate) fn claude_setup_fault(
     pid: u32,
     cwd: &Path,
 ) -> Option<String> {
-    (!configured_with(&[], config_dir, managed, pid, cwd)).then(|| {
-        format!(
+    claude_setup_fault_with(
+        &read_file,
+        &|hook| program_present(hook, pid, cwd),
+        config_dir,
+        managed,
+        cwd,
+    )
+}
+
+/// [`claude_setup_fault`] reading the settings through `read`, once.
+fn claude_setup_fault_with(
+    read: Reader<'_>,
+    present: Present<'_>,
+    config_dir: &Path,
+    managed: &Path,
+    cwd: &Path,
+) -> Option<String> {
+    match claude_guard_with(read, present, &[], config_dir, managed, cwd) {
+        ClaudeGuard::Guarded => None,
+        ClaudeGuard::OlderHook => Some(format!(
+            "{} (settings in {}, and those of the project in {})",
+            CLAUDE_OLD_HOOK,
+            config_dir.join("settings.json").display(),
+            cwd.display()
+        )),
+        ClaudeGuard::NotConfigured => Some(format!(
             "Claude Code's settings ({}, and those of the project in {}) do not run Lunchroom's \
              whole guard (PreToolUse, PostToolUse, PostToolUseFailure and UserPromptSubmit, each \
              on every call, its program there to run), or stop every hook (disableAllHooks): run \
              lunchroom install claude-code in a terminal of your own.",
             config_dir.join("settings.json").display(),
             cwd.display()
-        )
-    })
+        )),
+    }
 }
 
 /// C1.4 (`lunchroom doctor`): `None` when Lunchroom's plugin file `file`, where `lunchroom
@@ -2790,7 +3561,7 @@ mod tests {
                 .text()
                 .contains("unified_exec_tty is false")
         );
-        let off = "[features]\nunified_exec_tty = false\n";
+        let off = "web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n";
         let _ = std::fs::write(
             codex_home.join("config.toml"),
             format!("{off}[profiles.p.features]\nunified_exec_tty = true\n"),
@@ -2808,7 +3579,7 @@ mod tests {
             text.contains(&file.display().to_string()) && text.contains("lunchroom install codex"),
             "{text}"
         );
-        let hook = |mode: &str| json!([{"hooks": [{"type": "command", "command": format!("{program} guard {mode}")}]}]);
+        let hook = |mode: &str| json!([{"hooks": [{"type": "command", "command": written(&program, &format!("guard {mode}"), &file)}]}]);
         let _ = std::fs::write(
             &file,
             json!({"hooks": {
@@ -2868,6 +3639,494 @@ mod tests {
         let _ = std::fs::write(codex_home.join("config.toml"), format!("{off}{all}"));
         assert_eq!(fault(), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A Lunchroom hook's command as the install writes it: the tool-call hook (`guard pretool`)
+    /// with H1.5's failure branch, the others as they are.
+    fn written(program: &str, rest: &str, file: &Path) -> String {
+        if rest == "guard pretool" {
+            crate::install::pretool_command(program, file)
+        } else {
+            format!("{program} {rest}")
+        }
+    }
+
+    /// Stands for the settings file a Claude Code fixture is written to: [`Claude::write`] puts the
+    /// file's own name in its place, since the line of the tool-call hook names the file it is in.
+    const HERE: &str = "/x/here.json";
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    // §13::68-§13::75 (H1.4): each command-line spelling that turns the tty setting or
+    // web search on is read as Codex reads it, and each that does not is not: the key spellings
+    // (`-c`, `--config`, `-c<value>`, `-c=<value>`, `--config=<value>`), spaces around the key, a
+    // value of any type but `false` (tty) or `"disabled"` (web search), the whole table
+    // `features`, `--enable` and `--enable=`, `--search`, a profile named by `-p` or `--profile`,
+    // options after a subcommand, and nothing after `--`.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of spellings
+    fn command_line_spellings_turn_the_settings_on_as_codex_reads_them() {
+        let tty = |a: &[&str]| CommandLine::read(&words(a), &[]).tty.len();
+        let web = |a: &[&str]| CommandLine::read(&words(a), &[]).web.len();
+        for on in [
+            &["-c", "features.unified_exec_tty=true"][..],
+            &["-c", "features.unified_exec_tty=1"],
+            &["-c", "features.unified_exec_tty=\"x\""],
+            &["-c", "features.unified_exec_tty="],
+            &["-c", "features.unified_exec_tty=\"false\""],
+            &["-c", " features.unified_exec_tty = true"],
+            &["--config", "features.unified_exec_tty=true"],
+            &["-cfeatures.unified_exec_tty=true"],
+            &["-c=features.unified_exec_tty=true"],
+            &["--config=features.unified_exec_tty=true"],
+            &["-c", "features={unified_exec_tty=true}"],
+            &["-c", "features={ unified_exec_tty = \"x\" }"],
+            &["-c", "features=true"],
+            &["-c", "profiles.p.features.unified_exec_tty=true"],
+            &["--enable", "unified_exec_tty"],
+            &["--enable=unified_exec_tty"],
+            &["-m", "gpt", "-c", "features.unified_exec_tty=true"],
+            &["exec", "-c", "features.unified_exec_tty=true", "a prompt"],
+            &[
+                "-c",
+                "features.unified_exec_tty=false",
+                "--enable",
+                "unified_exec_tty",
+            ],
+        ] {
+            assert_eq!(tty(on), 1, "{on:?}");
+            assert_eq!(web(on), 0, "{on:?}");
+        }
+        for off in [
+            &["-c", "features.unified_exec_tty=false"][..],
+            &["--config=features.unified_exec_tty=false"],
+            &["-c", "features={unified_exec_tty=false}"],
+            &["-c", "features={hooks=true}"],
+            &["-c", "features=false"],
+            &["--disable", "unified_exec_tty"],
+            &["--enable", "web_search_request"],
+            &["--enable", "hooks"],
+            &["-c", "features.unified_exec_tty"],
+            &["--", "-c", "features.unified_exec_tty=true"],
+            &["exec", "--", "--enable", "unified_exec_tty"],
+            &["-m", "unified_exec_tty"],
+            &[],
+        ] {
+            assert_eq!(tty(off), 0, "{off:?}");
+        }
+        for on in [
+            &["-c", "web_search=\"live\""][..],
+            &["-c", "web_search=live"],
+            &["-c", "web_search=\"cached\""],
+            &["-c", "web_search=\"indexed\""],
+            &["-c", "web_search="],
+            &["-c", "web_search=\"\""],
+            &["-c", "web_search=1"],
+            &["-c", " web_search = \"live\""],
+            &["--config", "web_search=\"live\""],
+            &["-cweb_search=\"live\""],
+            &["-c=web_search=\"live\""],
+            &["--config=web_search=\"live\""],
+            &["-c", "profiles.p.web_search=\"live\""],
+            &["--search"],
+            &["-m", "gpt", "--search", "a prompt"],
+            &["exec", "-c", "web_search=\"live\"", "a prompt"],
+            &["-c", "web_search=\"disabled\"", "--search"],
+        ] {
+            assert_eq!(web(on), 1, "{on:?}");
+            assert_eq!(tty(on), 0, "{on:?}");
+        }
+        for off in [
+            &["-c", "web_search=\"disabled\""][..],
+            &["-c", "web_search=disabled"],
+            &["-c", "web_search='disabled'"],
+            &["--config=web_search=\"disabled\""],
+            &["-cweb_search=\"disabled\""],
+            &["--enable", "web_search_request"],
+            &[
+                "--enable=web_search_request",
+                "-c",
+                "web_search=\"disabled\"",
+            ],
+            &["--", "--search"],
+            &["-c", "web_search"],
+            &["--search=yes"],
+        ] {
+            assert_eq!(web(off), 0, "{off:?}");
+        }
+        // `-p` or `--profile` naming a profile that sets either on.
+        let config = "[profiles.t.features]\nunified_exec_tty = true\n\
+                      [profiles.w]\nweb_search = \"live\"\n\
+                      [profiles.ok]\nweb_search = \"disabled\"\n[profiles.ok.features]\nunified_exec_tty = false\n"
+            .to_owned();
+        let read = |a: &[&str]| CommandLine::read(&words(a), std::slice::from_ref(&config));
+        for (args, tty_on, web_on) in [
+            (&["-p", "t"][..], 1, 0),
+            (&["--profile", "t"], 1, 0),
+            (&["--profile=t"], 1, 0),
+            (&["-pt"], 1, 0),
+            (&["-p", "w"], 0, 1),
+            (&["--profile=w"], 0, 1),
+            (&["-p", "ok"], 0, 0),
+            (&["-p", "missing"], 0, 0),
+        ] {
+            let got = read(args);
+            assert_eq!((got.tty.len(), got.web.len()), (tty_on, web_on), "{args:?}");
+        }
+        // The spelling is kept, for the user to read.
+        let got = CommandLine::read(&words(&["--config=web_search=\"live\""]), &[]);
+        assert_eq!(got.web, ["config web_search=\"live\"".to_owned()]);
+    }
+
+    // §13::65, §13::73, §13::74 (H1.4): web search is guarded only where `web_search` is
+    // `"disabled"` at the top of `config.toml`, by the same files and profiles as the tty setting:
+    // unset, `live`, `cached`, `indexed`, an empty value and a value of another type each count as
+    // on, in `config.toml`, in a profile and in a project's `.codex/config.toml`; the tty values
+    // `true`, `1`, an empty string and `"x"` count as on, `false` does not.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, each file the setting can come from
+    fn web_search_and_tty_values_are_read_from_every_file_and_profile() {
+        let root = crate::test_target()
+            .join("codex-web-unit")
+            .join(std::process::id().to_string());
+        let codex_home = root.join("home/.codex");
+        let project = root.join("project");
+        let _ = std::fs::create_dir_all(&codex_home);
+        let _ = std::fs::create_dir_all(project.join(".codex"));
+        let fault = |home: &str, project_config: &str| {
+            let _ = std::fs::write(codex_home.join("config.toml"), home);
+            let _ = std::fs::write(project.join(".codex/config.toml"), project_config);
+            codex_settings_fault(&codex_home, std::process::id(), &project)
+        };
+        let ok = "web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n";
+        assert_eq!(fault(ok, ""), None);
+        assert_eq!(fault(ok, "model = \"x\"\n"), None);
+        // `config.toml`: unset, and every other value.
+        assert_eq!(
+            fault("[features]\nunified_exec_tty = false\n", ""),
+            Some(CodexFault::WebNotOff)
+        );
+        for value in [
+            "\"live\"",
+            "\"cached\"",
+            "\"indexed\"",
+            "\"\"",
+            "1",
+            "true",
+            "[]",
+        ] {
+            let home = format!("web_search = {value}\n[features]\nunified_exec_tty = false\n");
+            assert_eq!(fault(&home, ""), Some(CodexFault::WebNotOff), "{value}");
+        }
+        // The same keys as dotted or quoted TOML.
+        for spelling in [
+            "\"web_search\" = \"disabled\"\n",
+            "web_search = 'disabled'\n",
+        ] {
+            let home = format!("{spelling}[features]\nunified_exec_tty = false\n");
+            assert_eq!(fault(&home, ""), None, "{spelling}");
+        }
+        // A profile, and a project's file.
+        for value in ["\"live\"", "\"cached\"", "\"indexed\"", "\"\"", "1"] {
+            let profile = format!("{ok}[profiles.p]\nweb_search = {value}\n");
+            assert_eq!(
+                fault(&profile, ""),
+                Some(CodexFault::WebTurnedOn),
+                "{value}"
+            );
+            let project_config = format!("web_search = {value}\n");
+            assert_eq!(
+                fault(ok, &project_config),
+                Some(CodexFault::WebTurnedOn),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            fault(ok, "[profiles.q]\nweb_search = \"live\"\n"),
+            Some(CodexFault::WebTurnedOn)
+        );
+        assert_eq!(fault(ok, "web_search = \"disabled\"\n"), None);
+        assert_eq!(fault(ok, "[not toml\n"), Some(CodexFault::TtyTurnedOn));
+        // The tty values.
+        for (value, on) in [
+            ("true", true),
+            ("1", true),
+            ("\"\"", true),
+            ("\"x\"", true),
+            ("false", false),
+        ] {
+            let home =
+                format!("web_search = \"disabled\"\n[features]\nunified_exec_tty = {value}\n");
+            let expected = (on).then_some(CodexFault::TtyNotOff);
+            assert_eq!(fault(&home, ""), expected, "home {value}");
+            let project_config = format!("[features]\nunified_exec_tty = {value}\n");
+            let expected = (on).then_some(CodexFault::TtyTurnedOn);
+            assert_eq!(fault(ok, &project_config), expected, "project {value}");
+            let profile = format!("{ok}[profiles.p.features]\nunified_exec_tty = {value}\n");
+            assert_eq!(fault(&profile, ""), expected, "profile {value}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Held by each test that runs stand-in `codex` processes: a window with an option makes a
+    /// shared-server session UNGUARDED (H1.4), so the tests must not overlap.
+    static WINDOWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A stand-in `codex` process whose command line carries `options`; it is ended on drop.
+    struct StandIn(std::process::Child);
+
+    impl StandIn {
+        fn start(codex_home: &Path, options: &[&str]) -> Option<Self> {
+            use std::os::unix::process::CommandExt as _;
+            let child = std::process::Command::new("/bin/sh")
+                .arg0("codex")
+                .args(["-c", "sleep 30; :", "stand-in"])
+                .args(options)
+                .env("CODEX_HOME", codex_home)
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .ok()?;
+            let stand = Self(child);
+            // Until the process has started its program its command line is this test's.
+            for _ in 0..200 {
+                if cmdline_args(stand.0.id()).first().map(String::as_str) == Some("codex") {
+                    return Some(stand);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            None
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // §13::66, §13::67, §13::68-§13::72, §13::75, §4::38, §4::40 (H1.4): the settings in
+    // force for a session's `codex` process, read from the files and its real command line and
+    // recorded with the guard fingerprint at the first hook; a session recorded with either on
+    // stays UNGUARDED across later hooks, whatever the files say then, and is read anew only in
+    // another process.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, each spelling on a real process
+    fn the_first_hook_records_the_settings_of_the_codex_process() {
+        let _alone = WINDOWS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = crate::test_target()
+            .join("codex-record-unit")
+            .join(std::process::id().to_string());
+        let home = root.join("home");
+        let codex_home = home.join(".codex");
+        let _ = std::fs::create_dir_all(&codex_home);
+        let ok = "web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n\
+                  [profiles.live]\nweb_search = \"disabled\"\n";
+        let _ = std::fs::write(codex_home.join("config.toml"), ok);
+        let read = |stand: &StandIn| {
+            let key = process::key(stand.pid()).unwrap_or_default();
+            CodexSettings::read(&key, &codex_home, stand.pid(), &root)
+        };
+        for (options, tty_on, web_on) in [
+            (&["--search"][..], false, true),
+            (&["-c", "web_search=\"live\""], false, true),
+            (&["--config=web_search=cached"], false, true),
+            (&["-c", "features.unified_exec_tty=true"], true, false),
+            (&["-cfeatures.unified_exec_tty=1"], true, false),
+            (&["--enable", "unified_exec_tty"], true, false),
+            (&["--enable=unified_exec_tty"], true, false),
+            (&["-c", "features={unified_exec_tty=true}"], true, false),
+            (&["-c", "web_search=\"disabled\""], false, false),
+            (&["--enable", "web_search_request"], false, false),
+            (
+                &[
+                    "--enable=web_search_request",
+                    "-c",
+                    "web_search=\"disabled\"",
+                ],
+                false,
+                false,
+            ),
+            (&["-c", "features.unified_exec_tty=false"], false, false),
+            (&[], false, false),
+        ] {
+            let started = StandIn::start(&codex_home, options);
+            assert!(started.is_some(), "{options:?}");
+            let Some(stand) = started else { return };
+            let settings = read(&stand);
+            assert_eq!(
+                (!settings.tty.is_empty(), !settings.web.is_empty()),
+                (tty_on, web_on),
+                "{options:?}: {settings:?}"
+            );
+            // The live check gives the same answer, naming the option.
+            let live = codex_settings_fault(&codex_home, stand.pid(), &root);
+            assert_eq!(live.is_some(), tty_on || web_on, "{options:?}: {live:?}");
+        }
+        // The first hook's record, kept by later hooks while the process stays the same.
+        let started = StandIn::start(&codex_home, &[]);
+        assert!(started.is_some());
+        let Some(stand) = started else { return };
+        let _ = std::fs::write(
+            codex_home.join("config.toml"),
+            "[features]\nunified_exec_tty = true\n",
+        );
+        let first = codex_guard_fingerprint(stand.pid(), &root, &home, None);
+        let recorded = first.as_deref().and_then(CodexSettings::parse);
+        assert!(
+            recorded
+                .as_ref()
+                .is_some_and(|s| !s.tty.is_empty() && !s.web.is_empty())
+        );
+        // The user fixes the files; the process is the same, so the record stays.
+        let _ = std::fs::write(codex_home.join("config.toml"), ok);
+        let later = codex_guard_fingerprint(stand.pid(), &root, &home, first.as_deref());
+        assert_eq!(later, first);
+        // With no record (a session started anew in a new process) the files are read again.
+        assert_eq!(
+            codex_guard_fingerprint(stand.pid(), &root, &home, None),
+            None
+        );
+        // A record made for another process is not this process's.
+        let other = first
+            .as_deref()
+            .map(|f| f.replacen(&process::key(stand.pid()).unwrap_or_default(), "1:1", 1));
+        assert_eq!(
+            codex_guard_fingerprint(stand.pid(), &root, &home, other.as_deref()),
+            None
+        );
+        assert_eq!(recorded_hooks("codex-settings|1:1||\nhooks"), "hooks");
+        assert_eq!(recorded_hooks("codex-settings|1:1||"), "");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // §13::76 (H1.4): a session in a shared server is UNGUARDED while any running `codex`
+    // process of the user was started with an option that turns the tty setting or web search on,
+    // and not made so by windows started only with `-c web_search="disabled"`, nor after the
+    // window ends.
+    #[test]
+    fn a_window_with_such_an_option_makes_the_shared_server_unguarded() {
+        let _alone = WINDOWS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = crate::test_target()
+            .join("codex-server-unit")
+            .join(std::process::id().to_string());
+        let codex_home = root.join("home/.codex");
+        let _ = std::fs::create_dir_all(&codex_home);
+        let _ = std::fs::write(
+            codex_home.join("config.toml"),
+            "web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n",
+        );
+        let started = StandIn::start(&codex_home, &["app-server"]);
+        assert!(started.is_some());
+        let Some(server) = started else { return };
+        if shared_server_fault(server.pid()).is_some() {
+            // A real `codex` window of this user with such an option is running: not testable now.
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let quiet = StandIn::start(&codex_home, &["-c", "web_search=\"disabled\""]);
+        assert!(quiet.is_some());
+        assert_eq!(shared_server_fault(server.pid()), None);
+        let window = StandIn::start(&codex_home, &["--search"]);
+        let window_pid = window.as_ref().map(StandIn::pid).unwrap_or_default();
+        let fault = shared_server_fault(server.pid());
+        assert!(
+            matches!(&fault, Some(CodexFault::SharedServer(by)) if by.contains("--search") && by.contains(&window_pid.to_string())),
+            "{fault:?}"
+        );
+        assert!(fault.is_some_and(|f| {
+            f.text()
+                .contains("every session in that server is UNGUARDED")
+        }));
+        // A session that is not in the server (no `app-server` on its command line) is not made so.
+        let own = StandIn::start(&codex_home, &[]);
+        assert_eq!(
+            own.as_ref().and_then(|s| shared_server_fault(s.pid())),
+            None
+        );
+        drop(window);
+        assert_eq!(shared_server_fault(server.pid()), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // §13::77, §13::78, §4::42 (H1.4): a thread with a session record in
+    // `<CODEX_HOME>/sessions` that no guard hook recorded is listed, once, whether its record is
+    // plain or compressed; one a hook recorded, and files that are not session records, are not.
+    #[test]
+    fn a_thread_with_a_record_and_no_hook_is_listed() {
+        let root = crate::test_target()
+            .join("codex-threads-unit")
+            .join(std::process::id().to_string());
+        let day = root.join("sessions/2026/10/27");
+        let _ = std::fs::create_dir_all(&day);
+        let (seen, plain, packed) = (
+            "11111111-2222-3333-4444-555555555555",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        );
+        for name in [
+            format!("rollout-2026-10-27T00-00-00-{seen}.jsonl"),
+            format!("rollout-2026-10-27T00-00-01-{plain}.jsonl"),
+            format!("rollout-2026-10-26T00-00-01-{packed}.jsonl.zst"),
+            format!("rollout-2026-10-27T00-00-02-{plain}.jsonl"),
+            "rollout-2026-10-27T00-00-03-not-a-uuid.jsonl".to_owned(),
+            format!("notes-{plain}.jsonl"),
+            format!("rollout-2026-10-27T00-00-04-{plain}.txt"),
+        ] {
+            let _ = std::fs::write(day.join(name), "{}\n");
+        }
+        let mut mail = Mail::default();
+        // A hook records a session by the process it ran in.
+        mail.observe_process("1:1", &root, &Identity::new(Harness::Codex, seen));
+        let listed = unrecorded_codex_threads(&mail, &root);
+        let ids: Vec<&str> = listed.iter().map(|t| t.thread.as_str()).collect();
+        assert_eq!(ids, [packed, plain]);
+        assert!(
+            listed[0]
+                .file
+                .ends_with(format!("rollout-2026-10-26T00-00-01-{packed}.jsonl.zst"))
+        );
+        // Another harness's session of that name is not a Codex thread's record.
+        mail.observe_process("2:2", &root, &Identity::new(Harness::ClaudeCode, plain));
+        assert_eq!(unrecorded_codex_threads(&mail, &root).len(), 2);
+        mail.observe_process("3:3", &root, &Identity::new(Harness::Codex, plain));
+        assert_eq!(unrecorded_codex_threads(&mail, &root).len(), 1);
+        assert_eq!(unrecorded_codex_threads(&mail, &root.join("none")), []);
+        assert_eq!(CODEX_NO_HOOK_RAN, "no guard hook has run in it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // §13::67, §4::38-§4::41 (H1.4, R3.4): the reasons the user reads name the option, the
+    // file or the window.
+    #[test]
+    fn the_reasons_for_the_new_faults_name_what_to_change() {
+        let text = |f: CodexFault| f.text();
+        assert!(text(CodexFault::WebNotOff).contains("web_search is \"disabled\""));
+        assert!(text(CodexFault::WebNotOff).contains("lunchroom install codex"));
+        assert!(text(CodexFault::WebTurnedOn).contains("web_search"));
+        assert!(
+            text(CodexFault::CommandWeb("--search".to_owned())).contains("started with --search")
+        );
+        assert!(
+            text(CodexFault::CommandTty("enable unified_exec_tty".to_owned()))
+                .contains("unified_exec_tty")
+        );
+        let both = text(CodexFault::Recorded {
+            tty: "config.toml".to_owned(),
+            web: "--search".to_owned(),
+        });
+        assert!(both.contains("unified_exec_tty on by config.toml and web search on by --search"));
+        assert!(both.contains("UNGUARDED until you start it anew"));
     }
 
     // §4::9 (R3.4 items 3 and 4), §13::2: a release that cannot be read is item 3 (naming
@@ -3217,9 +4476,21 @@ mod tests {
             ),
             ("lunchroom guard pretool", "pretool", "lunchroom"),
         ] {
+            // An earlier install's `guard pretool` is read, to be told apart from none.
             assert_eq!(
-                guard_program(&hook(command), mode),
+                guard_program(
+                    &hook(command),
+                    mode,
+                    PreTool::Older,
+                    Some(Path::new("/h/s.json"))
+                ),
                 Some(program),
+                "{command}"
+            );
+            // Read from no file (settings given as text), no older install is told from none.
+            assert_eq!(
+                guard_program(&hook(command), mode, PreTool::Older, None).is_some(),
+                mode != "pretool",
                 "{command}"
             );
         }
@@ -3233,10 +4504,25 @@ mod tests {
             ("'/h/my home/lunchroom guard pretool", "pretool"),
             ("", "pretool"),
         ] {
-            assert_eq!(guard_program(&hook(command), mode), None, "{command}");
+            assert_eq!(
+                guard_program(
+                    &hook(command),
+                    mode,
+                    PreTool::Older,
+                    Some(Path::new("/h/s.json"))
+                ),
+                None,
+                "{command}"
+            );
         }
-        assert_eq!(guard_program(&json!({}), "pretool"), None);
-        assert_eq!(guard_program(&json!({"command": 7}), "pretool"), None);
+        assert_eq!(
+            guard_program(&json!({}), "pretool", PreTool::Older, None),
+            None
+        );
+        assert_eq!(
+            guard_program(&json!({"command": 7}), "pretool", PreTool::Older, None),
+            None
+        );
     }
 
     /// A scratch folder with a program named `lunchroom` in a folder whose name has a space, and
@@ -3264,9 +4550,15 @@ mod tests {
         fn settings(&self, events: &[(&str, &str)], matcher: Option<&str>) -> Value {
             let mut hooks = serde_json::Map::new();
             for (event, mode) in events {
-                let mut group = json!({"hooks": [{
-                    "type": "command", "command": format!("'{}' guard {mode}", self.program)
-                }]});
+                let quoted = format!("'{}'", self.program);
+                let mut hook = json!({
+                    "type": "command", "command": written(&quoted, &format!("guard {mode}"), Path::new(HERE))
+                });
+                // H1.5: Claude Code's tool-call hook also carries `onFailure: block`.
+                if *mode == "pretool" {
+                    hook["onFailure"] = json!("block");
+                }
+                let mut group = json!({"hooks": [hook]});
                 if let Some(m) = matcher {
                     group["matcher"] = json!(m);
                 }
@@ -3276,11 +4568,19 @@ mod tests {
         }
 
         fn write(&self, relative: &str, value: &Value) {
-            let _ = std::fs::write(self.root.join(relative), value.to_string());
+            // The tool-call hook's line names the file it is in.
+            let file = self.root.join(relative);
+            let text = value.to_string().replace(HERE, &file.display().to_string());
+            let _ = std::fs::write(file, text);
         }
 
         /// `configured_with` for a process given `args`, against this folder's settings.
         fn guarded(&self, args: &[&str]) -> bool {
+            self.guarded_as(args, PreTool::Claude)
+        }
+
+        /// As [`Self::guarded`], taking the tool-call hook in the form `form`.
+        fn guarded_as(&self, args: &[&str], form: PreTool) -> bool {
             let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
             configured_with(
                 &args,
@@ -3288,6 +4588,7 @@ mod tests {
                 &self.root.join("managed.json"),
                 std::process::id(),
                 &self.root.join("project"),
+                form,
             )
         }
 
@@ -3315,6 +4616,1291 @@ mod tests {
         ("PostToolUseFailure", "posttool"),
         ("UserPromptSubmit", "prompt"),
     ];
+
+    // §13::99-102, §13::103 (H1.5), Fable M11: after an upgrade, a tool-call hook of the
+    // 1.0.1 form (`guard pretool` alone, commit 276b58f install.rs line 346), a bare `|| exit 2`
+    // (no release wrote it; Codex counts an exit 2 with nothing on standard error as a failed hook
+    // that lets the call run), a failure branch altered by the user, and, in Claude Code, the
+    // written branch without `"onFailure": "block"`, do not make a session guarded; the reason
+    // names the reinstall only for the 1.0.1 form and the written branch without `onFailure`.
+    #[test]
+    fn claude_hooks_of_the_old_form_are_not_the_guard_and_name_the_reinstall() {
+        let c = Claude::new("oldform");
+        let program = format!("'{}'", c.program);
+        let current = written(&program, "guard pretool", Path::new(HERE));
+        let altered = current.replace("exit 2; }", "exit 0; }");
+        for (what, command, on_failure) in [
+            ("1.0.x form", format!("{program} guard pretool"), true),
+            (
+                "bare exit 2",
+                format!("{program} guard pretool || exit 2"),
+                true,
+            ),
+            ("branch without onFailure", current.clone(), false),
+            ("altered branch", altered, true),
+            ("line endings", format!("{current}\r\n"), true),
+            (
+                "a line break in the branch",
+                current.replace("; exit 2", ";\nexit 2"),
+                true,
+            ),
+        ] {
+            let mut settings = c.settings(&FULL, None);
+            let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            hook["command"] = json!(command);
+            if !on_failure && let Some(h) = hook.as_object_mut() {
+                h.remove("onFailure");
+            }
+            c.write("config/settings.json", &settings);
+            assert!(!c.guarded(&[]), "{what}");
+            let older = c.guarded_as(&[], PreTool::Older);
+            // Only the hook as the install writes it (here without `onFailure`) and the forms an
+            // earlier install wrote are told from none: an altered or whitespace-altered line is
+            // no Lunchroom form, so it is not an invitation to reinstall.
+            assert_eq!(
+                older,
+                !matches!(
+                    what,
+                    "altered branch"
+                        | "line endings"
+                        | "a line break in the branch"
+                        | "bare exit 2"
+                ),
+                "{what}"
+            );
+            let fault = claude_setup_fault(
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                std::process::id(),
+                &c.root.join("project"),
+            )
+            .unwrap_or_default();
+            assert!(fault.contains("Reinstall") == older, "{what}: {fault}");
+            assert!(
+                fault.contains("lunchroom install claude-code"),
+                "{what}: {fault}"
+            );
+        }
+        // The hook as the install writes it is the guard.
+        c.write("config/settings.json", &c.settings(&FULL, None));
+        assert!(c.guarded(&[]));
+        assert_eq!(
+            claude_setup_fault(
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                std::process::id(),
+                &c.root.join("project"),
+            ),
+            None
+        );
+    }
+
+    // H1.5 failure classes of where the hook stands: an old-form tool-call hook in one settings
+    // file does not stand for the written one in another, and two Lunchroom tool-call hooks (an
+    // old and a written one) are guarded by the written one alone; the old one by itself is not.
+    #[test]
+    fn the_tool_call_hook_is_judged_across_settings_levels_and_duplicates() {
+        let c = Claude::new("levels");
+        let program = format!("'{}'", c.program);
+        let old = json!({"hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": format!("{program} guard pretool")}
+        ]}]}});
+        let rest = &FULL[1..];
+        // Old in the user's file, the rest of the set in the project's: not guarded.
+        c.write("config/settings.json", &old);
+        c.write("project/.claude/settings.json", &c.settings(rest, None));
+        assert!(!c.guarded(&[]), "old form only");
+        assert!(
+            c.guarded_as(&[], PreTool::Older),
+            "old form is told from none"
+        );
+        // The written hook in a third file (the project's local settings) makes it guarded, the
+        // old hook in the user's file notwithstanding.
+        let pre = c.settings(&FULL[..1], None);
+        c.write("project/.claude/settings.local.json", &pre);
+        assert!(c.guarded(&[]), "written hook in another settings file");
+        c.clear();
+        // Two Lunchroom tool-call hooks in one file: an old one before the written one.
+        let mut both = c.settings(&FULL, None);
+        let written_group = both["hooks"]["PreToolUse"][0].clone();
+        both["hooks"]["PreToolUse"] = json!([old["hooks"]["PreToolUse"][0].clone(), written_group]);
+        c.write("config/settings.json", &both);
+        assert!(c.guarded(&[]), "an old hook and a written one");
+        // Two old ones are still no guard.
+        let mut twice = c.settings(&FULL, None);
+        twice["hooks"]["PreToolUse"] = json!([
+            old["hooks"]["PreToolUse"][0].clone(),
+            old["hooks"]["PreToolUse"][0].clone()
+        ]);
+        c.write("config/settings.json", &twice);
+        assert!(!c.guarded(&[]), "two old hooks");
+    }
+
+    /// A tool-call hook of Claude Code (with `onFailure`) running `command`.
+    fn claude_pretool(command: &str) -> Value {
+        json!({"type": "command", "command": command, "onFailure": "block"})
+    }
+
+    //H1.5: the tool-call hook counts only when it is the install's line byte for byte.
+    // A leading, trailing, repeated, tab, line-break or Unicode space (a no-break space looks like
+    // a space and the shell does not split at it) is not it; the hook is still read as Lunchroom's,
+    // so an install replaces it.
+    #[test]
+    fn the_tool_call_hook_must_be_the_installs_line_byte_for_byte() {
+        let file = Path::new("/h/.claude/settings.json");
+        let program = "/h/.lunchroom/bin/lunchroom";
+        let current = written(program, "guard pretool", file);
+        let check = |command: &str| {
+            guard_program(
+                &claude_pretool(command),
+                "pretool",
+                PreTool::Claude,
+                Some(file),
+            )
+            .is_some()
+        };
+        assert!(check(&current));
+        for (what, command) in [
+            ("trailing space", format!("{current} ")),
+            ("trailing tab", format!("{current}\t")),
+            ("trailing no-break space", format!("{current}\u{a0}")),
+            ("trailing line break", format!("{current}\n")),
+            ("trailing carriage return", format!("{current}\r")),
+            (
+                "two spaces after the program",
+                current.replacen(" guard", "  guard", 1),
+            ),
+            (
+                "a tab after the program",
+                current.replacen(" guard", "\tguard", 1),
+            ),
+            (
+                "a no-break space after the program",
+                current.replacen(" guard", "\u{a0}guard", 1),
+            ),
+            (
+                "two spaces before pretool",
+                current.replacen("guard pretool", "guard  pretool", 1),
+            ),
+            (
+                "two spaces before the branch",
+                current.replacen(" || {", "  || {", 1),
+            ),
+            ("a tab in the branch", current.replacen("{ [", "{\t[", 1)),
+            (
+                "a no-break space in the branch",
+                current.replacen("-eq 2", "-eq\u{a0}2", 1),
+            ),
+            (
+                "two spaces in the line",
+                current.replacen("the guard", "the  guard", 1),
+            ),
+            (
+                "a line break before the exit",
+                current.replacen(">&2; exit", ">&2;\nexit", 1),
+            ),
+            ("a leading space", format!(" {current}")),
+        ] {
+            assert!(!check(&command), "{what}: {command:?}");
+        }
+    }
+
+    //H1.5: the file the line names is the file the hook was read from, not just any
+    // name. A wrong but non-empty name, a name that differs in one character, and a hook read from no
+    // file (settings given as text) are not the install's hook; a spelling of the same file is.
+    #[test]
+    fn the_tool_call_hooks_line_must_name_the_file_it_was_read_from() {
+        let root = crate::test_target()
+            .join("hook-name-unit")
+            .join(std::process::id().to_string());
+        let _ = std::fs::create_dir_all(root.join("a"));
+        let file = root.join("a/settings.json");
+        let other = root.join("a/settings.json.other");
+        let _ = std::fs::write(&file, "{}");
+        let program = "/h/.lunchroom/bin/lunchroom";
+        let check = |named: &Path, read_from: Option<&Path>| {
+            let command = written(program, "guard pretool", named);
+            guard_program(
+                &claude_pretool(&command),
+                "pretool",
+                PreTool::Claude,
+                read_from,
+            )
+            .is_some()
+        };
+        assert!(check(&file, Some(&file)));
+        assert!(!check(&other, Some(&file)), "another file");
+        assert!(
+            !check(Path::new("/x/y/settings.json"), Some(&file)),
+            "a name that is not it"
+        );
+        assert!(
+            !check(&root.join("a/settings.jsoN"), Some(&file)),
+            "one character"
+        );
+        assert!(!check(&file, None), "read from no file");
+        assert!(
+            !check(&file.with_file_name("x y"), Some(&file)),
+            "a name with a space"
+        );
+        // The same file by another spelling does not count: the name is the path the install
+        // writes, byte for byte. A link, a relative path, `..`, `.` and a doubled slash are each
+        // another spelling (and each would be a file-system question the check does not ask).
+        let link = root.join("link");
+        let _ = std::os::unix::fs::symlink(root.join("a"), &link);
+        assert!(
+            link.join("settings.json").exists(),
+            "the link reaches the file"
+        );
+        assert!(
+            !check(&link.join("settings.json"), Some(&file)),
+            "a symlink alias"
+        );
+        assert!(
+            !check(Path::new("a/settings.json"), Some(&file)),
+            "a relative alias"
+        );
+        assert!(
+            !check(Path::new("../a/settings.json"), Some(&file)),
+            "a relative alias with .."
+        );
+        for alias in [
+            format!("{}/a/../a/settings.json", root.display()),
+            format!("{}/a/./settings.json", root.display()),
+            format!("{}//a/settings.json", root.display()),
+            format!("{}/a//settings.json", root.display()),
+            format!("{}/a/settings.json/", root.display()),
+        ] {
+            assert!(!check(Path::new(&alias), Some(&file)), "{alias}");
+        }
+        // A quote in the name is escaped as the install writes it.
+        let quoted = root.join("it's/settings.json");
+        let _ = std::fs::create_dir_all(root.join("it's"));
+        let _ = std::fs::write(&quoted, "{}");
+        assert!(check(&quoted, Some(&quoted)), "a quote in the name");
+        assert!(!check(&quoted, Some(&file)), "a quote, another file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    //H1.5 (failure class: an empty or nameless failure line): evidence takes the
+    // tool-call hook as the guard only with the install's line, which names the file. An empty line,
+    // a line with no file name, a line of other text, and the line with another file's name are not
+    // it, for Claude Code and for Codex.
+    #[test]
+    fn an_empty_or_nameless_failure_line_is_not_the_guard() {
+        let file = Path::new("/h/.claude/settings.json");
+        let program = "/h/.lunchroom/bin/lunchroom";
+        let current = written(program, "guard pretool", file);
+        let line = crate::install::guard_failed_line(file);
+        assert!(current.contains(&line));
+        let counts = |command: &str| {
+            let hook = claude_pretool(command);
+            [PreTool::Claude, PreTool::Codex]
+                .map(|form| guard_program(&hook, "pretool", form, Some(file)).is_some())
+        };
+        assert_eq!(counts(&current), [true, true]);
+        for (what, command) in [
+            ("an empty line", current.replacen(&line, "", 1)),
+            ("a line of one space", current.replacen(&line, " ", 1)),
+            (
+                "a line with no file name",
+                current.replacen(&file.display().to_string(), "", 1),
+            ),
+            (
+                "a line of other text",
+                current.replacen(&line, "the guard is fine", 1),
+            ),
+            (
+                "another file's name",
+                current.replacen(&file.display().to_string(), "/h/.claude/other.json", 1),
+            ),
+        ] {
+            assert_eq!(counts(&command), [false, false], "{what}: {command}");
+        }
+    }
+
+    //H1.5 (failure class: a configuration file path that is not UTF-8): the line names
+    // the file in text, so such a path has no spelling in it. The hook the install would write
+    // (with the lossy name) is not accepted as naming the file, and the install refuses the path
+    // before changing anything; a UTF-8 path with an odd name is accepted when named exactly.
+    #[test]
+    fn a_configuration_path_that_is_not_utf8_is_never_named_by_a_line() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let program = "/h/.lunchroom/bin/lunchroom";
+        let bytes = b"/tmp/not-text-\xff\xfe/settings.json".to_vec();
+        let file = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        assert!(file.to_str().is_none());
+        // The install would have written the lossy spelling.
+        let command = written(program, "guard pretool", &file);
+        assert!(command.contains('\u{fffd}'));
+        let hook = claude_pretool(&command);
+        for form in [PreTool::Claude, PreTool::Codex] {
+            assert!(
+                guard_program(&hook, "pretool", form, Some(&file)).is_none(),
+                "{form:?}"
+            );
+        }
+        // The lossy name of a real UTF-8 file is not taken for the non-UTF-8 one either way round.
+        let lossy = PathBuf::from(file.to_string_lossy().into_owned());
+        assert!(guard_program(&hook, "pretool", PreTool::Claude, Some(&lossy)).is_some());
+        // A UTF-8 name that holds characters a shell must quote is named exactly.
+        let odd = Path::new("/h/it's a \u{e9} dir/settings.json");
+        let command = written(program, "guard pretool", odd);
+        assert!(
+            guard_program(
+                &claude_pretool(&command),
+                "pretool",
+                PreTool::Claude,
+                Some(odd)
+            )
+            .is_some()
+        );
+    }
+
+    //H1.5: Claude Code settings given as text (`--settings '<json>'`, or `--settings=`)
+    // are read from no file, so the line cannot name the file they were read from: they are not the
+    // install's hook, and not an older install's either (there is nothing to reinstall: the
+    // diagnosis is "no guard"). The same text is the current form, an older form, and a bare
+    // `|| exit 2`.
+    #[test]
+    fn settings_given_as_text_are_no_guard_and_no_older_install() {
+        let c = Claude::new("inline");
+        let user = c.root.join("config/settings.json");
+        let texts = [
+            claude_text(&c, &user, true),
+            claude_text(&c, &user, false),
+            claude_text(&c, &user, false).replace(" guard pretool", " guard pretool || exit 2"),
+        ];
+        let nothing = |_: &Path| None;
+        for text in &texts {
+            for args in [
+                vec!["claude".to_owned(), "--settings".to_owned(), text.clone()],
+                vec!["claude".to_owned(), format!("--settings={text}")],
+            ] {
+                let got = claude_guard_with(
+                    &nothing,
+                    &|hook| program_present(hook, std::process::id(), &c.root),
+                    &args,
+                    &c.root.join("config"),
+                    &c.root.join("managed.json"),
+                    &c.root.join("project"),
+                );
+                assert_eq!(got, ClaudeGuard::NotConfigured, "{text}");
+            }
+        }
+        // The same text read from the user's file is guarded, older, or older (bare).
+        for (text, expected) in [
+            (&texts[0], ClaudeGuard::Guarded),
+            (&texts[1], ClaudeGuard::OlderHook),
+        ] {
+            let reader = |path: &Path| (path == user).then(|| text.clone());
+            let got = claude_guard_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &c.root),
+                &[],
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                &c.root.join("project"),
+            );
+            assert_eq!(got, expected);
+        }
+    }
+
+    //H1.5: a hook that looks like the install's line but names another file, an alias
+    // of this one (`..`, `.`, a doubled slash, a relative path), or is altered (Windows line ending,
+    // a line break, a trailing space), is neither the guard nor an older install's: for Claude
+    // Code the settings are not configured, and for Codex the hooks file holds no guard set. The
+    // exact line is the control.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, each look-alike judged for both harnesses
+    fn a_fail_closed_looking_hook_that_is_not_the_installs_is_no_guard_and_no_older_install() {
+        use std::fmt::Write as _;
+        let c = Claude::new("lookalike");
+        let user = c.root.join("config/settings.json");
+        let program = format!("'{}'", c.program);
+        let root = c.root.display().to_string();
+        let current = written(&program, "guard pretool", &user);
+        let variants = [
+            (
+                "another file",
+                written(&program, "guard pretool", &c.root.join("config/other.json")),
+            ),
+            (
+                "a .. alias",
+                written(
+                    &program,
+                    "guard pretool",
+                    Path::new(&format!("{root}/config/../config/settings.json")),
+                ),
+            ),
+            (
+                "a . alias",
+                written(
+                    &program,
+                    "guard pretool",
+                    Path::new(&format!("{root}/config/./settings.json")),
+                ),
+            ),
+            (
+                "a doubled slash",
+                written(
+                    &program,
+                    "guard pretool",
+                    Path::new(&format!("{root}//config/settings.json")),
+                ),
+            ),
+            (
+                "a relative path",
+                written(&program, "guard pretool", Path::new("config/settings.json")),
+            ),
+            ("a Windows line ending", format!("{current}\r\n")),
+            ("a line break", current.replacen("; exit 2", ";\nexit 2", 1)),
+            ("a trailing space", format!("{current} ")),
+        ];
+        let claude = |command: &str| {
+            let mut settings = c.settings(&FULL, None);
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = json!(command);
+            let text = settings.to_string();
+            let reader = |path: &Path| (path == user).then(|| text.clone());
+            claude_guard_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &c.root),
+                &[],
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                &c.root.join("project"),
+            )
+        };
+        assert_eq!(claude(&current), ClaudeGuard::Guarded);
+        for (what, command) in &variants {
+            assert_eq!(
+                claude(command),
+                ClaudeGuard::NotConfigured,
+                "Claude Code, {what}"
+            );
+        }
+        // Codex.
+        let codex_home = c.root.join("home/.codex");
+        let file = codex_home.join("hooks.json");
+        let states = [
+            ("PreToolUse", "pre_tool_use", "guard pretool"),
+            ("PostToolUse", "post_tool_use", "guard posttool"),
+            ("UserPromptSubmit", "user_prompt_submit", "guard prompt"),
+            ("SessionStart", "session_start", "guard start"),
+        ];
+        let mut config =
+            String::from("web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n");
+        for (_, state, _) in states {
+            let _ = writeln!(
+                config,
+                "[hooks.state.\"{}:{state}:0:0\"]\ntrusted_hash = \"sha256:{state}\"",
+                file.display()
+            );
+        }
+        let program_bare = program.clone();
+        let codex = |pretool: &str| {
+            let mut hooks = serde_json::Map::new();
+            for (event, _, rest) in states {
+                let command = if rest == "guard pretool" {
+                    pretool.to_owned()
+                } else {
+                    format!("{program_bare} {rest}")
+                };
+                hooks.insert(
+                    event.to_owned(),
+                    json!([{"hooks": [{"type": "command", "command": command}]}]),
+                );
+            }
+            let text = json!({ "hooks": hooks }).to_string();
+            let reader = |path: &Path| {
+                if path == file {
+                    Some(text.clone())
+                } else if path == codex_home.join("config.toml") {
+                    Some(config.clone())
+                } else {
+                    None
+                }
+            };
+            codex_hooks_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &c.root),
+                &codex_home,
+                &c.root,
+            )
+        };
+        let codex_current = written(&program_bare, "guard pretool", &file);
+        assert!(codex(&codex_current).is_ok());
+        let alias = format!("{root}/home/.codex/../.codex/hooks.json");
+        let codex_variants = [
+            written(
+                &program_bare,
+                "guard pretool",
+                &codex_home.join("other.json"),
+            ),
+            written(&program_bare, "guard pretool", Path::new(&alias)),
+            format!("{codex_current}\r\n"),
+            codex_current.replacen("; exit 2", ";\nexit 2", 1),
+            format!("{codex_current} "),
+        ];
+        for command in &codex_variants {
+            assert_eq!(
+                codex(command),
+                Err(CodexFault::NoGuardSet(file.clone())),
+                "{command:?}"
+            );
+        }
+    }
+
+    //H1.5: one spelling is an older install, byte for byte: `<program> guard pretool`,
+    // the only form a released installer wrote (the 1.0.1 release, commit 276b58f,
+    // `rust/crates/lunchroom/src/install.rs` line 346, `"command": format!("{p} guard {mode}")`).
+    // A bare `guard pretool || exit 2` was never written by a release: it is no older install, and
+    // not Lunchroom's hook. Any other spelling, with a space, tab, vertical tab, form feed, next line,
+    // no-break, ogham, en, em or ideographic space, line separator, line break or carriage return,
+    // in front, behind, between the words or around `||`, is no older install.
+    #[test]
+    fn only_the_one_released_spelling_is_an_older_install() {
+        let file = Path::new("/h/.claude/settings.json");
+        let program = "/h/.lunchroom/bin/lunchroom";
+        let older = |command: &str| {
+            guard_program(
+                &json!({"command": command}),
+                "pretool",
+                PreTool::Older,
+                Some(file),
+            )
+            .is_some()
+        };
+        assert!(older(&format!("{program} guard pretool")));
+        assert!(older("'/h/my home/lunchroom' guard pretool"));
+        // The bare form no release wrote is none.
+        assert!(!older(&format!("{program} guard pretool || exit 2")));
+        assert!(!older("'/h/my home/lunchroom' guard pretool || exit 2"));
+        let spaces = [
+            " ", "  ", "\t", "\u{b}", "\u{c}", "\r", "\n", "\r\n", "\u{85}", "\u{a0}", "\u{1680}",
+            "\u{2003}", "\u{2028}", "\u{2029}", "\u{202f}", "\u{205f}", "\u{3000}",
+        ];
+        let mut altered = Vec::new();
+        for ws in spaces {
+            for exact in ["guard pretool", "guard pretool || exit 2"] {
+                // Leading, trailing, between the program and `guard`, before `pretool`.
+                altered.push(format!("{ws}{program} {exact}"));
+                altered.push(format!("{program} {exact}{ws}"));
+                altered.push(format!("{program} {ws}{exact}"));
+                altered.push(format!(
+                    "{program} {}",
+                    exact.replacen("guard pretool", &format!("guard{ws}pretool"), 1)
+                ));
+            }
+            // Around `||`, and inside `exit 2`.
+            altered.push(format!("{program} guard pretool{ws}|| exit 2"));
+            altered.push(format!("{program} guard pretool ||{ws}exit 2"));
+            altered.push(format!("{program} guard pretool || exit{ws}2"));
+            altered.push(format!("{program} guard pretool{ws}||{ws}exit{ws}2"));
+        }
+        altered.push(format!("{program}\u{2003}guard pretool"));
+        altered.push(format!("{program} guard pretool\u{2003}|| exit 2"));
+        let spelled = [format!("{program} guard pretool")];
+        for command in altered.iter().filter(|c| !spelled.contains(c)) {
+            assert!(!older(command), "{command:?}");
+        }
+        // Through the whole reading: an altered spelling in the user's file is no guard and no
+        // invitation to reinstall; the exact spelling is the invitation.
+        let c = Claude::new("legacy");
+        let user = c.root.join("config/settings.json");
+        let verdict = |command: &str| {
+            let mut settings = c.settings(&FULL, None);
+            let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            hook["command"] = json!(command);
+            if let Some(h) = hook.as_object_mut() {
+                h.remove("onFailure");
+            }
+            let text = settings.to_string();
+            let reader = |path: &Path| (path == user).then(|| text.clone());
+            claude_guard_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &c.root),
+                &[],
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                &c.root.join("project"),
+            )
+        };
+        let quoted = format!("'{}'", c.program);
+        assert_eq!(
+            verdict(&format!("{quoted} guard pretool")),
+            ClaudeGuard::OlderHook
+        );
+        assert_eq!(
+            verdict(&format!("{quoted} guard pretool || exit 2")),
+            ClaudeGuard::NotConfigured
+        );
+        for ws in ["  ", "\t", "\u{a0}", "\u{2003}", "\r\n"] {
+            for command in [
+                format!("{quoted} guard{ws}pretool"),
+                format!("{quoted} guard pretool{ws}|| exit 2"),
+                format!("{quoted} guard pretool{ws}"),
+            ] {
+                assert_eq!(verdict(&command), ClaudeGuard::NotConfigured, "{command:?}");
+            }
+        }
+    }
+
+    //H1.5: a hook command over 4096 bytes never reaches the file system: the check that
+    // the hook's program is there to run is not asked, in any form (the current one for Claude Code
+    // and Codex, and an older one). An injected check records what it is asked: at 4096 bytes it is
+    // asked once, at 4097 and above never.
+    #[test]
+    fn a_command_over_the_bound_never_reaches_the_file_system() {
+        use std::cell::Cell;
+        let file = Path::new("/h/.claude/settings.json");
+        let program = "/h/.lunchroom/bin/lunchroom";
+        let fixed = written(program, "guard pretool", Path::new("")).len();
+        let calls = Cell::new(0usize);
+        let present = |_: &Value| {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let holds = |command: &str, form: PreTool| {
+            let settings = json!({"hooks": {"PreToolUse": [{"hooks": [claude_pretool(command)]}]}});
+            calls.set(0);
+            let got = has_guard_hook(
+                &settings,
+                "PreToolUse",
+                "pretool",
+                &present,
+                form,
+                Some(file),
+            );
+            (got, calls.get())
+        };
+        for (over, expected) in [(0usize, true), (1, false), (500, false), (4096, false)] {
+            let name = format!("/{}", "a".repeat(4096 - fixed - 1 + over));
+            let long_file = PathBuf::from(&name);
+            let command = written(program, "guard pretool", &long_file);
+            assert_eq!(command.len(), 4096 + over);
+            let settings =
+                json!({"hooks": {"PreToolUse": [{"hooks": [claude_pretool(&command)]}]}});
+            for form in [PreTool::Claude, PreTool::Codex, PreTool::Older] {
+                calls.set(0);
+                let got = has_guard_hook(
+                    &settings,
+                    "PreToolUse",
+                    "pretool",
+                    &present,
+                    form,
+                    Some(&long_file),
+                );
+                assert_eq!(
+                    (got, calls.get()),
+                    (expected, usize::from(expected)),
+                    "{form:?} at {} bytes",
+                    command.len()
+                );
+            }
+        }
+        // An older form past the bound (a long program path) is not asked about either.
+        for (pad, expected) in [
+            (4096 - "/lunchroom guard pretool".len(), true),
+            (4097 - "/lunchroom guard pretool".len(), false),
+        ] {
+            let command = format!("/{}/lunchroom guard pretool", "p".repeat(pad - 1));
+            assert_eq!(command.len(), 4096 + usize::from(!expected));
+            assert_eq!(
+                holds(&command, PreTool::Older),
+                (expected, usize::from(expected)),
+                "{} bytes",
+                command.len()
+            );
+        }
+    }
+
+    //H1.5: a hook command of more than 4096 bytes is not the install's line, and no call
+    // is made on the file system for it (the file it names does not exist, and is not asked about).
+    #[test]
+    fn a_tool_call_hook_command_is_bounded_at_4096_bytes() {
+        let program = "/h/.lunchroom/bin/lunchroom";
+        // The command's length is this much more than the length of the file's name.
+        let fixed = written(program, "guard pretool", Path::new("")).len();
+        for (over, expected) in [(0usize, true), (1, false), (4096, false)] {
+            let name = format!("/{}", "a".repeat(4096 - fixed - 1 + over));
+            let file = PathBuf::from(&name);
+            let command = written(program, "guard pretool", &file);
+            assert_eq!(command.len(), 4096 + over);
+            assert!(!file.exists());
+            let hook = claude_pretool(&command);
+            let counts =
+                |form: PreTool| guard_program(&hook, "pretool", form, Some(&file)).is_some();
+            assert_eq!(counts(PreTool::Claude), expected, "{} bytes", command.len());
+            assert_eq!(counts(PreTool::Codex), expected, "{} bytes", command.len());
+            // Past the bound it is Lunchroom's line in no form, not even an older one.
+            assert_eq!(counts(PreTool::Older), expected, "{} bytes", command.len());
+        }
+    }
+
+    //H1.5: Claude Code's tool-call hook has `"onFailure": "block"`, the string and no
+    // other value: not `Block`, a boolean, null, a number, another string, a string with a space, an
+    // object, a list, or nothing.
+    #[test]
+    fn only_the_string_block_is_the_on_failure_that_blocks() {
+        let file = Path::new("/h/.claude/settings.json");
+        let command = written("/h/.lunchroom/bin/lunchroom", "guard pretool", file);
+        let with = |value: Option<Value>| {
+            let mut hook = json!({"type": "command", "command": command});
+            if let Some(v) = value {
+                hook["onFailure"] = v;
+            }
+            hook
+        };
+        let claude =
+            |hook: &Value| guard_program(hook, "pretool", PreTool::Claude, Some(file)).is_some();
+        assert!(claude(&with(Some(json!("block")))));
+        for (what, value) in [
+            ("Block", Some(json!("Block"))),
+            ("BLOCK", Some(json!("BLOCK"))),
+            ("block with a space", Some(json!("block "))),
+            ("true", Some(json!(true))),
+            ("false", Some(json!(false))),
+            ("null", Some(json!(null))),
+            ("a number", Some(json!(1))),
+            ("another string", Some(json!("warn"))),
+            ("an empty string", Some(json!(""))),
+            ("a list", Some(json!(["block"]))),
+            ("an object", Some(json!({"block": true}))),
+            ("nothing", None),
+        ] {
+            assert!(!claude(&with(value.clone())), "{what}");
+            // Codex has no such option and ignores it: its tool-call hook needs the line only.
+            assert!(
+                guard_program(&with(value), "pretool", PreTool::Codex, Some(file)).is_some(),
+                "{what} (Codex)"
+            );
+        }
+    }
+
+    /// The text of a settings file for the Claude fixture `c` holding the whole guard set, with the
+    /// tool-call hook as the install writes it (`current`) or as 1.0.x did.
+    fn claude_text(c: &Claude, file: &Path, current: bool) -> String {
+        let mut settings = c.settings(&FULL, None);
+        if !current {
+            let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            hook["command"] = json!(format!("'{}' guard pretool", c.program));
+            if let Some(h) = hook.as_object_mut() {
+                h.remove("onFailure");
+            }
+        }
+        settings
+            .to_string()
+            .replace(HERE, &file.display().to_string())
+    }
+
+    //H1.5 (failure class: a `command` that is not a string): a hook whose `command` is
+    // absent, null, a boolean, a number, an array, an object or an empty string is not Lunchroom's
+    // hook, in every mode and form, for Claude Code and for Codex, and is never asked about on the
+    // file system. It is not read as the empty string and it is not read through its JSON text: the
+    // array and the object here hold the exact command of the install, as a string inside.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table of values, judged four ways
+    fn a_command_that_is_not_a_string_is_not_lunchroom_s_hook() {
+        use std::fmt::Write as _;
+        let file = Path::new("/h/.claude/settings.json");
+        let program = "/h/.lunchroom/bin/lunchroom";
+        let exact = written(program, "guard pretool", file);
+        let values: Vec<(&str, Option<Value>)> = vec![
+            ("absent", None),
+            ("null", Some(json!(null))),
+            ("true", Some(json!(true))),
+            ("a number", Some(json!(7))),
+            ("an empty string", Some(json!(""))),
+            ("an empty array", Some(json!([]))),
+            ("an array with the command", Some(json!([exact.clone()]))),
+            ("an empty object", Some(json!({}))),
+            (
+                "an object with the command",
+                Some(json!({"command": exact.clone()})),
+            ),
+        ];
+        let calls = std::cell::Cell::new(0usize);
+        let present = |_: &Value| {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let hook_of = |value: &Option<Value>| {
+            let mut hook = json!({"type": "command", "onFailure": "block"});
+            if let Some(v) = value {
+                hook["command"] = v.clone();
+            }
+            hook
+        };
+        for (what, value) in &values {
+            let hook = hook_of(value);
+            for mode in ["pretool", "posttool", "prompt", "start"] {
+                for form in [PreTool::Claude, PreTool::Codex, PreTool::Older] {
+                    assert!(
+                        guard_program(&hook, mode, form, Some(file)).is_none(),
+                        "{what}, {mode}, {form:?}"
+                    );
+                }
+            }
+            let settings = json!({"hooks": {"PreToolUse": [{"hooks": [hook]}]}});
+            calls.set(0);
+            assert!(!has_guard_hook(
+                &settings,
+                "PreToolUse",
+                "pretool",
+                &present,
+                PreTool::Claude,
+                Some(file)
+            ));
+            assert_eq!(calls.get(), 0, "{what}");
+        }
+        // The whole reading: Claude Code settings and a Codex hooks file whose tool-call hook has
+        // such a command are not configured and hold no guard set, and are not an older install.
+        let c = Claude::new("nonstring");
+        let user = c.root.join("config/settings.json");
+        let quoted = format!("'{}'", c.program);
+        let codex_home = c.root.join("home/.codex");
+        let hooks_file = codex_home.join("hooks.json");
+        let states = [
+            ("PreToolUse", "pre_tool_use", "guard pretool"),
+            ("PostToolUse", "post_tool_use", "guard posttool"),
+            ("UserPromptSubmit", "user_prompt_submit", "guard prompt"),
+            ("SessionStart", "session_start", "guard start"),
+        ];
+        let mut config =
+            String::from("web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n");
+        for (_, state, _) in states {
+            let _ = write!(
+                config,
+                "[hooks.state.\"{}:{state}:0:0\"]\ntrusted_hash = \"sha256:{state}\"\n",
+                hooks_file.display()
+            );
+        }
+        for (what, value) in &values {
+            let mut settings: Value =
+                serde_json::from_str(&claude_text(&c, &user, true)).unwrap_or_default();
+            let slot = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            match value {
+                Some(v) => slot["command"] = v.clone(),
+                None => {
+                    if let Some(h) = slot.as_object_mut() {
+                        h.remove("command");
+                    }
+                }
+            }
+            let text = settings.to_string();
+            let reader = |path: &Path| (path == user).then(|| text.clone());
+            let got = claude_guard_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &c.root),
+                &[],
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                &c.root.join("project"),
+            );
+            assert_eq!(got, ClaudeGuard::NotConfigured, "Claude Code, {what}");
+            // Codex.
+            let mut hooks = serde_json::Map::new();
+            for (event, _, rest) in states {
+                let mut hook = json!({"type": "command"});
+                if rest == "guard pretool" {
+                    if let Some(v) = value {
+                        hook["command"] = v.clone();
+                    }
+                } else {
+                    hook["command"] = json!(format!("{quoted} {rest}"));
+                }
+                hooks.insert(event.to_owned(), json!([{"hooks": [hook]}]));
+            }
+            let hooks_text = json!({ "hooks": hooks }).to_string();
+            let reader = |path: &Path| {
+                if path == hooks_file {
+                    Some(hooks_text.clone())
+                } else if path == codex_home.join("config.toml") {
+                    Some(config.clone())
+                } else {
+                    None
+                }
+            };
+            let got = codex_hooks_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &c.root),
+                &codex_home,
+                &c.root,
+            );
+            assert_eq!(
+                got,
+                Err(CodexFault::NoGuardSet(hooks_file.clone())),
+                "Codex, {what}"
+            );
+        }
+    }
+
+    //H1.5: every `onFailure` that is not the string `block` leaves Claude Code's tool-call
+    // hook (the install's line in the user's file) out of the guard: the whole reading says reinstall
+    // (`OlderHook`), the doctor's text names the reinstall and `onFailure`, and the session is not
+    // guarded. The exact string is guarded and the doctor says nothing.
+    #[test]
+    fn a_wrong_on_failure_is_a_reinstall_in_the_whole_reading_and_the_doctors_words() {
+        let c = Claude::new("onfailure");
+        let user = c.root.join("config/settings.json");
+        let reading = |value: Option<Value>| {
+            let mut settings: Value =
+                serde_json::from_str(&claude_text(&c, &user, true)).unwrap_or_default();
+            let hook = &mut settings["hooks"]["PreToolUse"][0]["hooks"][0];
+            match value {
+                Some(v) => hook["onFailure"] = v,
+                None => {
+                    if let Some(h) = hook.as_object_mut() {
+                        h.remove("onFailure");
+                    }
+                }
+            }
+            let text = settings.to_string();
+            let reader = |path: &Path| (path == user).then(|| text.clone());
+            let present = |hook: &Value| program_present(hook, std::process::id(), &c.root);
+            let got = claude_guard_with(
+                &reader,
+                &present,
+                &[],
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                &c.root.join("project"),
+            );
+            let doctor = claude_setup_fault_with(
+                &reader,
+                &present,
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                &c.root.join("project"),
+            );
+            (got, doctor)
+        };
+        assert_eq!(reading(Some(json!("block"))), (ClaudeGuard::Guarded, None));
+        for (what, value) in [
+            ("Block", Some(json!("Block"))),
+            ("BLOCK", Some(json!("BLOCK"))),
+            ("block with a space", Some(json!("block "))),
+            ("true", Some(json!(true))),
+            ("false", Some(json!(false))),
+            ("null", Some(json!(null))),
+            ("a number", Some(json!(1))),
+            ("another string", Some(json!("warn"))),
+            ("an empty string", Some(json!(""))),
+            ("a list", Some(json!(["block"]))),
+            ("an object", Some(json!({"block": true}))),
+            ("nothing", None),
+        ] {
+            let (got, doctor) = reading(value);
+            assert_eq!(got, ClaudeGuard::OlderHook, "{what}");
+            let text = doctor.unwrap_or_default();
+            assert!(
+                text.contains("Reinstall") && text.contains("onFailure"),
+                "{what}: {text}"
+            );
+        }
+    }
+
+    //H1.5: Claude Code's settings are read once and both forms of the tool-call hook
+    // are judged from that one reading. A reader that gives the current form the first time and the
+    // 1.0.x form after (a file replaced between two readings) is judged by the first reading; so is
+    // the other way round. Each file is read once.
+    #[test]
+    fn claude_settings_are_read_once_and_judged_from_that_reading() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let c = Claude::new("snapshot");
+        let user = c.root.join("config/settings.json");
+        let current = claude_text(&c, &user, true);
+        let older = claude_text(&c, &user, false);
+        for (first, second, expected) in [
+            (&current, &older, ClaudeGuard::Guarded),
+            (&older, &current, ClaudeGuard::OlderHook),
+            (&current, &current, ClaudeGuard::Guarded),
+            (&older, &older, ClaudeGuard::OlderHook),
+        ] {
+            let reads: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
+            let reader = |path: &Path| {
+                let mut reads = reads.borrow_mut();
+                let n = reads.entry(path.to_path_buf()).or_insert(0);
+                *n += 1;
+                (path == user).then(|| {
+                    if *n == 1 {
+                        first.clone()
+                    } else {
+                        second.clone()
+                    }
+                })
+            };
+            let got = claude_guard_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &c.root),
+                &[],
+                &c.root.join("config"),
+                &c.root.join("managed.json"),
+                &c.root.join("project"),
+            );
+            assert_eq!(got, expected);
+            assert!(
+                reads.borrow().values().all(|n| *n == 1),
+                "{:?}",
+                reads.borrow()
+            );
+            assert_eq!(reads.borrow().get(&user), Some(&1));
+        }
+        // The doctor text is judged from one reading too.
+        let reads: RefCell<usize> = RefCell::new(0);
+        let reader = |path: &Path| {
+            (path == user).then(|| {
+                *reads.borrow_mut() += 1;
+                if *reads.borrow() == 1 {
+                    older.clone()
+                } else {
+                    current.clone()
+                }
+            })
+        };
+        let text = claude_setup_fault_with(
+            &reader,
+            &|hook| program_present(hook, std::process::id(), &c.root),
+            &c.root.join("config"),
+            &c.root.join("managed.json"),
+            &c.root.join("project"),
+        );
+        assert!(text.is_some_and(|t| t.contains("Reinstall")));
+        assert_eq!(*reads.borrow(), 1);
+    }
+
+    //H1.5: for Codex too, each hooks file and `config.toml` are read once, and both
+    // forms of the tool-call hook are judged from that one reading.
+    #[test]
+    fn codex_hooks_are_read_once_and_judged_from_that_reading() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::fmt::Write as _;
+        let root = crate::test_target()
+            .join("codex-snapshot-unit")
+            .join(std::process::id().to_string());
+        let codex_home = root.join("home/.codex");
+        let _ = std::fs::create_dir_all(&codex_home);
+        let bin = root.join("bin");
+        let _ = std::fs::create_dir_all(&bin);
+        let _ = std::fs::copy("/bin/true", bin.join("lunchroom"));
+        let program = bin.join("lunchroom").display().to_string();
+        let file = codex_home.join("hooks.json");
+        let states = [
+            ("PreToolUse", "pre_tool_use", "guard pretool"),
+            ("PostToolUse", "post_tool_use", "guard posttool"),
+            ("UserPromptSubmit", "user_prompt_submit", "guard prompt"),
+            ("SessionStart", "session_start", "guard start"),
+        ];
+        let mut config =
+            String::from("web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n");
+        for (_, state, _) in states {
+            let _ = writeln!(
+                config,
+                "[hooks.state.\"{}:{state}:0:0\"]\ntrusted_hash = \"sha256:{state}\"",
+                file.display()
+            );
+        }
+        let set = |current: bool| {
+            let mut hooks = serde_json::Map::new();
+            for (event, _, rest) in states {
+                let command = if current {
+                    written(&program, rest, &file)
+                } else {
+                    format!("{program} {rest}")
+                };
+                hooks.insert(
+                    event.to_owned(),
+                    json!([{"hooks": [{"type": "command", "command": command}]}]),
+                );
+            }
+            json!({ "hooks": hooks }).to_string()
+        };
+        let (current, older) = (set(true), set(false));
+        for (first, second, guarded) in [(&current, &older, true), (&older, &current, false)] {
+            let reads: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
+            let reader = |path: &Path| {
+                let mut reads = reads.borrow_mut();
+                let n = reads.entry(path.to_path_buf()).or_insert(0);
+                *n += 1;
+                if path == file {
+                    Some(if *n == 1 {
+                        first.clone()
+                    } else {
+                        second.clone()
+                    })
+                } else if path == codex_home.join("config.toml") {
+                    Some(config.clone())
+                } else {
+                    None
+                }
+            };
+            let got = codex_hooks_with(
+                &reader,
+                &|hook| program_present(hook, std::process::id(), &root),
+                &codex_home,
+                &root,
+            );
+            assert_eq!(got.is_ok(), guarded, "{got:?}");
+            if !guarded {
+                assert_eq!(got, Err(CodexFault::OldToolHook(file.clone())));
+            }
+            assert!(
+                reads.borrow().values().all(|n| *n == 1),
+                "{:?}",
+                reads.borrow()
+            );
+            assert_eq!(reads.borrow().get(&file), Some(&1));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // H1.5 failure class "a hook in another settings file", for Codex: a project's
+    // `.codex/hooks.json` is read beside `<CODEX_HOME>/hooks.json`. An old-form set in the one does
+    // not stand for the written set in the other (the written, trusted one guards), and an old-form
+    // set in the project's file alone is told apart from no guard, naming that file.
+    #[test]
+    fn a_codex_project_hooks_file_is_judged_on_its_own_form() {
+        use std::fmt::Write as _;
+        let root = crate::test_target()
+            .join("codex-project-unit")
+            .join(std::process::id().to_string());
+        let codex_home = root.join("home/.codex");
+        let project = root.join("project");
+        let _ = std::fs::create_dir_all(&codex_home);
+        let _ = std::fs::create_dir_all(project.join(".codex"));
+        let bin = root.join("bin");
+        let _ = std::fs::create_dir_all(&bin);
+        let _ = std::fs::copy("/bin/true", bin.join("lunchroom"));
+        let program = bin.join("lunchroom").display().to_string();
+        let home_file = codex_home.join("hooks.json");
+        let project_file = project.join(".codex/hooks.json");
+        let states = [
+            ("PreToolUse", "pre_tool_use", "guard pretool"),
+            ("PostToolUse", "post_tool_use", "guard posttool"),
+            ("UserPromptSubmit", "user_prompt_submit", "guard prompt"),
+            ("SessionStart", "session_start", "guard start"),
+        ];
+        let mut config =
+            String::from("web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n");
+        for file in [&home_file, &project_file] {
+            for (_, state, _) in states {
+                let _ = writeln!(
+                    config,
+                    "[hooks.state.\"{}:{state}:0:0\"]\ntrusted_hash = \"sha256:{state}\"",
+                    file.display()
+                );
+            }
+        }
+        let _ = std::fs::write(codex_home.join("config.toml"), config);
+        let set = |file: &Path, current: bool| {
+            let mut hooks = serde_json::Map::new();
+            for (event, _, rest) in states {
+                let command = if current {
+                    written(&program, rest, file)
+                } else if rest == "guard pretool" {
+                    format!("{program} guard pretool")
+                } else {
+                    format!("{program} {rest}")
+                };
+                hooks.insert(
+                    event.to_owned(),
+                    json!([{"hooks": [{"type": "command", "command": command}]}]),
+                );
+            }
+            let _ = std::fs::write(file, json!({ "hooks": hooks }).to_string());
+        };
+        let judged = || codex_guard_in(&codex_home, std::process::id(), &project);
+        // Old in the user's file, written in the project's: guarded.
+        set(&home_file, false);
+        set(&project_file, true);
+        assert!(judged().is_ok(), "{:?}", judged());
+        // Old in both: not guarded, and told apart from none.
+        set(&project_file, false);
+        assert_eq!(judged(), Err(CodexFault::OldToolHook(home_file.clone())));
+        // Old in the project's file alone.
+        let _ = std::fs::remove_file(&home_file);
+        assert_eq!(judged(), Err(CodexFault::OldToolHook(project_file.clone())));
+        // Written in the project's file alone: guarded.
+        set(&project_file, true);
+        assert!(judged().is_ok(), "{:?}", judged());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_codex_tool_call_hook_of_the_old_form_is_unguarded_and_names_the_reinstall() {
+        use std::fmt::Write as _;
+        let root = crate::test_target()
+            .join("codex-oldform-unit")
+            .join(std::process::id().to_string());
+        let codex_home = root.join("home/.codex");
+        let _ = std::fs::create_dir_all(&codex_home);
+        let bin = root.join("bin");
+        let _ = std::fs::create_dir_all(&bin);
+        let _ = std::fs::copy("/bin/true", bin.join("lunchroom"));
+        let program = bin.join("lunchroom").display().to_string();
+        let file = codex_home.join("hooks.json");
+        let events = [
+            ("PreToolUse", "pre_tool_use", "guard pretool"),
+            ("PostToolUse", "post_tool_use", "guard posttool"),
+            ("UserPromptSubmit", "user_prompt_submit", "guard prompt"),
+            ("SessionStart", "session_start", "guard start"),
+        ];
+        let mut config =
+            String::from("web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n");
+        for (_, state, _) in events {
+            let _ = writeln!(
+                config,
+                "[hooks.state.\"{}:{state}:0:0\"]\ntrusted_hash = \"sha256:{state}\"",
+                file.display()
+            );
+        }
+        let _ = std::fs::write(codex_home.join("config.toml"), config);
+        let fault = |pretool: &str| {
+            let mut hooks = serde_json::Map::new();
+            for (event, _, rest) in events {
+                let command = if rest == "guard pretool" {
+                    pretool.to_owned()
+                } else {
+                    format!("{program} {rest}")
+                };
+                hooks.insert(
+                    event.to_owned(),
+                    json!([{"hooks": [{"type": "command", "command": command}]}]),
+                );
+            }
+            let _ = std::fs::write(&file, json!({ "hooks": hooks }).to_string());
+            codex_guard_in(&codex_home, std::process::id(), &root)
+        };
+        let current = written(&program, "guard pretool", &file);
+        for old in [
+            format!("{program} guard pretool"),
+            format!("{program} guard pretool || exit 2"),
+            current.replace("printf", "echo"),
+        ] {
+            let got = fault(&old);
+            let expected = old.ends_with("guard pretool");
+            if expected {
+                assert_eq!(got, Err(CodexFault::OldToolHook(file.clone())), "{old}");
+                let text = CodexFault::OldToolHook(file.clone()).text();
+                assert!(
+                    text.contains("Reinstall") && text.contains("lunchroom install codex"),
+                    "{text}"
+                );
+            } else {
+                // A branch the install did not write is no Lunchroom hook form at all.
+                assert_eq!(got, Err(CodexFault::NoGuardSet(file.clone())), "{old}");
+            }
+            assert_eq!(
+                codex_fingerprint_in(&codex_home, std::process::id(), &root),
+                None
+            );
+        }
+        assert!(fault(&current).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     // R3.1, review finding 5 and 14: a session is guarded only when the complete guard set runs,
     // each hook covering every call. The guard's program is under a path with a space, quoted as
@@ -3407,8 +5993,11 @@ mod tests {
             } else {
                 "posttool"
             };
-            unquoted["hooks"][event][0]["hooks"][0]["command"] =
-                json!(format!("{} guard {mode}", c.program));
+            unquoted["hooks"][event][0]["hooks"][0]["command"] = json!(written(
+                &c.program,
+                &format!("guard {mode}"),
+                Path::new(HERE)
+            ));
         }
         c.write("config/settings.json", &unquoted);
         assert!(!c.guarded(&[]), "unquoted path with a space");
@@ -3437,10 +6026,12 @@ mod tests {
         assert!(c.guarded(&["claude", "--setting-sources", "local"]));
         c.clear();
         // `--settings`, as text and as a file (absolute, or relative to the session's folder).
+        // Settings given as text are read from no file, and the tool-call hook's line names the
+        // file it was read from: text is not the install's hook (H1.5), whatever it holds.
         let text = full.to_string();
-        assert!(c.guarded(&["claude", "--settings", &text]));
+        assert!(!c.guarded(&["claude", "--settings", &text]));
         let joined = format!("--settings={text}");
-        assert!(c.guarded(&[joined.as_str()]));
+        assert!(!c.guarded(&[joined.as_str()]));
         c.write("flag.json", &full);
         let file = c.root.join("flag.json").display().to_string();
         assert!(c.guarded(&["claude", "--settings", &file]));
@@ -3519,8 +6110,8 @@ mod tests {
         let _ = std::fs::create_dir_all(&bin);
         let _ = std::fs::copy("/bin/true", bin.join("lunchroom"));
         let program = bin.join("lunchroom").display().to_string();
-        let hook = |mode: &str| json!([{"hooks": [{"type": "command", "command": format!("{program} {mode}")}]}]);
         let file = codex_home.join("hooks.json");
+        let hook = |mode: &str| json!([{"hooks": [{"type": "command", "command": written(&program, mode, &file)}]}]);
         let _ = std::fs::write(
             &file,
             json!({"hooks": {
@@ -3547,7 +6138,9 @@ mod tests {
             )
         };
         let fingerprint = |config: &str| {
-            let config = format!("[features]\nunified_exec_tty = false\n{config}");
+            let config = format!(
+                "web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n{config}"
+            );
             let _ = std::fs::write(codex_home.join("config.toml"), config);
             codex_fingerprint_in(&codex_home, std::process::id(), &root)
         };
@@ -3579,7 +6172,9 @@ mod tests {
             ),
             ("[features]\nunified_exec_tty = false\n", "[not toml\n"),
         ] {
-            let _ = std::fs::write(codex_home.join("config.toml"), format!("{home}{all}"));
+            // The web search setting is off in each: the fault under test is the tty's.
+            let web = "web_search = \"disabled\"\n";
+            let _ = std::fs::write(codex_home.join("config.toml"), format!("{web}{home}{all}"));
             let _ = std::fs::create_dir_all(root.join(".codex"));
             let _ = std::fs::write(root.join(".codex/config.toml"), project);
             let _ = std::fs::create_dir_all(root.join("a/b"));
@@ -3649,7 +6244,7 @@ mod tests {
             ("UserPromptSubmit", "user_prompt_submit", "guard prompt"),
             ("SessionStart", "session_start", "guard start"),
         ];
-        let tty = "[features]\nunified_exec_tty = false\n".to_owned();
+        let tty = "web_search = \"disabled\"\n[features]\nunified_exec_tty = false\n".to_owned();
         let config = events.iter().fold(tty, |mut s, (_, state, _)| {
             use std::fmt::Write as _;
             let _ = write!(
@@ -3665,7 +6260,7 @@ mod tests {
             let mut hooks = serde_json::Map::new();
             for (name, _, args) in events {
                 let mut group = json!({"hooks": [{
-                    "type": "command", "command": format!("{program} {args}"),
+                    "type": "command", "command": written(&program, args, &file),
                 }]});
                 if name == event {
                     change(&mut group);
@@ -3707,7 +6302,7 @@ mod tests {
         }
         // Every event runs the guard of another event's mode: no event is satisfied by a sibling.
         assert!(!guarded("UserPromptSubmit", &|g| {
-            g["hooks"][0]["command"] = json!(format!("{program} guard pretool"));
+            g["hooks"][0]["command"] = json!(written(&program, "guard pretool", &file));
         }));
         let _ = std::fs::remove_dir_all(&root);
     }
